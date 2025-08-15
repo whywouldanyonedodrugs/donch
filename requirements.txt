@@ -1,0 +1,7 @@
+aiohttp
+asyncpg
+ccxt
+pyyaml
+watchdog
+pydantic
+tenacity
