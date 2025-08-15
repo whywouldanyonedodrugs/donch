@@ -1,0 +1,31 @@
+# strategies/dummy_long_ema500.yaml
+# Purpose: simple LONG that should trigger quickly for testing end-to-end wiring.
+strategy:
+  name: dummy_long_ema500
+  side: LONG
+  timeframes: ["5m", "1h", "1d"]
+
+  entry:
+    all:
+      # Price above 500-day EMA (use 1d timeframe, EMA length 500)
+      - name: "price_above_ema500"
+        indicator: "ema_cross"
+        timeframe: "1d"
+        params: { fast: 1, slow: 500, direction: "above" }  # fast(1) above slow(500) ≈ price > EMA500
+        op: "is_true"
+
+  veto:
+    any:
+      # Optional safety: don't enter if blacklisted or cooldown not satisfied
+      - { name: "blacklisted",  source: "context", key: "is_blacklisted", op: "is_true" }
+      - { name: "cooldown",     source: "context", key: "cooldown_ok",   op: "is_false" }
+
+  sizing:
+    base_risk_usdt: 0.10    # fixed tiny risk for test
+    scalers: []
+
+  exits:
+    sl: { type: "atr", timeframe: "1h", mult: 2.0 }
+    tp:
+      - { type: "atr", mult: 2.0, size_pct: 100 }
+    time_exit_hours: 12

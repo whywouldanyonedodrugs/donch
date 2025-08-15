@@ -1,0 +1,5 @@
+# research/config/disable_features.txt
+# Put feature names (one per line) to disable from the modeling pipeline.
+# Example:
+# vwap_stack_slope_pph_at_entry
+# price_slowdown_pct_at_entry

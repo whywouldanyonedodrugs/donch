@@ -1,0 +1,25 @@
+# strategies/governance_only.yaml
+# A testing skeleton that relies solely on governance vetoes; entry is trivially true.
+strategy:
+  name: governance_only
+  side: SHORT
+  timeframes: ["5m", "1h"]
+
+  entry:
+    all:
+      - { name: "always_true", indicator: "ema_cross", timeframe: "5m", params: { fast: 1, slow: 1, direction: "above" }, op: "is_true" }
+
+  veto:
+    any:
+      - { name: "cooldown_bad",  source: "context", key: "cooldown_ok",     op: "is_false" }
+      - { name: "too_many_open", source: "context", key: "open_positions",  op: ">=", value: 1 }
+      - { name: "equity_floor",  source: "context", key: "equity",          op: "<", value: 10.0 }
+
+  sizing:
+    base_risk_usdt: 0.10
+    scalers: []
+
+  exits:
+    sl: { type: "atr", timeframe: "1h", mult: 1.5 }
+    tp: [ { type: "atr", mult: 1.5, size_pct: 100 } ]
+    time_exit_hours: 2

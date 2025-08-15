@@ -1,0 +1,49 @@
+# strategies/livefader_short_governed.yaml
+# Livefader SHORT with governance vetoes (context-driven).
+strategy:
+  name: livefader_short_governed
+  side: SHORT
+  timeframes: ["5m", "1h", "4h", "1d"]
+
+  entry:
+    all:
+      - name: "boom_24h"
+        indicator: "return_pct"
+        timeframe: "5m"
+        params: { hours: "@cfg.PRICE_BOOM_PERIOD_H" }
+        op: ">="; value: "@cfg.PRICE_BOOM_PCT"
+      - name: "slowdown_4h"
+        indicator: "return_pct"
+        timeframe: "5m"
+        params: { hours: "@cfg.PRICE_SLOWDOWN_PERIOD_H" }
+        op: "<="; value: "-@cfg.PRICE_SLOWDOWN_PCT"
+      - name: "ema_down_4h"
+        indicator: "ema_cross"
+        timeframe: "4h"
+        params: { fast: "@cfg.EMA_FAST_PERIOD", slow: "@cfg.EMA_SLOW_PERIOD", direction: "below" }
+        op: "is_true"
+
+  veto:
+    any:
+      - { name: "RSI_RANGE",     indicator: "rsi", timeframe: "1h", params: { period: "@cfg.RSI_PERIOD" }, op: "outside", min: "@cfg.RSI_ENTRY_MIN", max: "@cfg.RSI_ENTRY_MAX" }
+      - { name: "ADX_RANGE",     indicator: "adx", timeframe: "1h", params: { period: "@cfg.ADX_PERIOD" }, op: "outside", min: "@cfg.ADX_MIN", max: "@cfg.ADX_MAX" }
+      - { name: "cooldown_bad",  source: "context", key: "cooldown_ok",     op: "is_false" }
+      - { name: "too_many_open", source: "context", key: "open_positions",  op: ">=", value: "@cfg.MAX_CONCURRENT_POSITIONS" }
+      - { name: "young_listing", source: "context", key: "listing_age_days", op: "<",  value: 30 }
+      - { name: "blacklisted",   source: "context", key: "is_blacklisted",  op: "is_true" }
+      - { name: "equity_floor",  source: "context", key: "equity",          op: "<",  value: 100.0 }
+
+  sizing:
+    base_risk_usdt: "@cfg.FIXED_RISK_USDT"
+    scalers:
+      - { name: "winprob", source: "context", key: "winprob", method: "piecewise",
+          pieces: [ {lt: 0.55, factor: 0.7}, {lt: 0.65, factor: 1.0}, {ge: 0.65, factor: 1.3} ], default: 1.0 }
+      - { name: "eth_barometer", source: "context", key: "eth_macdhist", method: "clamp_linear",
+          x_min: -0.01, x_max: 0.01, f_min: 1.3, f_max: 0.7 }
+      - { name: "delever_when_crowded", source: "context", key: "open_positions", method: "piecewise",
+          pieces: [ {lt: 1, factor: 1.0}, {lt: 3, factor: 0.9}, {ge: 3, factor: 0.75} ], default: 1.0 }
+
+  exits:
+    sl: { type: "atr", timeframe: "1h", mult: "@cfg.SL_ATR_MULT" }
+    tp: [ { type: "atr", mult: "@cfg.TP_ATR_MULT", size_pct: 100 } ]
+    time_exit_hours: "@cfg.TIME_EXIT_HOURS"

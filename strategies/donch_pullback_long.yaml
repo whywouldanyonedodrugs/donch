@@ -1,0 +1,24 @@
+name: DonchPullbackLong
+timeframes:
+  base: 5m
+  donch: 1h
+  volume: 5m
+
+params:
+  DONCH_PERIOD: 55
+  PULLBACK_PCT_MAX: 0.015
+  VOL_SMA_WIN: 50
+
+entry:
+  side: long
+  all:
+    - trend_filter_ema: { tf: base, fast: 50, slow: 200, direction: up }
+    - donch_breakout:   { tf: donch, period: "@params.DONCH_PERIOD", direction: up }
+    - pullback_under_ma:{ tf: base, ema_period: 200, max_pullback_pct: "@params.PULLBACK_PCT_MAX" }
+    - volume_surge:     { tf: volume, win: "@params.VOL_SMA_WIN", min_mult: 1.5 }
+
+veto:
+  any:
+    - blacklist_symbol: {}
+    - cooldown_hours: { hours: "@cfg.SYMBOL_COOLDOWN_HOURS" }
+    - min_listing_age_days: { days: 7 }
