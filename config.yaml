@@ -5,7 +5,7 @@ RISK_USD: 0.10             # tiny test risk
 
 
 # --- gating (optional but recommended) ---
-MIN_WINPROB_TO_TRADE: 0.58     # replaces/duplicates META_PROB_THRESHOLD; code patch below
+MIN_WINPROB_TO_TRADE: 0.00    # replaces/duplicates META_PROB_THRESHOLD; code patch below
 
 # --- base risk ---
 RISK_MODE: "fixed"             # or "percent"
@@ -15,14 +15,14 @@ RISK_USD_MIN: 0.05
 RISK_USD_MAX: 2.00
 
 # --- win-prob sizing (kept) ---
-WINPROB_SIZING_ENABLED: true
+WINPROB_SIZING_ENABLED: false
 WINPROB_PROB_FLOOR: 0.55
 WINPROB_PROB_CAP:   0.80
 WINPROB_MIN_MULTIPLIER: 0.90
 WINPROB_MAX_MULTIPLIER: 1.20
 
 # --- VWAP-stack sizing (kept, narrow influence) ---
-VWAP_STACK_SIZING_ENABLED: true
+VWAP_STACK_SIZING_ENABLED: false
 VWAP_STACK_MIN_MULTIPLIER: 0.95
 VWAP_STACK_MAX_MULTIPLIER: 1.05
 VWAP_STACK_FRAC_MIN: 0.50
@@ -36,3 +36,11 @@ VWAP_STACK_EXP_WEIGHT: 0.4
 SIZING_SCALERS: []
 SIZING_MULT_MIN: 0.5
 SIZING_MULT_MAX: 2.0
+
+ENTRY_REQUIRE_EMA_CROSS: false
+ENTRY_REQUIRE_VWAP_CONSOL: false
+ENTRY_MIN_ATR_PCT: 0.0
+
+SCAN_INTERVAL_SEC: 20
+
+ETH_BAROMETER_ENABLED: false

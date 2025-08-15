@@ -2043,7 +2043,7 @@ class LiveTrader:
         self._listing_dates_cache = await self._load_listing_dates()
 
         await self._resume()
-        await self.tg.send("🤖 LIVEFADER v7.1 (YAML sizing + meta gate)")
+        await self.tg.send("🤖 DONCH v0.1 (YAML sizing + meta gate)")
 
         try:
             async with asyncio.TaskGroup() as tg:
