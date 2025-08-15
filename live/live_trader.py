@@ -290,7 +290,10 @@ class Signal:
     win_probability: float = 0.0
 
     def __post_init__(self):
-        LOG.info("Signal built for %s (entry=%.6f).", self.symbol, self.entry)
+        self.side = str(self.side).upper()
+        if self.side not in ("LONG", "SHORT"):
+            self.side = "SHORT"
+        LOG.info(f"Successfully created Signal object for {self.symbol} using correct class definition.")
 
 ###############################################################################
 # 7 ▸ MAIN TRADER #############################################################
@@ -563,7 +566,7 @@ class LiveTrader:
             verdict = self.strategy_engine.evaluate(dfs, ctx)
             if not verdict.should_enter:
                 return None
-            side = verdict.side  # "long" | "short"
+            side = (getattr(verdict, "side", "short") or "short").lower()  # "long" | "short"
 
             # ---- VWAP-stack diagnostics (for sizing/DB/reporting) -------------------
             lookback = int(self.cfg.get("VWAP_STACK_LOOKBACK_BARS", 12))
@@ -614,6 +617,7 @@ class LiveTrader:
             boom_ret_pct = (last['close'] / last['price_boom_ago'] - 1)
             slowdown_ret_pct = (last['close'] / last['price_slowdown_ago'] - 1)
             is_ema_crossed_down = last['ema_fast'] < last['ema_slow']
+            is_long = (side == "long")
             atr_pct = (last['atr'] / last['close']) * 100 if last['close'] > 0 else 0.0
             hour_of_day = now_utc.hour
             day_of_week = now_utc.weekday()
@@ -623,10 +627,10 @@ class LiveTrader:
                 if symbol in self._listing_dates_cache else -1
             )
 
-            # ---- Built-in entry heuristic (short-only, conservative defaults) -------
+            # ---- Built-in entry heuristic (side-aware) -------
             enter_ok = True
             if bool(self.cfg.get("ENTRY_REQUIRE_EMA_CROSS", True)):
-                enter_ok = enter_ok and bool(is_ema_crossed_down)
+                enter_ok = enter_ok and ( (not is_ema_crossed_down) if is_long else is_ema_crossed_down )
             if bool(self.cfg.get("ENTRY_REQUIRE_VWAP_CONSOL", False)):
                 enter_ok = enter_ok and bool(last.get('vwap_consolidated', False))
             min_atr_pct = float(self.cfg.get("ENTRY_MIN_ATR_PCT", 0.0))
@@ -635,6 +639,7 @@ class LiveTrader:
 
             if not enter_ok:
                 return None
+
 
             signal_obj = Signal(
                 symbol=symbol, entry=float(last['close']), atr=float(last['atr']),
@@ -646,7 +651,8 @@ class LiveTrader:
                 listing_age_days=listing_age_days, session_tag=session_tag,
                 day_of_week=day_of_week, hour_of_day=hour_of_day,
                 vwap_consolidated=bool(last.get('vwap_consolidated', False)),
-                is_ema_crossed_down=bool(is_ema_crossed_down)
+                is_ema_crossed_down=bool(is_ema_crossed_down),
+                side=side,   # ← NEW: propagate side into Signal
             )
 
             # Attach VWAP-stack diagnostics (used later in sizing + DB)
@@ -1288,15 +1294,19 @@ class LiveTrader:
                 tp_dir = (+1 if is_long else -1)
                 final_tp_price = float(pos["entry_price"]) + tp_dir * self.cfg["FINAL_TP_ATR_MULT"] * float(pos["atr"])
 
-
                 qty_left = float(pos["size"]) * (1 - self.cfg["PARTIAL_TP_PCT"])
                 tp2_cid = create_stable_cid(pid, "TP2")
+
+                tp2_side = "sell" if is_long else "buy"
+                tp2_trigger_dir = 1 if is_long else 2  # LONG: rise to target; SHORT: fall to target
+
                 await self.exchange.create_order(
-                    symbol, "market", "buy", qty_left, None,
+                    symbol, "market", tp2_side, qty_left, None,
                     params={
-                        "triggerPrice": final_tp_price,
+                        "triggerPrice": float(final_tp_price),
                         "clientOrderId": tp2_cid,
-                        'reduceOnly': True, 'closeOnTrigger': True, 'triggerDirection': 2, 'category': 'linear'
+                        'reduceOnly': True, 'closeOnTrigger': True,
+                        'triggerDirection': tp2_trigger_dir, 'category': 'linear'
                     }
                 )
                 await self.db.update_position(pid, tp2_cid=tp2_cid)
@@ -1571,11 +1581,13 @@ class LiveTrader:
         symbol = pos["symbol"]
         size = float(pos["size"])
         entry_price = float(pos["entry_price"])
+        side = (pos.get("side") or "SHORT").upper()
 
         try:
             await self.exchange.cancel_all_orders(symbol, params={"category": "linear"})
+            close_side = "sell" if side == "LONG" else "buy"
             await self.exchange.create_market_order(
-                symbol, "buy", size, params={"reduceOnly": True, "category": "linear"}
+                symbol, close_side, size, params={"reduceOnly": True, "category": "linear"}
             )
             LOG.info("Force-closed %s (pid %d) due to: %s", symbol, pid, tag)
         except Exception as e:
@@ -1586,17 +1598,20 @@ class LiveTrader:
         exit_price = None
         try:
             my_trades = await self.exchange.fetch_my_trades(symbol, limit=10)
-            closing_trade = next((t for t in reversed(my_trades) if str(t.get("side","")).lower() == "buy"), None)
+            closing_trade = next(
+                (t for t in reversed(my_trades) if str(t.get("side","")).lower() == close_side),
+                None
+            )
             if closing_trade:
                 exit_price = float(closing_trade["price"])
                 LOG.info("Confirmed force-close fill for %s at %.8f", symbol, exit_price)
         except Exception as e:
-            LOG.error("Error fetching fill price for force-close of %s: %s", symbol, e)
+            LOG.error("Error fetching force-close fill for %s: %s", symbol, e)
 
         if not exit_price:
             exit_price = float((await self.exchange.fetch_ticker(symbol))["last"])
 
-        pnl = (entry_price - exit_price) * size
+        pnl = (entry_price - exit_price) * size if side == "SHORT" else (exit_price - entry_price) * size
         closed_at = datetime.now(timezone.utc)
         holding_minutes = (closed_at - pos.get("opened_at", closed_at)).total_seconds()/60.0
 
