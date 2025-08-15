@@ -862,6 +862,13 @@ class LiveTrader:
             LOG.error("Pre-flight check failed for %s: %s", sig.symbol, e)
             return
 
+        # --- Win-probability gate (optional) ---
+        thr = float(self.cfg.get("MIN_WINPROB_TO_TRADE", self.cfg.get("META_PROB_THRESHOLD", 0.0)))
+        wp  = float(getattr(sig, "win_probability", 0.0) or 0.0)
+        if wp < thr:
+            LOG.info("Skip %s: WinProb %.3f < threshold %.3f", sig.symbol, wp, thr)
+            return
+
         # --- Resolve side & direction-dependent helpers ---
         side = (getattr(sig, "side", "short") or "short").lower()
         is_long = (side == "long")

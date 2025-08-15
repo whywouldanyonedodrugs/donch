@@ -1,21 +1,24 @@
-# optional: meta gate
-META_PROB_THRESHOLD: 0.58
+# --- gating (optional but recommended) ---
+MIN_WINPROB_TO_TRADE: 0.58     # replaces/duplicates META_PROB_THRESHOLD; code patch below
 
-# base risk
-RISK_MODE: "fixed"       # or "percent"
-RISK_USD: 5.0
+# --- base risk ---
+RISK_MODE: "fixed"             # or "percent"
+RISK_USD: 0.10                 # start small; raise later (you had 5.0)
 RISK_EQUITY_PCT: 0.01
+RISK_USD_MIN: 0.05
+RISK_USD_MAX: 2.00
 
-# multipliers
+# --- win-prob sizing (kept) ---
 WINPROB_SIZING_ENABLED: true
-WINPROB_PROB_FLOOR: 0.50
-WINPROB_PROB_CAP: 0.80
-WINPROB_MIN_MULTIPLIER: 0.8
-WINPROB_MAX_MULTIPLIER: 1.3
+WINPROB_PROB_FLOOR: 0.55
+WINPROB_PROB_CAP:   0.80
+WINPROB_MIN_MULTIPLIER: 0.90
+WINPROB_MAX_MULTIPLIER: 1.20
 
+# --- VWAP-stack sizing (kept, narrow influence) ---
 VWAP_STACK_SIZING_ENABLED: true
-VWAP_STACK_MIN_MULTIPLIER: 0.9
-VWAP_STACK_MAX_MULTIPLIER: 1.1
+VWAP_STACK_MIN_MULTIPLIER: 0.95
+VWAP_STACK_MAX_MULTIPLIER: 1.05
 VWAP_STACK_FRAC_MIN: 0.50
 VWAP_STACK_FRAC_GOOD: 0.75
 VWAP_STACK_EXPANSION_ABS_MIN: 0.006
@@ -23,17 +26,7 @@ VWAP_STACK_EXPANSION_GOOD: 0.015
 VWAP_STACK_FRAC_WEIGHT: 0.6
 VWAP_STACK_EXP_WEIGHT: 0.4
 
-# generic YAML scalers (multiply together)
-SIZING_SCALERS:
-  - feature: win_probability
-    in_min: 0.50
-    in_max: 0.80
-    mult_min: 0.90
-    mult_max: 1.20
-  - feature: vwap_stack_frac
-    in_min: 0.50
-    in_max: 0.75
-    mult_min: 0.95
-    mult_max: 1.05
+# --- generic scalers (off for now to avoid double-counting) ---
+SIZING_SCALERS: []
 SIZING_MULT_MIN: 0.5
 SIZING_MULT_MAX: 2.0
