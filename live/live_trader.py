@@ -597,7 +597,8 @@ class LiveTrader:
             verdict = self.strategy_engine.evaluate(dfs, ctx)
             if not verdict.should_enter:
                 return None
-            side = (getattr(verdict, "side", "short") or "short").lower()  # "long" | "short"
+            side = (getattr(verdict, "side", None) or self._strategy_declared_side() or "short").lower()
+
 
             # ---- VWAP-stack diagnostics (for sizing/DB/reporting) -------------------
             lookback = int(self.cfg.get("VWAP_STACK_LOOKBACK_BARS", 12))
@@ -1045,6 +1046,93 @@ class LiveTrader:
             LOG.warning("Stop distance is zero for %s. Skip.", sig.symbol)
             return
         intended_size = max(risk_usd / stop_dist, 0.0)
+
+        try:
+            mkt = self.exchange._exchange.market(sig.symbol)  # unified market
+        except Exception:
+            mkt = None
+
+        min_amt = None
+        min_cost = None
+        step_amt = None
+        if mkt:
+            lims = (mkt.get("limits") or {})
+            amt_lims = (lims.get("amount") or {})
+            cost_lims = (lims.get("cost") or {})
+            min_amt = amt_lims.get("min")  # e.g., BTC perp: 0.001
+            min_cost = cost_lims.get("min")  # not always set on Bybit, but handle if present
+            # ccxt handles precision/step internally; we’ll still track an indicative step
+            step_amt = (mkt.get("precision") or {}).get("amount", None)
+
+        # Round to precision grid first (truncates down), then bump up if below min
+        size_prec = intended_size
+        try:
+            size_prec = float(self.exchange._exchange.amount_to_precision(sig.symbol, intended_size))
+        except Exception:
+            pass
+
+        # If the precision rounding pushed us below min amount, bump to min (or ceil to the next step)
+        def _ceil_to_step(x: float, step: Optional[float]) -> float:
+            import math
+            if not step or step <= 0:
+                return x
+            return math.ceil(x / step) * step
+
+        if (min_amt is not None) and (size_prec < float(min_amt)):
+            # Optionally auto-pad risk to hit the minimum tradable size
+            auto_pad = bool(self.cfg.get("MIN_TRADE_AUTOPAD_ENABLED", True))
+            cap_usd = float(self.cfg.get("MIN_TRADE_AUTOPAD_CAP_USD", 5.0))
+            bumped_size = max(float(min_amt), _ceil_to_step(size_prec, step_amt))
+
+            required_risk = bumped_size * stop_dist  # risk = size * stopDistance
+            if auto_pad and required_risk <= cap_usd:
+                LOG.info("Auto-padding risk to meet min amount: size %.10f -> %.10f (risk %.4f -> %.4f)",
+                        size_prec, bumped_size, risk_usd, required_risk)
+                risk_usd = float(required_risk)
+                size_prec = bumped_size
+            else:
+                LOG.warning("Size %.10f < min_amt %.10f for %s; risk needed ≈ %.4f USDT. "
+                            "Auto-pad=%s cap=%.2f. Skipping entry.",
+                            size_prec, float(min_amt), sig.symbol, required_risk, auto_pad, cap_usd)
+                return
+
+        # If there is a min cost (notional) requirement, ensure we meet it
+        if (min_cost is not None) and mkt:
+            try:
+                last_px = float((await self.exchange.fetch_ticker(sig.symbol))["last"])
+                notional = last_px * size_prec
+                if notional < float(min_cost):
+                    auto_pad = bool(self.cfg.get("MIN_TRADE_AUTOPAD_ENABLED", True))
+                    cap_usd = float(self.cfg.get("MIN_TRADE_AUTOPAD_CAP_USD", 5.0))
+                    # Increase size only as much as needed (respecting step)
+                    need_size = float(min_cost) / last_px
+                    need_size = max(need_size, size_prec)
+                    need_size = _ceil_to_step(need_size, step_amt)
+                    required_risk = need_size * stop_dist
+                    if auto_pad and required_risk <= cap_usd:
+                        LOG.info("Auto-padding for min notional: size %.10f -> %.10f (risk %.4f -> %.4f)",
+                                size_prec, need_size, risk_usd, required_risk)
+                        risk_usd = float(required_risk)
+                        size_prec = float(need_size)
+                    else:
+                        LOG.warning("Notional %.4f < min_cost %.4f on %s; needed risk ≈ %.4f. "
+                                    "Auto-pad=%s cap=%.2f. Skipping.",
+                                    notional, float(min_cost), sig.symbol, required_risk, auto_pad, cap_usd)
+                        return
+            except Exception as e:
+                LOG.warning("Min-cost check failed for %s: %s (continuing)", sig.symbol, e)
+
+        # Final safety: re-apply ccxt precision to the adjusted size
+        try:
+            size_prec = float(self.exchange._exchange.amount_to_precision(sig.symbol, size_prec))
+        except Exception:
+            pass
+
+        if size_prec <= 0:
+            LOG.warning("Final size <= 0 after min/precision checks; skipping entry.")
+            return
+
+        intended_size = size_prec
 
         # --- Ensure leverage/mode ---
         try:
@@ -2032,6 +2120,19 @@ class LiveTrader:
             LOG.error("Failed to generate summary report: %s", e)
             return f"Error: Could not generate {period} report. Check logs."
 
+    def _strategy_declared_side(self) -> Optional[str]:
+        try:
+            spec = getattr(self.strategy_engine, "spec", None) or {}
+            st = spec.get("strategy", {}) if isinstance(spec, dict) else {}
+            s = st.get("side")
+            if s:
+                s = str(s).strip().lower()
+                if s in ("long", "short"):
+                    return s
+        except Exception:
+            pass
+        return None
+
     async def _reporting_loop(self):
         LOG.info("Reporting loop started.")
         last_report_sent = {}
@@ -2084,7 +2185,7 @@ class LiveTrader:
         self._listing_dates_cache = await self._load_listing_dates()
 
         await self._resume()
-        await self.tg.send("🤖 DONCH v0.1 (YAML sizing + meta gate)")
+        await self.tg.send("🤖 DONCH v0.7b")
 
         try:
             async with asyncio.TaskGroup() as tg:
