@@ -544,10 +544,10 @@ class LiveTrader:
             # ---- Timeframes to fetch -------------------------------------------------
             base_tf = str(self.cfg.get('TIMEFRAME', '5m'))
             ema_tf  = str(self.cfg.get('EMA_TIMEFRAME', '4h'))
-            rsi_tf  = str(self.cfg.get('RSI_TIMEFRAME', '1h'))
-            adx_tf  = str(self.cfg.get('ADX_TIMEFRAME', '1h'))
+            rsi_tf  = str(self.cfg.get('RSI_TIMEFRAME', '1h'))  # we still compute RSI on 1h below
+            adx_tf  = str(self.cfg.get('ADX_TIMEFRAME', '1h'))  # we still compute ADX on 1h below
 
-            # we also need these for meta features (ensure presence)
+            # meta features need 1h (ATR/RSI/ADX) and 1d (Donch), keep both
             required_tfs = {base_tf, ema_tf, rsi_tf, adx_tf, '1d', '1h'}
             required_tfs |= set(self.strategy_engine.required_timeframes() or [])
 
@@ -591,7 +591,7 @@ class LiveTrader:
             df5 = dfs[base_tf]
 
             # ---- Indicators aligned to base index -----------------------------------
-            # EMA on ema_tf (for your heuristic only)
+            # EMA on ema_tf (for optional heuristics)
             df5['ema_fast'] = ta.ema(dfs[ema_tf]['close'], cfg.EMA_FAST_PERIOD).reindex(df5.index, method='ffill')
             df5['ema_slow'] = ta.ema(dfs[ema_tf]['close'], cfg.EMA_SLOW_PERIOD).reindex(df5.index, method='ffill')
 
@@ -609,17 +609,17 @@ class LiveTrader:
             df5['rsi_1h'] = rsi_1h.reindex(df5.index, method='ffill')
             df5['adx_1h'] = adx_1h.reindex(df5.index, method='ffill')
 
-            # Keep your legacy 1h ADX/ATR fields too (if you use them elsewhere)
+            # Keep legacy names where used elsewhere
             df5['atr'] = df5['atr_1h']
             df5['adx'] = df5['adx_1h']
             df5['rsi'] = df5['rsi_1h']
 
-            # ---- Robust listing age (UTC) -------------------------------------------
+            # ---- Listing age (UTC) ---------------------------------------------------
             age_opt = self._listing_age_days(symbol, dfs)
             listing_age_days = int(age_opt) if age_opt is not None else 9999
 
             # ---- StrategyEngine verdict ---------------------------------------------
-            univ = (getattr(self, "_universe_ctx", {}) or {}).get(symbol, {})  # e.g., {"rs_pct": 78, "liq_ok": True}
+            univ = (getattr(self, "_universe_ctx", {}) or {}).get(symbol, {})  # e.g. {"rs_pct": 78, "liq_ok": True}
             eth_ctx = {"eth_macd": dict(eth_macd or {})}
             ctx = {
                 "symbol": symbol,
@@ -635,9 +635,7 @@ class LiveTrader:
 
             side = self._resolve_side(verdict)  # "long" | "short"
             LOG.info("Side chosen for %s: %s (verdict=%s, yaml=%s)",
-                    symbol, side.upper(),
-                    getattr(verdict, "side", None),
-                    self._strategy_declared_side())
+                    symbol, side.upper(), getattr(verdict, "side", None), self._strategy_declared_side())
 
             # ---- VWAP-stack diagnostics (DB/reporting only) -------------------------
             lookback = int(self.cfg.get("VWAP_STACK_LOOKBACK_BARS", 12))
@@ -689,17 +687,17 @@ class LiveTrader:
             boom_ret_pct = (last['close'] / last['price_boom_ago'] - 1)
             slowdown_ret_pct = (last['close'] / last['price_slowdown_ago'] - 1)
             is_ema_crossed_down = last['ema_fast'] < last['ema_slow']
-            atr_pct = (last['atr_1h'] / last['close']) if last['close'] > 0 else 0.0
+            atr_frac = (last['atr_1h'] / last['close']) if last['close'] > 0 else 0.0  # fraction, e.g. 0.001 = 0.1%
 
             hour_of_day = now_utc.hour
             day_of_week = now_utc.weekday()
             session_tag = "ASIA" if 0 <= hour_of_day < 8 else "EUROPE" if 8 <= hour_of_day < 16 else "US"
 
             # ---- Build the meta-model feature row -----------------------------------
-            # CATEGORICALS used by your OHE (provide best-available values; fall back to baseline)
+            # CATEGORICALS expected by your OHE (raw names)
             entry_rule = getattr(verdict, "entry_rule", None) or self.cfg.get("ENTRY_RULE", "close_above_break")
             pullback_type = getattr(verdict, "pullback_type", None) or self.cfg.get("PULLBACK_TYPE", "retest")
-            regime_1d = getattr(verdict, "regime_1d", None) or ""  # optional daily regime label if you compute it
+            regime_1d = getattr(verdict, "regime_1d", None) or ""  # if you have a daily regime label
 
             # Donch breakout info (if verdict provided), else compute reference level from 1D Donch(20) shifted
             don_len = int(getattr(verdict, "don_break_len", self.cfg.get("DON_N_DAYS", 20)))
@@ -718,7 +716,7 @@ class LiveTrader:
             # volume multiple: current 5m volume / rolling 30d median (bounded by available bars)
             try:
                 bars_needed = int(self.cfg.get("VOL_LOOKBACK_DAYS", 30) * 24 * (60 // tf_minutes))
-                bars_needed = max(96, min(bars_needed, len(df5)))  # at least ~2 days; cap to available
+                bars_needed = max(96, min(bars_needed, len(df5)))  # >= ~2d; cap to available
                 vol_med = df5['volume'].tail(bars_needed).median()
                 vol_mult = float(last['volume'] / vol_med) if vol_med > 0 else 0.0
             except Exception:
@@ -727,26 +725,27 @@ class LiveTrader:
             # RS percentile from universe (0..100), else 0
             rs_pct = float(univ.get("rs_pct", 0.0) or 0.0)
 
-            # ETH MACD histogram (4h) and above- signal flag
+            # ETH MACD histogram (4h) and above-signal flag
             eth_hist = float((eth_macd or {}).get("hist", 0.0) or 0.0)
             eth_above = 1.0 if float((eth_macd or {}).get("macd", 0.0)) > float((eth_macd or {}).get("signal", 0.0)) else 0.0
             regime_up = 1.0 if (eth_hist > 0 and eth_above == 1.0) else 0.0
 
             # time features
-            hour_sin = math.sin(2 * math.pi * hour_of_day / 24.0)
-            hour_cos = math.cos(2 * math.pi * hour_of_day / 24.0)
+            hour_sin = np.sin(2 * np.pi * hour_of_day / 24.0)
+            hour_cos = np.cos(2 * np.pi * hour_of_day / 24.0)
 
-            # distance from donch level in ATRs
-            don_dist_atr = (float(last['close']) - float(don_level)) / float(last['atr_1h'] if last['atr_1h'] > 0 else np.nan)
+            # distance from donch level in ATRs (defensive against div/0)
+            don_dist_atr = (float(last['close']) - float(don_level)) / (float(last['atr_1h']) if float(last['atr_1h']) > 0 else np.nan)
             if not np.isfinite(don_dist_atr):
                 don_dist_atr = 0.0
 
+            # Build the meta row; names must match your export (feature_names.json)
             meta_row = {
-                # numerics you trained on (names must match your feature_names.json)
+                # numerics
                 "atr_1h": float(last['atr_1h']),
                 "rsi_1h": float(last['rsi_1h']),
                 "adx_1h": float(last['adx_1h']),
-                "atr_pct": float(atr_pct),
+                "atr_pct": float(atr_frac),
                 "don_break_len": float(don_len),
                 "don_break_level": float(don_level),
                 "don_dist_atr": float(don_dist_atr),
@@ -758,38 +757,42 @@ class LiveTrader:
                 "eth_macd_hist_4h": float(eth_hist),
                 "regime_up": float(regime_up),
 
-                # anything else you included numerically in training (defaults are fine if absent)
-                "prior_1d_ret": float(ret_30d),  # if you trained with a 1d return-like feature
-                # "markov_prob_up_4h": 0.0,
-                # "vol_prob_low_1d": 0.0,
-                # ...
+                # optional numerics you might have trained with (safe defaults)
+                "prior_1d_ret": float(ret_30d),
+                "eth_macd_above": float(eth_above),
+                "markov_prob_up_4h": 0.0,
+                "vol_prob_low_1d": 0.0,
+                "trend_bull_1d": 0.0,
+                "vol_low_1d": 0.0,
+                "regime_code_1d": 0.0,
+                "markov_state_up_4h": 0.0,
 
-                # CATEGORICAL INPUTS for OHE:
+                # categoricals (RAW) for OHE
                 "entry_rule": str(entry_rule),
                 "pullback_type": str(pullback_type),
                 "regime_1d": str(regime_1d),
             }
 
-            # ---- Optional extra entry heuristics (kept OFF by default) ---------------
+            # ---- Optional entry heuristics (OFF by default) ---------------------------
             enter_ok = True
             if bool(self.cfg.get("ENTRY_REQUIRE_EMA_CROSS", False)):
                 enter_ok = enter_ok and ((last['ema_fast'] > last['ema_slow']) if side == "long" else (last['ema_fast'] < last['ema_slow']))
             if bool(self.cfg.get("ENTRY_REQUIRE_VWAP_CONSOL", False)):
                 enter_ok = enter_ok and bool(last.get('vwap_consolidated', False))
-            min_atr_pct = float(self.cfg.get("ENTRY_MIN_ATR_PCT", 0.0))
-            if min_atr_pct > 0:
-                enter_ok = enter_ok and (atr_pct >= min_atr_pct)
+            min_atr_frac = float(self.cfg.get("ENTRY_MIN_ATR_PCT", 0.0))  # expect fraction, e.g. 0.0001 = 0.01%
+            if min_atr_frac > 0:
+                enter_ok = enter_ok and (atr_frac >= min_atr_frac)
             if not enter_ok:
                 return None
 
-            # ---- Compose Signal (for DB/journaling & sizing) -------------------------
+            # ---- Compose Signal (DB/journaling & sizing) ------------------------------
             signal_obj = Signal(
                 symbol=symbol,
                 entry=float(last['close']),
                 atr=float(last['atr_1h']),
                 rsi=float(last['rsi_1h']),
                 adx=float(last['adx_1h']),
-                atr_pct=float(atr_pct) * 100.0,       # your DB stored pct in %
+                atr_pct=float(atr_frac) * 100.0,  # stored as percent in DB
                 market_regime=market_regime,
                 price_boom_pct=float(boom_ret_pct),
                 price_slowdown_pct=float(slowdown_ret_pct),
@@ -799,7 +802,7 @@ class LiveTrader:
                 ema_fast=float(last['ema_fast']),
                 ema_slow=float(last['ema_slow']),
                 listing_age_days=int(listing_age_days),
-                session_tag=("ASIA" if 0 <= hour_of_day < 8 else "EUROPE" if 8 <= hour_of_day < 16 else "US"),
+                session_tag=session_tag,
                 day_of_week=day_of_week,
                 hour_of_day=hour_of_day,
                 vwap_consolidated=bool(last.get('vwap_consolidated', False)),
@@ -814,7 +817,7 @@ class LiveTrader:
             # ---- Win-prob scoring (meta model) --------------------------------------
             try:
                 if self.winprob.is_loaded:
-                    wp = self.winprob.score(meta_row)
+                    wp = self.winprob.score(meta_row)  # WinProbScorer handles OHE + exact feature order
                     signal_obj.win_probability = max(0.0, min(1.0, float(wp)))
                 else:
                     signal_obj.win_probability = 0.0
