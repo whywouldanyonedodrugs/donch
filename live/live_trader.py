@@ -1,11 +1,11 @@
 """
-live_trader.py – v4.0 (Clean, YAML sizing + meta gate, no StrategyEngine deps)
+live_trader.py – v4.1 (Clean, YAML sizing + meta gate, robust listing-age)
 =============================================================================
-- Removes unused/missing StrategyEngine hooks to avoid import/runtime errors.
-- Adds YAML-driven sizing scalers (SIZING_SCALERS) and optional META_PROB_THRESHOLD gate.
-- Keeps your win-prob (meta) scorer integration; aligns features by name.
-- Fixes ETH barometer sizing log placement and the nested _yaml_sizing_multiplier bug.
-- Preserves your DB, Telegram, Bybit V5, watchers, reporting, resume, and safety logic.
+- Robust UTC-safe listing-age helper (uses cache, then earliest OHLCV bar).
+- Removes utcnow() deprecation warnings (timezone-aware everywhere).
+- Fixes NameError/UnboundLocal (no stray 'sym', no undefined listing_age_days).
+- Filters get the correct listing_age_days from the built signal.
+- Keeps StrategyEngine, YAML scalers, meta-prob gate, DB/Telegram/Bybit V5, etc.
 """
 
 from __future__ import annotations
@@ -333,8 +333,7 @@ class LiveTrader:
         self._strategy_spec_path = Path(self.strategy_engine.spec_path).resolve()
         _Watcher(self._strategy_spec_path, self._reload_strategy)
         LOG.info("StrategyEngine loaded from %s; requires TFs: %s",
-                self._strategy_spec_path, sorted(self.strategy_engine.required_timeframes()))
-
+                 self._strategy_spec_path, sorted(self.strategy_engine.required_timeframes()))
 
         # Hot reloads
         _Watcher(CONFIG_PATH, self._reload_cfg)
@@ -351,6 +350,45 @@ class LiveTrader:
             LOG.info("WinProb ready (kind=%s, features=%d)", self.winprob.kind, len(self.winprob.expected_features))
         else:
             LOG.warning("WinProb not loaded; using wp=0.0")
+
+    # ---- Robust listing-age helper (UTC-safe) --------------------------------
+    def _listing_age_days(self, symbol: str, dfs: dict[str, pd.DataFrame] | None = None) -> int | None:
+        """
+        Order of preference:
+          1) cached listing_dates.json
+          2) earliest timestamp in fetched dataframes (prefer '1d' if present)
+          3) None if unknown
+        """
+        today = datetime.now(timezone.utc).date()
+
+        # 1) cache
+        d = self._listing_dates_cache.get(symbol)
+        if d:
+            try:
+                return (today - d).days
+            except Exception:
+                pass
+
+        # 2) infer from dataframes (earliest bar)
+        if dfs:
+            try:
+                # prefer '1d', otherwise earliest among all TFs
+                if '1d' in dfs and not dfs['1d'].empty:
+                    earliest = dfs['1d'].index[0].date()
+                else:
+                    earliest = None
+                    for df in dfs.values():
+                        if isinstance(df, pd.DataFrame) and not df.empty:
+                            ts = df.index[0].date()
+                            if earliest is None or ts < earliest:
+                                earliest = ts
+                if earliest:
+                    return (today - earliest).days
+            except Exception:
+                pass
+
+        # 3) unknown
+        return None
 
     def _reload_strategy(self):
         try:
@@ -426,96 +464,6 @@ class LiveTrader:
             LOG.warning("Unexpected leverage setup error for %s: %s", symbol, e)
             raise e
 
-    def _compute_listing_age_days(self, symbol: str, dfs: dict[str, pd.DataFrame]) -> int:
-        """
-        Robust listing age (days):
-        - Prefer earliest date from daily candles we already fetched (dfs['1d']).
-        - If we also have a cached listing date, take the EARLIER of the two.
-        - Return -1 if unknown.
-        """
-        now_d = datetime.now(timezone.utc).date()
-
-        listing_date_cache = self._listing_dates_cache.get(symbol)
-        listing_date_data = None
-
-        df1d = dfs.get('1d')
-        if df1d is not None and not df1d.empty:
-            listing_date_data = df1d.index.min().date()
-
-        if listing_date_cache and listing_date_data:
-            listing_date = listing_date_cache if listing_date_cache <= listing_date_data else listing_date_data
-        else:
-            listing_date = listing_date_cache or listing_date_data
-
-        return (now_d - listing_date).days if listing_date else -1
-
-
-
-    async def _load_listing_dates(self) -> Dict[str, datetime.date]:
-        if LISTING_PATH.exists():
-            raw = json.loads(LISTING_PATH.read_text())
-            return {s: datetime.fromisoformat(ts).date() for s, ts in raw.items()}
-
-        LOG.info("listing_dates.json not found. Fetching from exchange.")
-        async def fetch_date(sym):
-            try:
-                # fetch a long window and take the oldest bar we see
-                candles = await self.exchange.fetch_ohlcv(sym, timeframe="1d", limit=1000)
-                if candles:
-                    ts = min(row[0] for row in candles)
-                    return sym, datetime.fromtimestamp(ts/1000, tz=timezone.utc).date()
-            except Exception as e:
-                LOG.warning("Could not fetch listing date for %s: %s", sym, e)
-            return sym, None
-
-        results = await asyncio.gather(*(fetch_date(s) for s in self.symbols))
-        out = {sym: d for sym, d in results if d}
-        if out:
-            LISTING_PATH.write_text(json.dumps({k: v.isoformat() for k, v in out.items()}, indent=2))
-            LOG.info("Saved %d listing dates to %s", len(out), LISTING_PATH)
-        else:
-            LOG.warning("No listing dates could be determined; leaving file absent.")
-        return out
-
-    # ───────────────────── Exchange order helpers ─────────────────────
-
-    async def _fetch_by_cid(self, cid: str, symbol: str):
-        return await self.exchange.fetch_order(
-            None, symbol, params={"clientOrderId": cid, "category": "linear"}
-        )
-
-    async def _cancel_by_cid(self, cid: str, symbol: str):
-        try:
-            return await self.exchange.cancel_order(
-                None, symbol, params={"clientOrderId": cid, "category": "linear"}
-            )
-        except ccxt.OrderNotFound:
-            LOG.warning("Order %s for %s already filled/cancelled.", cid, symbol)
-        except Exception as e:
-            LOG.error("Failed to cancel order %s for %s: %s", cid, symbol, e)
-
-    async def _all_open_orders(self, symbol: str) -> list:
-        params_linear = {'category': 'linear'}
-        try:
-            active = await self.exchange.fetch_open_orders(symbol, params=params_linear)
-            stop = await self.exchange.fetch_open_orders(symbol, params={**params_linear, 'orderFilter': 'StopOrder'})
-            tpsl = await self.exchange.fetch_open_orders(symbol, params={**params_linear, 'orderFilter': 'tpslOrder'})
-            return active + stop + tpsl
-        except Exception as e:
-            LOG.warning("Could not fetch open orders for %s: %s", symbol, e)
-            return []
-
-    async def _all_open_orders_for_all_symbols(self) -> list:
-        params_linear = {'category': 'linear'}
-        try:
-            active = await self.exchange.fetch_open_orders(params=params_linear)
-            stop = await self.exchange.fetch_open_orders(params={**params_linear, 'orderFilter': 'StopOrder'})
-            tpsl = await self.exchange.fetch_open_orders(params={**params_linear, 'orderFilter': 'tpslOrder'})
-            return active + stop + tpsl
-        except Exception as e:
-            LOG.warning("Could not fetch all open orders: %s", e)
-            return []
-
     # ───────────────────── Indicator scanning ─────────────────────
 
     async def _scan_symbol_for_signal(
@@ -523,7 +471,7 @@ class LiveTrader:
         symbol: str,
         market_regime: str,
         eth_macd: Optional[dict],
-        gov_ctx: Optional[dict] = None  # ignored for now; kept for future governance integration
+        gov_ctx: Optional[dict] = None  # placeholder for future governance integration
     ) -> Optional[Signal]:
         LOG.info("Checking %s...", symbol)
         try:
@@ -581,12 +529,10 @@ class LiveTrader:
             df5['atr']      = ta.atr(dfs[atr_tf], cfg.ADX_PERIOD).reindex(df5.index, method='ffill')
             df5['adx']      = ta.adx(dfs[atr_tf], cfg.ADX_PERIOD).reindex(df5.index, method='ffill')
 
-
-            now_utc_date = datetime.now(timezone.utc).date()
-            listing_age = (
-                (now_utc_date - self._listing_dates_cache.get(sym, now_utc_date)).days
-                if sym in self._listing_dates_cache else None
-            )
+            # ---- Robust listing age (UTC), one place, one value ---------------------
+            age_opt = self._listing_age_days(symbol, dfs)
+            # If unknown, treat as very old so filters won't veto as "new"
+            listing_age_days = int(age_opt) if age_opt is not None else 9999
 
             ctx = {
                 "symbol": symbol,
@@ -596,16 +542,16 @@ class LiveTrader:
                 "is_symbol_blacklisted": is_blacklisted(symbol),
             }
 
-
+            # ---- StrategyEngine verdict & side --------------------------------------
             verdict = self.strategy_engine.evaluate(dfs, ctx)
             if not verdict.should_enter:
                 return None
 
             side = self._resolve_side(verdict)  # "long" | "short"
             LOG.info("Side chosen for %s: %s (verdict=%s, yaml=%s)",
-                    symbol, side.upper(),
-                    getattr(verdict, "side", None),
-                    self._strategy_declared_side())        
+                     symbol, side.upper(),
+                     getattr(verdict, "side", None),
+                     self._strategy_declared_side())
 
             # ---- VWAP-stack diagnostics (for sizing/DB/reporting) -------------------
             lookback = int(self.cfg.get("VWAP_STACK_LOOKBACK_BARS", 12))
@@ -692,7 +638,7 @@ class LiveTrader:
                 ret_30d=ret_30d,
                 ema_fast=float(last['ema_fast']),
                 ema_slow=float(last['ema_slow']),
-                listing_age_days=listing_age_days,  # <-- use the value computed once
+                listing_age_days=int(listing_age_days),
                 session_tag=session_tag,
                 day_of_week=day_of_week,
                 hour_of_day=hour_of_day,
@@ -700,7 +646,6 @@ class LiveTrader:
                 is_ema_crossed_down=bool(is_ema_crossed_down),
                 side=side,
             )
-
 
             # Attach VWAP-stack diagnostics (used later in sizing + DB)
             signal_obj.vwap_stack_frac = vwap_frac
@@ -819,17 +764,6 @@ class LiveTrader:
     def _yaml_sizing_multiplier(self, sig: Signal) -> float:
         """
         Apply a sequence of YAML scalers to produce a single size multiplier.
-        SIZING_SCALERS:
-          - feature: win_probability
-            in_min: 0.50
-            in_max: 0.80
-            mult_min: 0.80
-            mult_max: 1.20
-          - feature: vwap_stack_frac
-            in_min: 0.50
-            in_max: 0.75
-            mult_min: 0.90
-            mult_max: 1.10
         """
         scalers = self.cfg.get("SIZING_SCALERS", []) or []
         if not isinstance(scalers, list) or not scalers:
@@ -953,17 +887,15 @@ class LiveTrader:
                 eth = await self._get_eth_macd_barometer()
                 hist = float(eth.get("hist", 0.0)) if eth else 0.0
                 if is_long:
-                    # unfavorable for LONG if hist < cutoff (momentum down)
                     cutoff = float(self.cfg.get("ETH_MACD_HIST_CUTOFF_NEG", 0.0))
                     unfavorable = (hist < cutoff)
                 else:
-                    # unfavorable for SHORT if hist > cutoff (momentum up)
                     cutoff = float(self.cfg.get("ETH_MACD_HIST_CUTOFF_POS", 0.0))
                     unfavorable = (hist > cutoff)
                 if unfavorable:
                     eth_mult = float(self.cfg.get("UNFAVORABLE_RISK_RESIZE_FACTOR", 0.2))
                     LOG.info("ETH barometer unfavorable → resize x%.2f (hist=%.3f cutoff=%.3f side=%s)",
-                            eth_mult, hist, cutoff, side_label)
+                             eth_mult, hist, cutoff, side_label)
             except Exception as e:
                 LOG.warning("ETH barometer unavailable (%s). Proceeding with base risk.", e)
 
@@ -1036,7 +968,7 @@ class LiveTrader:
         sig.risk_usd = float(risk_usd)
 
         LOG.info("Sizing(%s) base=%.2f · eth×=%.2f · vwap×=%.2f · wp=%.2f (wp×=%.2f) · yaml×=%.2f → risk=%.2f",
-                side_label, base_risk_usd, eth_mult, vw_mult, wp, wp_mult, yaml_mult, risk_usd)
+                 side_label, base_risk_usd, eth_mult, vw_mult, wp, wp_mult, yaml_mult, risk_usd)
 
         # --- Compute size from live price / ATR distance ---
         try:
@@ -1068,7 +1000,6 @@ class LiveTrader:
             cost_lims = (lims.get("cost") or {})
             min_amt = amt_lims.get("min")  # e.g., BTC perp: 0.001
             min_cost = cost_lims.get("min")  # not always set on Bybit, but handle if present
-            # ccxt handles precision/step internally; we’ll still track an indicative step
             step_amt = (mkt.get("precision") or {}).get("amount", None)
 
         # Round to precision grid first (truncates down), then bump up if below min
@@ -1080,21 +1011,19 @@ class LiveTrader:
 
         # If the precision rounding pushed us below min amount, bump to min (or ceil to the next step)
         def _ceil_to_step(x: float, step: Optional[float]) -> float:
-            import math
+            import math as _m
             if not step or step <= 0:
                 return x
-            return math.ceil(x / step) * step
+            return _m.ceil(x / step) * step
 
         if (min_amt is not None) and (size_prec < float(min_amt)):
-            # Optionally auto-pad risk to hit the minimum tradable size
             auto_pad = bool(self.cfg.get("MIN_TRADE_AUTOPAD_ENABLED", True))
             cap_usd = float(self.cfg.get("MIN_TRADE_AUTOPAD_CAP_USD", 5.0))
             bumped_size = max(float(min_amt), _ceil_to_step(size_prec, step_amt))
-
             required_risk = bumped_size * stop_dist  # risk = size * stopDistance
             if auto_pad and required_risk <= cap_usd:
                 LOG.info("Auto-padding risk to meet min amount: size %.10f -> %.10f (risk %.4f -> %.4f)",
-                        size_prec, bumped_size, risk_usd, required_risk)
+                         size_prec, bumped_size, risk_usd, required_risk)
                 risk_usd = float(required_risk)
                 size_prec = bumped_size
             else:
@@ -1111,14 +1040,13 @@ class LiveTrader:
                 if notional < float(min_cost):
                     auto_pad = bool(self.cfg.get("MIN_TRADE_AUTOPAD_ENABLED", True))
                     cap_usd = float(self.cfg.get("MIN_TRADE_AUTOPAD_CAP_USD", 5.0))
-                    # Increase size only as much as needed (respecting step)
                     need_size = float(min_cost) / last_px
                     need_size = max(need_size, size_prec)
                     need_size = _ceil_to_step(need_size, step_amt)
                     required_risk = need_size * stop_dist
                     if auto_pad and required_risk <= cap_usd:
                         LOG.info("Auto-padding for min notional: size %.10f -> %.10f (risk %.4f -> %.4f)",
-                                size_prec, need_size, risk_usd, required_risk)
+                                 size_prec, need_size, risk_usd, required_risk)
                         risk_usd = float(required_risk)
                         size_prec = float(need_size)
                     else:
@@ -1182,7 +1110,7 @@ class LiveTrader:
 
         slippage_usd = (actual_entry_price - px) * actual_size if is_long else (px - actual_entry_price) * actual_size
         LOG.info("Entry confirmed %s %s: size=%.6f @ %.6f (slip $%.4f)",
-                side_label, sig.symbol, actual_size, actual_entry_price, slippage_usd)
+                 side_label, sig.symbol, actual_size, actual_entry_price, slippage_usd)
 
         # --- Protective levels from actual entry ---
         stop_price = (actual_entry_price - sl_mult * float(sig.atr)) if is_long else (actual_entry_price + sl_mult * float(sig.atr))
@@ -1597,7 +1525,7 @@ class LiveTrader:
 
         holding_minutes = (closed_at - opened_at).total_seconds() / 60 if opened_at else 0.0
 
-        # 5) Post-trade analytics (MAE/MFE, realized vol, BTC beta) – best-effort
+        # 5) Post-trade analytics
         mae_usd = mfe_usd = mae_over_atr = mfe_over_atr = 0.0
         realized_vol_during_trade = btc_beta_during_trade = 0.0
         try:
@@ -1626,7 +1554,7 @@ class LiveTrader:
                             bdf = bdf[bdf["ts"] <= closed_at]
                             if not bdf.empty:
                                 comb = pd.concat([asset_rets.rename("asset"),
-                                                bdf["c"].pct_change().rename("btc")], axis=1).dropna()
+                                                  bdf["c"].pct_change().rename("btc")], axis=1).dropna()
                                 if len(comb) > 5 and comb["btc"].var() > 0:
                                     btc_beta_during_trade = comb["asset"].cov(comb["btc"]) / comb["btc"].var()
 
@@ -1733,7 +1661,7 @@ class LiveTrader:
         try:
             my_trades = await self.exchange.fetch_my_trades(symbol, limit=10)
             closing_trade = next(
-                (t for t in reversed(my_trades) if str(t.get("side","")).lower() == close_side),
+                (t for t in reversed(my_trades) if str(t.get("side","")).lower() == ("sell" if side == "LONG" else "buy")),
                 None
             )
             if closing_trade:
@@ -1826,15 +1754,9 @@ class LiveTrader:
                                 continue
 
                             # Old-school filters (belt & suspenders)
-
-                            now_utc_date = datetime.now(timezone.utc).date()
-                            listing_age_days = (
-                                (now_utc_date - self._listing_dates_cache.get(symbol, now_utc_date)).days
-                                if symbol in self._listing_dates_cache else None
-                            )                         
                             ok, vetoes = filters.evaluate(
                                 signal,
-                                listing_age_days=listing_age,
+                                listing_age_days=signal.listing_age_days,
                                 open_positions=open_positions_count,
                                 equity=equity,
                             )
@@ -2270,6 +2192,72 @@ class LiveTrader:
                 await self.db.pool.close()
             await self.tg.close()
             LOG.info("Bot shut down cleanly.")
+
+    # ───────────────────── Listing-date I/O (unchanged logic) ─────────────────
+
+    async def _load_listing_dates(self) -> Dict[str, datetime.date]:
+        if LISTING_PATH.exists():
+            raw = json.loads(LISTING_PATH.read_text())
+            return {s: datetime.fromisoformat(ts).date() for s, ts in raw.items()}
+
+        LOG.info("listing_dates.json not found. Fetching from exchange.")
+        async def fetch_date(sym):
+            try:
+                candles = await self.exchange.fetch_ohlcv(sym, timeframe="1d", limit=1000)
+                if candles:
+                    ts = min(row[0] for row in candles)
+                    return sym, datetime.fromtimestamp(ts/1000, tz=timezone.utc).date()
+            except Exception as e:
+                LOG.warning("Could not fetch listing date for %s: %s", sym, e)
+            return sym, None
+
+        results = await asyncio.gather(*(fetch_date(s) for s in self.symbols))
+        out = {sym: d for sym, d in results if d}
+        if out:
+            LISTING_PATH.write_text(json.dumps({k: v.isoformat() for k, v in out.items()}, indent=2))
+            LOG.info("Saved %d listing dates to %s", len(out), LISTING_PATH)
+        else:
+            LOG.warning("No listing dates could be determined; leaving file absent.")
+        return out
+
+    # ───────────────────── Exchange order helpers ─────────────────────
+
+    async def _fetch_by_cid(self, cid: str, symbol: str):
+        return await self.exchange.fetch_order(
+            None, symbol, params={"clientOrderId": cid, "category": "linear"}
+        )
+
+    async def _cancel_by_cid(self, cid: str, symbol: str):
+        try:
+            return await self.exchange.cancel_order(
+                None, symbol, params={"clientOrderId": cid, "category": "linear"}
+            )
+        except ccxt.OrderNotFound:
+            LOG.warning("Order %s for %s already filled/cancelled.", cid, symbol)
+        except Exception as e:
+            LOG.error("Failed to cancel order %s for %s: %s", cid, symbol, e)
+
+    async def _all_open_orders(self, symbol: str) -> list:
+        params_linear = {'category': 'linear'}
+        try:
+            active = await self.exchange.fetch_open_orders(symbol, params=params_linear)
+            stop = await self.exchange.fetch_open_orders(symbol, params={**params_linear, 'orderFilter': 'StopOrder'})
+            tpsl = await self.exchange.fetch_open_orders(symbol, params={**params_linear, 'orderFilter': 'tpslOrder'})
+            return active + stop + tpsl
+        except Exception as e:
+            LOG.warning("Could not fetch open orders for %s: %s", symbol, e)
+            return []
+
+    async def _all_open_orders_for_all_symbols(self) -> list:
+        params_linear = {'category': 'linear'}
+        try:
+            active = await self.exchange.fetch_open_orders(params=params_linear)
+            stop = await self.exchange.fetch_open_orders(params={**params_linear, 'orderFilter': 'StopOrder'})
+            tpsl = await self.exchange.fetch_open_orders(params={**params_linear, 'orderFilter': 'tpslOrder'})
+            return active + stop + tpsl
+        except Exception as e:
+            LOG.warning("Could not fetch all open orders: %s", e)
+            return []
 
 
 # ──────────────────────────────────────────────────────────────────────────────
