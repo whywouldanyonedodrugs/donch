@@ -426,6 +426,30 @@ class LiveTrader:
             LOG.warning("Unexpected leverage setup error for %s: %s", symbol, e)
             raise e
 
+    def _compute_listing_age_days(self, symbol: str, dfs: dict[str, pd.DataFrame]) -> int:
+        """
+        Robust listing age:
+        - Prefer the earliest date from live 1d candles we already fetched.
+        - If we also have a cached listing date, take the *earlier* of the two.
+        - Return -1 if unknown.
+        """
+        now_d = datetime.now(timezone.utc).date()
+
+        listing_date_cache = self._listing_dates_cache.get(symbol)
+        listing_date_data = None
+
+        df1d = dfs.get('1d')
+        if df1d is not None and not df1d.empty:
+            listing_date_data = df1d.index.min().date()
+
+        if listing_date_cache and listing_date_data:
+            listing_date = listing_date_cache if listing_date_cache <= listing_date_data else listing_date_data
+        else:
+            listing_date = listing_date_cache or listing_date_data
+
+        return (now_d - listing_date).days if listing_date else -1
+
+
     async def _load_listing_dates(self) -> Dict[str, datetime.date]:
         if LISTING_PATH.exists():
             raw = json.loads(LISTING_PATH.read_text())
@@ -557,15 +581,18 @@ class LiveTrader:
             df5['adx']      = ta.adx(dfs[atr_tf], cfg.ADX_PERIOD).reindex(df5.index, method='ffill')
 
 
-            listing_age = ((datetime.utcnow().date() - self._listing_dates_cache[symbol]).days
+            listing_age = ((datetime.now(timezone.utc).date() - self._listing_dates_cache[symbol]).days
                         if symbol in self._listing_dates_cache else None)
+
+
             ctx = {
                 "symbol": symbol,
                 "market_regime": market_regime,
-                "listing_age_days": listing_age,
+                "listing_age_days": listing_age_days,
                 "last_exit_dt": self.last_exit.get(symbol),
                 "is_symbol_blacklisted": is_blacklisted(symbol),
             }
+
 
             verdict = self.strategy_engine.evaluate(dfs, ctx)
             if not verdict.should_enter:
@@ -617,6 +644,15 @@ class LiveTrader:
             last = df5.iloc[-1]
             now_utc = datetime.now(timezone.utc)
 
+            # Robust listing age (no false "AGE_TOO_NEW")
+            listing_age_days = self._compute_listing_age_days(symbol, dfs)
+
+            hour_of_day = now_utc.hour
+            day_of_week = now_utc.weekday()
+            session_tag = "ASIA" if 0 <= hour_of_day < 8 else "EUROPE" if 8 <= hour_of_day < 16 else "US"
+
+
+
             # Compute values for Signal + logs
             boom_ret_pct = (last['close'] / last['price_boom_ago'] - 1)
             slowdown_ret_pct = (last['close'] / last['price_slowdown_ago'] - 1)
@@ -626,10 +662,7 @@ class LiveTrader:
             hour_of_day = now_utc.hour
             day_of_week = now_utc.weekday()
             session_tag = "ASIA" if 0 <= hour_of_day < 8 else "EUROPE" if 8 <= hour_of_day < 16 else "US"
-            listing_age_days = (
-                (now_utc.date() - self._listing_dates_cache[symbol]).days
-                if symbol in self._listing_dates_cache else -1
-            )
+
 
             # ---- Built-in entry heuristic (side-aware) -------
             enter_ok = True
@@ -644,20 +677,30 @@ class LiveTrader:
             if not enter_ok:
                 return None
 
-
             signal_obj = Signal(
-                symbol=symbol, entry=float(last['close']), atr=float(last['atr']),
-                rsi=float(last['rsi']), adx=float(last['adx']), atr_pct=atr_pct,
-                market_regime=market_regime, price_boom_pct=boom_ret_pct,
-                price_slowdown_pct=slowdown_ret_pct, vwap_dev_pct=float(last.get('vwap_dev_pct', 0.0)),
-                vwap_z_score=float(last.get('vwap_z_score', 0.0)), ret_30d=ret_30d,
-                ema_fast=float(last['ema_fast']), ema_slow=float(last['ema_slow']),
-                listing_age_days=listing_age_days, session_tag=session_tag,
-                day_of_week=day_of_week, hour_of_day=hour_of_day,
+                symbol=symbol,
+                entry=float(last['close']),
+                atr=float(last['atr']),
+                rsi=float(last['rsi']),
+                adx=float(last['adx']),
+                atr_pct=atr_pct,
+                market_regime=market_regime,
+                price_boom_pct=boom_ret_pct,
+                price_slowdown_pct=slowdown_ret_pct,
+                vwap_dev_pct=float(last.get('vwap_dev_pct', 0.0)),
+                vwap_z_score=float(last.get('vwap_z_score', 0.0)),
+                ret_30d=ret_30d,
+                ema_fast=float(last['ema_fast']),
+                ema_slow=float(last['ema_slow']),
+                listing_age_days=listing_age_days,
+                session_tag=session_tag,
+                day_of_week=day_of_week,
+                hour_of_day=hour_of_day,
                 vwap_consolidated=bool(last.get('vwap_consolidated', False)),
                 is_ema_crossed_down=bool(is_ema_crossed_down),
-                side=side,   # ← NEW: propagate side into Signal
+                side=side,
             )
+
 
             # Attach VWAP-stack diagnostics (used later in sizing + DB)
             signal_obj.vwap_stack_frac = vwap_frac
@@ -1696,12 +1739,14 @@ class LiveTrader:
                                 continue
 
                             # Old-school filters (belt & suspenders)
-                            listing_age = (datetime.utcnow().date() - self._listing_dates_cache.get(sym, datetime.utcnow().date())).days \
-                                          if sym in self._listing_dates_cache else None
+                            listing_age = getattr(signal, "listing_age_days", None)
                             ok, vetoes = filters.evaluate(
-                                signal, listing_age_days=listing_age,
-                                open_positions=open_positions_count, equity=equity
+                                signal,
+                                listing_age_days=listing_age,
+                                open_positions=open_positions_count,
+                                equity=equity,
                             )
+
                             if ok:
                                 await self._open_position(signal)
                                 open_positions_count += 1
