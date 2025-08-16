@@ -321,6 +321,8 @@ class LiveTrader:
         self.regime_detector = RegimeDetector(self.exchange, self.cfg)
 
         self.symbols = self._load_symbols()
+        self._universe_ctx: dict[str, dict] = {}
+        self._universe_ctx_ts: datetime = datetime.min.replace(tzinfo=timezone.utc)
         self.open_positions: Dict[int, Dict[str, Any]] = {}
         self.peak_equity: float = 0.0
         self._listing_dates_cache: Dict[str, datetime.date] = {}
@@ -374,12 +376,13 @@ class LiveTrader:
         Returns { symbol: {"rs_pct": float, "median_24h_turnover_usd": float} }
         """
         syms = list(self.symbols)
-        # concurrent pulls: 1d and 1h per symbol
-        async with self.api_semaphore:
-            tasks_1d = {s: self.exchange.fetch_ohlcv(s, '1d', limit=10) for s in syms}
-            tasks_1h = {s: self.exchange.fetch_ohlcv(s, '1h', limit=168) for s in syms}
-            res_1d = await asyncio.gather(*tasks_1d.values(), return_exceptions=True)
-            res_1h = await asyncio.gather(*tasks_1h.values(), return_exceptions=True)
+        LOG.info("Building universe context for %d symbols…", len(syms))
+
+        # Run the two big batches without holding a single semaphore token over all of them.
+        tasks_1d = {s: self.exchange.fetch_ohlcv(s, '1d', limit=10) for s in syms}
+        tasks_1h = {s: self.exchange.fetch_ohlcv(s, '1h', limit=168) for s in syms}
+        res_1d = await asyncio.gather(*tasks_1d.values(), return_exceptions=True)
+        res_1h = await asyncio.gather(*tasks_1h.values(), return_exceptions=True)
 
         one_d = {s: r for s, r in zip(tasks_1d.keys(), res_1d)}
         one_h = {s: r for s, r in zip(tasks_1h.keys(), res_1h)}
@@ -430,6 +433,8 @@ class LiveTrader:
                 "rs_pct": float(pct[i]),
                 "median_24h_turnover_usd": float(med24[s]),
             }
+
+        LOG.info("Universe context ready (%d symbols).", len(out))
         return out
 
     # ---- Robust listing-age helper (UTC-safe) --------------------------------
@@ -1895,11 +1900,18 @@ class LiveTrader:
                 LOG.info("New scan cycle for %d symbols | regime: %s", len(self.symbols), current_market_regime)
 
                 try:
-                    self._universe_ctx = await self._build_universe_context()
+                    refresh_min = int(self.cfg.get("UNIVERSE_CTX_REFRESH_MIN", 60))
+                    age = (datetime.now(timezone.utc) - getattr(self, "_universe_ctx_ts", datetime.min.replace(tzinfo=timezone.utc)))
+                    if not self._universe_ctx or age > timedelta(minutes=refresh_min):
+                        self._universe_ctx = await self._build_universe_context()
+                        self._universe_ctx_ts = datetime.now(timezone.utc)
+                    else:
+                        LOG.info("Reusing cached universe context (%d symbols, age=%d min).",
+                                 len(self._universe_ctx), max(0, int(age.total_seconds() // 60)))
                 except Exception as e:
                     LOG.warning("Universe context failed: %s (continuing with empty).", e)
                     self._universe_ctx = {}
-
+                    
                 # ETH MACD Barometer (4h)
                 eth_macd_data = None
                 try:
