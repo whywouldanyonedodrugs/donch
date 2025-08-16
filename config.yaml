@@ -1,5 +1,5 @@
 # Strategy selection
-STRATEGY_SPEC_PATH: "strategy/donch_pullback_long.yaml"
+STRATEGY_SPEC_PATH: "strategies/donch_pullback_long.yaml"
 
 # Sizing
 RISK_MODE: "cash"           # or "percent"
