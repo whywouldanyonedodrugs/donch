@@ -428,9 +428,9 @@ class LiveTrader:
 
     def _compute_listing_age_days(self, symbol: str, dfs: dict[str, pd.DataFrame]) -> int:
         """
-        Robust listing age:
-        - Prefer the earliest date from live 1d candles we already fetched.
-        - If we also have a cached listing date, take the *earlier* of the two.
+        Robust listing age (days):
+        - Prefer earliest date from daily candles we already fetched (dfs['1d']).
+        - If we also have a cached listing date, take the EARLIER of the two.
         - Return -1 if unknown.
         """
         now_d = datetime.now(timezone.utc).date()
@@ -448,6 +448,7 @@ class LiveTrader:
             listing_date = listing_date_cache or listing_date_data
 
         return (now_d - listing_date).days if listing_date else -1
+
 
 
     async def _load_listing_dates(self) -> Dict[str, datetime.date]:
@@ -581,8 +582,7 @@ class LiveTrader:
             df5['adx']      = ta.adx(dfs[atr_tf], cfg.ADX_PERIOD).reindex(df5.index, method='ffill')
 
 
-            listing_age = ((datetime.now(timezone.utc).date() - self._listing_dates_cache[symbol]).days
-                        if symbol in self._listing_dates_cache else None)
+            listing_age_days = self._compute_listing_age_days(symbol, dfs)
 
 
             ctx = {
@@ -642,38 +642,30 @@ class LiveTrader:
                 return None
 
             last = df5.iloc[-1]
-            now_utc = datetime.now(timezone.utc)
+            now_utc = datetime.now(timezone.utc)  # UTC-aware
 
-            # Robust listing age (no false "AGE_TOO_NEW")
-            listing_age_days = self._compute_listing_age_days(symbol, dfs)
-
-            hour_of_day = now_utc.hour
-            day_of_week = now_utc.weekday()
-            session_tag = "ASIA" if 0 <= hour_of_day < 8 else "EUROPE" if 8 <= hour_of_day < 16 else "US"
-
-
-
-            # Compute values for Signal + logs
             boom_ret_pct = (last['close'] / last['price_boom_ago'] - 1)
             slowdown_ret_pct = (last['close'] / last['price_slowdown_ago'] - 1)
             is_ema_crossed_down = last['ema_fast'] < last['ema_slow']
-            is_long = (side == "long")
             atr_pct = (last['atr'] / last['close']) * 100 if last['close'] > 0 else 0.0
+
             hour_of_day = now_utc.hour
             day_of_week = now_utc.weekday()
             session_tag = "ASIA" if 0 <= hour_of_day < 8 else "EUROPE" if 8 <= hour_of_day < 16 else "US"
 
-
-            # ---- Built-in entry heuristic (side-aware) -------
+            # ---- Optional side-aware built-in entry heuristic (OFF by default) ----
             enter_ok = True
-            if bool(self.cfg.get("ENTRY_REQUIRE_EMA_CROSS", True)):
-                enter_ok = enter_ok and ( (not is_ema_crossed_down) if is_long else is_ema_crossed_down )
+            need_cross = bool(self.cfg.get("ENTRY_REQUIRE_EMA_CROSS", False))
+            if need_cross:
+                if side == "long":
+                    enter_ok = enter_ok and bool(last['ema_fast'] > last['ema_slow'])
+                else:
+                    enter_ok = enter_ok and bool(last['ema_fast'] < last['ema_slow'])
             if bool(self.cfg.get("ENTRY_REQUIRE_VWAP_CONSOL", False)):
                 enter_ok = enter_ok and bool(last.get('vwap_consolidated', False))
             min_atr_pct = float(self.cfg.get("ENTRY_MIN_ATR_PCT", 0.0))
             if min_atr_pct > 0:
                 enter_ok = enter_ok and (atr_pct >= min_atr_pct)
-
             if not enter_ok:
                 return None
 
@@ -692,7 +684,7 @@ class LiveTrader:
                 ret_30d=ret_30d,
                 ema_fast=float(last['ema_fast']),
                 ema_slow=float(last['ema_slow']),
-                listing_age_days=listing_age_days,
+                listing_age_days=listing_age_days,  # <-- use the value computed once
                 session_tag=session_tag,
                 day_of_week=day_of_week,
                 hour_of_day=hour_of_day,
