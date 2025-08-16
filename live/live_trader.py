@@ -2077,7 +2077,6 @@ class LiveTrader:
                     self._universe_ctx = uc
                     LOG.info("Universe context loaded from cache (%d symbols).", len(self._universe_ctx))
                 else:
-                    LOG.info("Building universe context for %d symbols…", len(self.symbols))
                     try:
                         self._universe_ctx = await self._build_universe_context()
                         LOG.info("Universe context ready (%d symbols).", len(self._universe_ctx))
