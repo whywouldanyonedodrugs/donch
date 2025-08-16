@@ -51,6 +51,7 @@ from pydantic import Field, ValidationError
 from pydantic_settings import BaseSettings
 from .strategy_engine import StrategyEngine
 
+UNIVERSE_CACHE_PATH = Path("universe_cache.json")
 # ──────────────────────────────────────────────────────────────────────────────
 # Shims/utilities that may be referenced by joblib'd pipelines from research
 # ──────────────────────────────────────────────────────────────────────────────
@@ -366,6 +367,56 @@ class LiveTrader:
                 LOG.info("WinProb ready (kind=%s, features=%d)", kind, nfeats)
         else:
             LOG.warning("WinProb not loaded; using wp=0.0")
+
+    def _load_universe_cache_if_fresh(self) -> Optional[dict]:
+        """Return {symbol: {rs_pct, median_24h_turnover_usd}} if cache exists & fresh & symbols match."""
+        if not bool(self.cfg.get("UNIVERSE_CACHE_ENABLED", True)):
+            return None
+        p = Path(self.cfg.get("UNIVERSE_CACHE_PATH", UNIVERSE_CACHE_PATH))
+        if not p.exists():
+            return None
+        try:
+            raw = json.loads(p.read_text())
+            ttl_min = int(self.cfg.get("UNIVERSE_CACHE_TTL_MIN", 1440))  # default: 24h
+            ts = raw.get("computed_at")
+            if not ts:
+                return None
+            # tolerate "Z" suffix or naive
+            try:
+                computed_at = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            except Exception:
+                computed_at = datetime.fromisoformat(ts)
+            if computed_at.tzinfo is None:
+                computed_at = computed_at.replace(tzinfo=timezone.utc)
+
+            if datetime.now(timezone.utc) - computed_at > timedelta(minutes=ttl_min):
+                return None
+
+            if bool(self.cfg.get("UNIVERSE_CACHE_REQUIRE_SYMBOLS_MATCH", True)):
+                cached_syms = list(map(str, raw.get("symbols", [])))
+                if sorted(cached_syms) != sorted(map(str, self.symbols)):
+                    return None
+
+            data = raw.get("data")
+            return data if isinstance(data, dict) and data else None
+        except Exception as e:
+            LOG.warning("Universe cache load failed: %s", e)
+            return None
+
+    def _save_universe_cache(self, data: dict) -> None:
+        if not bool(self.cfg.get("UNIVERSE_CACHE_ENABLED", True)):
+            return
+        p = Path(self.cfg.get("UNIVERSE_CACHE_PATH", UNIVERSE_CACHE_PATH))
+        try:
+            blob = {
+                "computed_at": datetime.now(timezone.utc).isoformat(),
+                "symbols": list(self.symbols),
+                "data": data,
+            }
+            p.write_text(json.dumps(blob))
+            LOG.info("Universe context cached to %s (%d symbols).", p, len(data))
+        except Exception as e:
+            LOG.warning("Failed to write universe cache: %s", e)
 
 
     async def _build_universe_context(self) -> dict[str, dict]:
@@ -2021,18 +2072,19 @@ class LiveTrader:
                 current_market_regime = await self.regime_detector.get_current_regime()
                 LOG.info("New scan cycle for %d symbols | regime: %s", len(self.symbols), current_market_regime)
 
-                try:
-                    refresh_min = int(self.cfg.get("UNIVERSE_CTX_REFRESH_MIN", 60))
-                    age = (datetime.now(timezone.utc) - getattr(self, "_universe_ctx_ts", datetime.min.replace(tzinfo=timezone.utc)))
-                    if not self._universe_ctx or age > timedelta(minutes=refresh_min):
+                uc = self._load_universe_cache_if_fresh()
+                if uc is not None:
+                    self._universe_ctx = uc
+                    LOG.info("Universe context loaded from cache (%d symbols).", len(self._universe_ctx))
+                else:
+                    LOG.info("Building universe context for %d symbols…", len(self.symbols))
+                    try:
                         self._universe_ctx = await self._build_universe_context()
-                        self._universe_ctx_ts = datetime.now(timezone.utc)
-                    else:
-                        LOG.info("Reusing cached universe context (%d symbols, age=%d min).",
-                                 len(self._universe_ctx), max(0, int(age.total_seconds() // 60)))
-                except Exception as e:
-                    LOG.warning("Universe context failed: %s (continuing with empty).", e)
-                    self._universe_ctx = {}
+                        LOG.info("Universe context ready (%d symbols).", len(self._universe_ctx))
+                        self._save_universe_cache(self._universe_ctx)
+                    except Exception as e:
+                        LOG.warning("Universe context failed: %s (continuing with empty).", e)
+                        self._universe_ctx = {}
 
                 # ETH MACD Barometer (4h)
                 eth_macd_data = None
