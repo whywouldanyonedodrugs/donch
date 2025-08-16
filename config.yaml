@@ -1,7 +1,7 @@
 STRATEGY_SPEC_PATH: "strategies/dummy_long_ema500.yaml"
 META_PROB_THRESHOLD: 0.0   # don’t gate entries while wiring
 RISK_MODE: "fixed"
-RISK_USD: 0.10             # tiny test risk
+RISK_USD: 1.00            # tiny test risk
 
 
 # --- gating (optional but recommended) ---
@@ -47,4 +47,4 @@ ETH_BAROMETER_ENABLED: false
 
 
 MIN_TRADE_AUTOPAD_ENABLED: true
-MIN_TRADE_AUTOPAD_CAP_USD: 0.5
+MIN_TRADE_AUTOPAD_CAP_USD: 5.0

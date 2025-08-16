@@ -583,10 +583,10 @@ class LiveTrader:
 
 
             now_utc_date = datetime.now(timezone.utc).date()
-            listing_age_days = (
-                (now_utc_date - self._listing_dates_cache.get(symbol, now_utc_date)).days
-                if symbol in self._listing_dates_cache else None
-)
+            listing_age = (
+                (now_utc_date - self._listing_dates_cache.get(sym, now_utc_date)).days
+                if sym in self._listing_dates_cache else None
+            )
 
             ctx = {
                 "symbol": symbol,
@@ -600,11 +600,12 @@ class LiveTrader:
             verdict = self.strategy_engine.evaluate(dfs, ctx)
             if not verdict.should_enter:
                 return None
+
             side = self._resolve_side(verdict)  # "long" | "short"
             LOG.info("Side chosen for %s: %s (verdict=%s, yaml=%s)",
                     symbol, side.upper(),
                     getattr(verdict, "side", None),
-                    self._strategy_declared_side())            
+                    self._strategy_declared_side())        
 
             # ---- VWAP-stack diagnostics (for sizing/DB/reporting) -------------------
             lookback = int(self.cfg.get("VWAP_STACK_LOOKBACK_BARS", 12))
@@ -1827,10 +1828,10 @@ class LiveTrader:
                             # Old-school filters (belt & suspenders)
 
                             now_utc_date = datetime.now(timezone.utc).date()
-                            listing_age = (
-                                (now_utc_date - self._listing_dates_cache.get(sym, now_utc_date)).days
-                                if sym in self._listing_dates_cache else None
-)                            
+                            listing_age_days = (
+                                (now_utc_date - self._listing_dates_cache.get(symbol, now_utc_date)).days
+                                if symbol in self._listing_dates_cache else None
+                            )                         
                             ok, vetoes = filters.evaluate(
                                 signal,
                                 listing_age_days=listing_age,
@@ -2132,26 +2133,62 @@ class LiveTrader:
             return f"Error: Could not generate {period} report. Check logs."
 
     def _strategy_declared_side(self) -> str | None:
-        """Read 'strategy.side' from the loaded YAML spec, if present."""
+        """
+        Read 'strategy.side' from the loaded YAML spec file, robustly.
+        Returns 'long' | 'short' | None
+        """
+        # 1) Try reading from the actual YAML file
         try:
-            spec = getattr(self.strategy_engine, "spec", None) or {}
-            st = spec.get("strategy", {}) if isinstance(spec, dict) else {}
-            s = st.get("side")
-            if s:
-                s = str(s).strip().lower()
-                if s in ("long", "short"):
-                    return s
+            path = getattr(self, "_strategy_spec_path", None)
+            if path:
+                from pathlib import Path as _P
+                import yaml as _yaml
+                data = _yaml.safe_load(_P(path).read_text()) or {}
+                st = data.get("strategy") or {}
+                s = st.get("side")
+                if s:
+                    s = str(s).strip().lower()
+                    if s in ("long", "short"):
+                        return s
+        except Exception:
+            pass
+
+        # 2) Fallback: try whatever the StrategyEngine exposes
+        try:
+            spec = getattr(self.strategy_engine, "spec", None)
+            if isinstance(spec, dict):
+                st = spec.get("strategy") or {}
+                s = st.get("side")
+                if s:
+                    s = str(s).strip().lower()
+                    if s in ("long", "short"):
+                        return s
         except Exception:
             pass
         return None
 
     def _resolve_side(self, verdict) -> str:
         """
-        Order of precedence for deciding side:
-        1) verdict.side (if engine supplies it)
-        2) YAML 'strategy.side'
-        3) default: 'short'
+        Precedence for deciding side:
+        1) STRATEGY_SIDE_OVERRIDE in config.yaml (if set to 'long'/'short')
+        2) YAML 'strategy.side' (from the strategy file)
+        3) verdict.side (if provided by StrategyEngine)
+        4) default: 'short'
         """
+        # 1) Hard override via config
+        try:
+            forced = str(self.cfg.get("STRATEGY_SIDE_OVERRIDE", "") or "").strip().lower()
+            if forced in ("long", "short"):
+                return forced
+        except Exception:
+            pass
+
+        # 2) YAML
+        y = self._strategy_declared_side()
+        if y:
+            return y
+
+        # 3) Verdict
         try:
             v = getattr(verdict, "side", None)
             if v:
@@ -2160,9 +2197,8 @@ class LiveTrader:
                     return vs
         except Exception:
             pass
-        y = self._strategy_declared_side()
-        if y:
-            return y
+
+        # 4) Default
         return "short"
 
     async def _reporting_loop(self):
