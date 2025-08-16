@@ -994,6 +994,21 @@ class LiveTrader:
             signal_obj.vwap_stack_expansion_pct = vwap_exp
             signal_obj.vwap_stack_slope_pph = vwap_slope
 
+            signal_obj.rs_pct = rs_pct
+            signal_obj.liq_ok = bool(univ.get("liq_ok", True))
+            signal_obj.vol_mult = vol_mult
+
+            signal_obj.don_break_len = don_len
+            signal_obj.don_break_level = don_level
+            signal_obj.don_dist_atr = don_dist_atr
+
+            signal_obj.eth_macd_hist_4h = eth_hist
+            signal_obj.eth_macd_above_signal = bool(eth_above)
+            signal_obj.regime_up_flag = bool(regime_up)
+
+            signal_obj.entry_rule = entry_rule
+            signal_obj.pullback_type = pullback_type
+            signal_obj.regime_1d = regime_1d or ""
             # -------------- Win-prob scoring ---------------------
             try:
                 if self.winprob.is_loaded:
@@ -1604,18 +1619,65 @@ class LiveTrader:
             self.open_positions[pid] = dict(row)
 
             # --- Telegram ---
-            vwap_frac  = getattr(sig, "vwap_stack_frac", None)
-            vwap_exp   = getattr(sig, "vwap_stack_expansion_pct", None)
-            vwap_slope = getattr(sig, "vwap_stack_slope_pph", None)
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+            # thresholds from config
+            rs_min       = float(self.cfg.get("RS_MIN_PERCENTILE", 70))
+            vol_needed   = float(self.cfg.get("VOL_MULTIPLE", 2.0))
+            regime_block = bool(self.cfg.get("REGIME_BLOCK_WHEN_DOWN", True))
+            min_atr_pct  = float(self.cfg.get("ENTRY_MIN_ATR_PCT", 0.0))
+            meta_thresh  = float(self.cfg.get("META_PROB_THRESHOLD", 0.0))
+
+            # values from signal (set during scan)
+            rs_pct      = float(getattr(sig, "rs_pct", 0.0) or 0.0)
+            liq_ok      = bool(getattr(sig, "liq_ok", True))
+            vol_mult    = float(getattr(sig, "vol_mult", 0.0) or 0.0)
+            don_len     = getattr(sig, "don_break_len", None)
+            don_level   = getattr(sig, "don_break_level", None)
+            don_dist    = getattr(sig, "don_dist_atr", None)
+            eth_hist    = getattr(sig, "eth_macd_hist_4h", None)
+            eth_above   = getattr(sig, "eth_macd_above_signal", None)
+            reg_up      = bool(getattr(sig, "regime_up_flag", False))
+            pullback    = getattr(sig, "pullback_type", "?")
+            entry_rule  = getattr(sig, "entry_rule", "?")
+
+            # safe strings
+            don_len_s   = str(don_len) if isinstance(don_len, (int, float)) else "?"
+            don_level_s = f"{don_level:.6f}" if isinstance(don_level, (int, float)) else "N/A"
+            don_dist_s  = f"{don_dist:+.2f}" if isinstance(don_dist, (int, float)) else "N/A"
+            eth_hist_s  = f"{eth_hist:.3f}" if isinstance(eth_hist, (int, float)) else "N/A"
+            vwap_frac   = getattr(sig, "vwap_stack_frac", None)
+            vwap_exp    = getattr(sig, "vwap_stack_expansion_pct", None)
+            vwap_slope  = getattr(sig, "vwap_stack_slope_pph", None)
+            vwap_frac_s  = f"{vwap_frac:.2f}" if isinstance(vwap_frac, (int, float)) else "N/A"
+            vwap_exp_s   = f"{(vwap_exp*100):.2f}%" if isinstance(vwap_exp, (int, float)) else "N/A"
+            vwap_slope_s = f"{vwap_slope:.4f}" if isinstance(vwap_slope, (int, float)) else "N/A"
+
+            # gates (mirror the scan diagnostic)
+            def _ok(b): return "✅" if b else "❌"
+            g_rs    = (rs_pct >= rs_min)
+            g_liq   = liq_ok
+            g_reg   = (reg_up or (not regime_block))
+            g_vol   = (vol_mult >= vol_needed)
+            g_micro = ((float(sig.atr_pct)/100.0) >= min_atr_pct)
+            g_meta  = (wp >= meta_thresh)
+
+            # TP preview (even if partials enabled, show final)
+            final_tp_mult  = float(self.cfg.get("FINAL_TP_ATR_MULT", 8.0))
+            tp_final_price = actual_entry_price + (final_tp_mult * float(sig.atr) * (+1 if is_long else -1))
+
             msg = (
-                f"🔔 Opened {side_label} {sig.symbol}\n"
-                f"Entry: {actual_entry_price:.8f}\n"
-                f"ATR(1h): {sig.atr:.8f}  ATR%: {sig.atr_pct:.2f}%\n"
-                f"Risk: ${sig.risk_usd:.2f}  (ETH×{eth_mult:.2f} · VWAP×{vw_mult:.2f} · WP×{wp_mult:.2f} · YAML×{yaml_mult:.2f})\n"
-                f"VWAP stack: frac={vwap_frac if vwap_frac is not None else 'N/A'}  "
-                f"exp={f'{vwap_exp:.2f}%' if vwap_exp is not None else 'N/A'}  "
-                f"slope_pph={f'{vwap_slope:.4f}' if vwap_slope is not None else 'N/A'}\n"
-                f"WinProb: {wp:.2%}"
+                f"🔔 OPENED {side_label} {sig.symbol} — {ts} UTC\n"
+                f"Price: {actual_entry_price:.6f} | ATR1h: {sig.atr:.6f} ({sig.atr_pct:.2f}%) | RSI1h: {sig.rsi:.1f} | ADX1h: {sig.adx:.1f}\n"
+                f"Donch({don_len_s}d): level={don_level_s}  dist_atr={don_dist_s}\n"
+                f"Volume mult: x{vol_mult:.2f} | RS: {rs_pct:.1f}% | Regime: {sig.market_regime}\n"
+                f"ETH(4h) MACD hist: {eth_hist_s}  MACD>signal: {bool(eth_above)}  → regime_up={reg_up}\n"
+                f"VWAP stack: frac={vwap_frac_s}  exp={vwap_exp_s}  slope_pph={vwap_slope_s}\n"
+                f"Entry Rule: {pullback} + {entry_rule}\n"
+                f"GATES: RS≥{rs_min:.0f} {_ok(g_rs)} | Liquidity {_ok(g_liq)} | RegimeUp/OK {_ok(g_reg)} | "
+                f"Vol x{vol_needed:.1f} {_ok(g_vol)} | MicroATR≥{min_atr_pct:.4f} {_ok(g_micro)} | META p={wp:.3f}≥{meta_thresh:.2f} {_ok(g_meta)}\n"
+                f"Sizing: base ${base_risk_usd:.2f} · ETH×{eth_mult:.2f} · VWAP×{vw_mult:.2f} · WP×{wp_mult:.2f} · YAML×{yaml_mult:.2f} ⇒ risk ${risk_usd:.2f}\n"
+                f"Protection: SL {sl_mult:.2f}×ATR → {stop_price:.6f} | Final TP {final_tp_mult:.2f}×ATR → {tp_final_price:.6f}"
             )
             await self.tg.send(msg)
 
@@ -2560,7 +2622,7 @@ class LiveTrader:
         self._listing_dates_cache = await self._load_listing_dates()
 
         await self._resume()
-        await self.tg.send("🤖 DONCH v0.9b test")
+        await self.tg.send("🤖 DONCH v1.0")
 
         try:
             async with asyncio.TaskGroup() as tg:
