@@ -582,8 +582,11 @@ class LiveTrader:
             df5['adx']      = ta.adx(dfs[atr_tf], cfg.ADX_PERIOD).reindex(df5.index, method='ffill')
 
 
-            listing_age_days = self._compute_listing_age_days(symbol, dfs)
-
+            now_utc_date = datetime.now(timezone.utc).date()
+            listing_age_days = (
+                (now_utc_date - self._listing_dates_cache.get(symbol, now_utc_date)).days
+                if symbol in self._listing_dates_cache else None
+)
 
             ctx = {
                 "symbol": symbol,
@@ -597,8 +600,11 @@ class LiveTrader:
             verdict = self.strategy_engine.evaluate(dfs, ctx)
             if not verdict.should_enter:
                 return None
-            side = (getattr(verdict, "side", None) or self._strategy_declared_side() or "short").lower()
-
+            side = self._resolve_side(verdict)  # "long" | "short"
+            LOG.info("Side chosen for %s: %s (verdict=%s, yaml=%s)",
+                    symbol, side.upper(),
+                    getattr(verdict, "side", None),
+                    self._strategy_declared_side())            
 
             # ---- VWAP-stack diagnostics (for sizing/DB/reporting) -------------------
             lookback = int(self.cfg.get("VWAP_STACK_LOOKBACK_BARS", 12))
@@ -1819,7 +1825,12 @@ class LiveTrader:
                                 continue
 
                             # Old-school filters (belt & suspenders)
-                            listing_age = getattr(signal, "listing_age_days", None)
+
+                            now_utc_date = datetime.now(timezone.utc).date()
+                            listing_age = (
+                                (now_utc_date - self._listing_dates_cache.get(sym, now_utc_date)).days
+                                if sym in self._listing_dates_cache else None
+)                            
                             ok, vetoes = filters.evaluate(
                                 signal,
                                 listing_age_days=listing_age,
@@ -2120,7 +2131,8 @@ class LiveTrader:
             LOG.error("Failed to generate summary report: %s", e)
             return f"Error: Could not generate {period} report. Check logs."
 
-    def _strategy_declared_side(self) -> Optional[str]:
+    def _strategy_declared_side(self) -> str | None:
+        """Read 'strategy.side' from the loaded YAML spec, if present."""
         try:
             spec = getattr(self.strategy_engine, "spec", None) or {}
             st = spec.get("strategy", {}) if isinstance(spec, dict) else {}
@@ -2132,6 +2144,26 @@ class LiveTrader:
         except Exception:
             pass
         return None
+
+    def _resolve_side(self, verdict) -> str:
+        """
+        Order of precedence for deciding side:
+        1) verdict.side (if engine supplies it)
+        2) YAML 'strategy.side'
+        3) default: 'short'
+        """
+        try:
+            v = getattr(verdict, "side", None)
+            if v:
+                vs = str(v).strip().lower()
+                if vs in ("long", "short"):
+                    return vs
+        except Exception:
+            pass
+        y = self._strategy_declared_side()
+        if y:
+            return y
+        return "short"
 
     async def _reporting_loop(self):
         LOG.info("Reporting loop started.")
