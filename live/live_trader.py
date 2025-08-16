@@ -434,18 +434,22 @@ class LiveTrader:
         LOG.info("listing_dates.json not found. Fetching from exchange.")
         async def fetch_date(sym):
             try:
-                candles = await self.exchange.fetch_ohlcv(sym, timeframe="1d", limit=1, since=0)
+                # fetch a long window and take the oldest bar we see
+                candles = await self.exchange.fetch_ohlcv(sym, timeframe="1d", limit=1000)
                 if candles:
-                    ts = datetime.fromtimestamp(candles[0][0] / 1000, tz=timezone.utc)
-                    return sym, ts.date()
+                    ts = min(row[0] for row in candles)
+                    return sym, datetime.fromtimestamp(ts/1000, tz=timezone.utc).date()
             except Exception as e:
                 LOG.warning("Could not fetch listing date for %s: %s", sym, e)
             return sym, None
 
         results = await asyncio.gather(*(fetch_date(s) for s in self.symbols))
         out = {sym: d for sym, d in results if d}
-        LISTING_PATH.write_text(json.dumps({k: v.isoformat() for k, v in out.items()}, indent=2))
-        LOG.info("Saved %d listing dates to %s", len(out), LISTING_PATH)
+        if out:
+            LISTING_PATH.write_text(json.dumps({k: v.isoformat() for k, v in out.items()}, indent=2))
+            LOG.info("Saved %d listing dates to %s", len(out), LISTING_PATH)
+        else:
+            LOG.warning("No listing dates could be determined; leaving file absent.")
         return out
 
     # ───────────────────── Exchange order helpers ─────────────────────
