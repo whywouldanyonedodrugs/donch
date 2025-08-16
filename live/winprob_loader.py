@@ -9,6 +9,9 @@ import joblib
 import numpy as np
 import pandas as pd
 
+import hashlib
+import logging
+LOG = logging.getLogger("winprob")
 
 class WinProbScorer:
     """
@@ -43,36 +46,80 @@ class WinProbScorer:
             print(f"[WinProbScorer] load failed from {self.dir}: {e}")
             self.is_loaded = False
 
+        self._diag_once = False
+        self._last_hash = None
+        self._same_vec_count = 0
+
+        def _calibrate(self, p_raw: float) -> float:
+            if self.calibrator is None:
+                return p_raw
+            # Try isotonic first (has .predict), else Platt (.predict_proba)
+            if hasattr(self.calibrator, "predict") and not hasattr(self.calibrator, "predict_proba"):
+                # isotonic regression returns calibrated probas
+                return float(self.calibrator.predict([p_raw])[0])
+            elif hasattr(self.calibrator, "predict_proba"):
+                # logistic regression: need predict_proba on [[p_raw]]
+                import numpy as _np
+                return float(self.calibrator.predict_proba(_np.array([[p_raw]]))[:,1][0])
+            else:
+                return p_raw  # unknown calibrator type
+
     # -------------------- public API --------------------
 
-    def score(self, row: Dict[str, Any]) -> float:
-        """
-        Score a single row (dict of features). 'row' may contain raw cats
-        (e.g., 'entry_rule', 'pullback_type', 'regime_1d'); this scorer
-        will OHE them using ohe.joblib and assemble the exact feature order.
-        Returns probability in [0,1]. If not loaded, returns 0.0.
-        """
-        if not self.is_loaded or self.model is None:
-            return 0.0
+    def score(self, row: dict) -> float:
+        # 1) Build X exactly as used today
+        X, used_cols = self._build_X(row)   # your existing method that returns ndarray (1, n_features)
 
-        # Build a single-row DataFrame X with columns in self.expected_features
-        X = self._build_X(row)
+        # 2) Model raw proba
+        p_raw = float(self.model.predict_proba(X)[:, 1][0])
+        p = self._calibrate(p_raw)
 
-        # LightGBM sklearn wrapper prefers DataFrame with names; this avoids warnings
-        proba = float(self.model.predict_proba(X)[:, 1][0])
+        # 3) One-shot deep diag
+        if not self._diag_once:
+            # What did we *think* the categorical inputs are?
+            cat_in = list(getattr(self.ohe, "feature_names_in_", [])) if getattr(self, "ohe", None) is not None else []
+            ohe_out = list(self.ohe.get_feature_names_out(cat_in)) if getattr(self, "ohe", None) is not None else []
 
-        # optional calibrator (both IsotonicRegression and Platt LR expose .predict)
-        if self.calibrator is not None:
-            try:
-                proba = float(self.calibrator.predict([proba])[0])
-            except Exception:
-                # Some calibrators expect 2D; try that as fallback
-                proba = float(self.calibrator.predict(np.array([[proba]]))[0])
+            # Feature coverage:
+            missing = [f for f in self.feature_order if f not in used_cols]
+            present = [f for f in self.feature_order if f in used_cols]
 
-        # bound defensively
-        if not np.isfinite(proba):
-            proba = 0.0
-        return float(max(0.0, min(1.0, proba)))
+            # Nonzero snapshot (which columns are actually influencing)
+            nz_idx = list(np.where(X[0] != 0.0)[0])
+            nz_names = [self.feature_order[i] for i in nz_idx][:20]  # first 20 for brevity
+
+            LOG.warning(
+                "[WINPROB DIAG]\n"
+                "  n_features: %d\n"
+                "  raw_proba: %.6f  calibrated: %.6f\n"
+                "  cat_inputs_expected: %s\n"
+                "  ohe_outputs_seen: %d\n"
+                "  present_cols: %d  missing_cols: %d\n"
+                "  first_20_nonzero: %s\n",
+                len(self.feature_order), p_raw, p,
+                cat_in, len(ohe_out),
+                len(present), len(missing),
+                nz_names
+            )
+            if missing:
+                LOG.warning("[WINPROB DIAG] Missing features (first 30): %s", missing[:30])
+            self._diag_once = True
+
+        # 4) Vector hash: are many calls identical?
+        h = hashlib.md5(X.tobytes()).hexdigest()
+        if self._last_hash is None:
+            self._last_hash = h
+        else:
+            if h == self._last_hash:
+                self._same_vec_count += 1
+                if self._same_vec_count in (5, 25, 100):
+                    LOG.warning("[WINPROB DIAG] Detected %d consecutive identical feature vectors (hash=%s).",
+                                self._same_vec_count, h)
+            else:
+                self._last_hash = h
+                self._same_vec_count = 0
+
+        return p
 
     # -------------------- internals --------------------
 
