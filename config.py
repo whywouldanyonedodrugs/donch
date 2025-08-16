@@ -116,9 +116,9 @@ MAX_LOSS_STREAK     = 10
 KILL_EQUITY_LEVEL   = 200.0        # USDT
 MIN_EQUITY_USDT     = 100.0
 MAX_LEVERAGE        = 10
-MIN_NOTIONAL        = 0.001         # exchange min order size
+MIN_NOTIONAL        = 0.0000001         # exchange min order size
 MIN_STOP_DIST_USD   = 0.0002
-MIN_STOP_DIST_PCT   = 0.0008      # 0.08 %
+MIN_STOP_DIST_PCT   = 0.000008      # 0.08 %
 
 # draw‑down pause
 DD_PAUSE_ENABLED    = True     # set False to disable drawdown protection  # <--- ADD THIS
