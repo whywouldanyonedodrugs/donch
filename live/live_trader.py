@@ -556,20 +556,21 @@ class LiveTrader:
     ) -> Optional[Signal]:
         LOG.info("Checking %s...", symbol)
         try:
-            # ---- Timeframes to fetch -------------------------------------------------
+            # ---------------- Timeframes to fetch ----------------
             base_tf = str(self.cfg.get('TIMEFRAME', '5m'))
             ema_tf  = str(self.cfg.get('EMA_TIMEFRAME', '4h'))
-            rsi_tf  = str(self.cfg.get('RSI_TIMEFRAME', '1h'))  # we still compute RSI on 1h below
-            adx_tf  = str(self.cfg.get('ADX_TIMEFRAME', '1h'))  # we still compute ADX on 1h below
+            rsi_tf  = str(self.cfg.get('RSI_TIMEFRAME', '1h'))
+            adx_tf  = str(self.cfg.get('ADX_TIMEFRAME', '1h'))
 
-            # meta features need 1h (ATR/RSI/ADX) and 1d (Donch), keep both
             required_tfs = {base_tf, ema_tf, rsi_tf, adx_tf, '1d', '1h'}
             required_tfs |= set(self.strategy_engine.required_timeframes() or [])
 
-            # ---- OHLCV fetch (all TFs) ----------------------------------------------
+            # ---------------- OHLCV fetch ------------------------
             async with self.api_semaphore:
-                tasks = {tf: self.exchange.fetch_ohlcv(symbol, tf, limit=1500 if tf == base_tf else 500)
-                        for tf in sorted(required_tfs)}
+                tasks = {
+                    tf: self.exchange.fetch_ohlcv(symbol, tf, limit=1500 if tf == base_tf else 500)
+                    for tf in sorted(required_tfs)
+                }
                 results = await asyncio.gather(*tasks.values(), return_exceptions=True)
                 ohlcv_data = dict(zip(tasks.keys(), results))
 
@@ -599,18 +600,17 @@ class LiveTrader:
 
                 dfs[tf] = df
 
-            # Base frame
             if base_tf not in dfs:
                 LOG.warning("Base TF %s not available for %s.", base_tf, symbol)
                 return None
             df5 = dfs[base_tf]
 
-            # ---- Indicators aligned to base index -----------------------------------
+            # ---------------- Indicators aligned to base index ---
             # EMA on ema_tf (for optional heuristics)
             df5['ema_fast'] = ta.ema(dfs[ema_tf]['close'], cfg.EMA_FAST_PERIOD).reindex(df5.index, method='ffill')
             df5['ema_slow'] = ta.ema(dfs[ema_tf]['close'], cfg.EMA_SLOW_PERIOD).reindex(df5.index, method='ffill')
 
-            # Training features are *1h* ATR/RSI/ADX → compute on 1h, then ffill to 5m
+            # Training features are 1h ATR/RSI/ADX
             atr_len = int(self.cfg.get("ATR_LEN", 14))
             df1h = dfs.get('1h')
             if df1h is None or df1h.empty:
@@ -624,17 +624,17 @@ class LiveTrader:
             df5['rsi_1h'] = rsi_1h.reindex(df5.index, method='ffill')
             df5['adx_1h'] = adx_1h.reindex(df5.index, method='ffill')
 
-            # Keep legacy names where used elsewhere
+            # Legacy aliases used downstream
             df5['atr'] = df5['atr_1h']
             df5['adx'] = df5['adx_1h']
             df5['rsi'] = df5['rsi_1h']
 
-            # ---- Listing age (UTC) ---------------------------------------------------
+            # ---------------- Listing age ------------------------
             age_opt = self._listing_age_days(symbol, dfs)
             listing_age_days = int(age_opt) if age_opt is not None else 9999
 
-            # ---- StrategyEngine verdict ---------------------------------------------
-            univ = (getattr(self, "_universe_ctx", {}) or {}).get(symbol, {})  # e.g. {"rs_pct": 78, "liq_ok": True}
+            # ---------------- Strategy verdict (rule engine) -----
+            univ = (getattr(self, "_universe_ctx", {}) or {}).get(symbol, {})  # e.g., {"rs_pct": 78, "liq_ok": True}
             eth_ctx = {"eth_macd": dict(eth_macd or {})}
             ctx = {
                 "symbol": symbol,
@@ -646,13 +646,16 @@ class LiveTrader:
             }
             verdict = self.strategy_engine.evaluate(dfs, ctx)
             if not verdict.should_enter:
+                # we still emit a quick diagnostic if enabled
+                if bool(self.cfg.get("DEBUG_SIGNAL_DIAG", True)):
+                    LOG.debug("— %s skipped by StrategyEngine (should_enter=False).", symbol)
                 return None
 
             side = self._resolve_side(verdict)  # "long" | "short"
             LOG.info("Side chosen for %s: %s (verdict=%s, yaml=%s)",
                     symbol, side.upper(), getattr(verdict, "side", None), self._strategy_declared_side())
 
-            # ---- VWAP-stack diagnostics (DB/reporting only) -------------------------
+            # ---------------- VWAP-stack diagnostics -------------
             lookback = int(self.cfg.get("VWAP_STACK_LOOKBACK_BARS", 12))
             band_pct = float(self.cfg.get("VWAP_STACK_BAND_PCT", 0.004))
             try:
@@ -667,14 +670,13 @@ class LiveTrader:
                 LOG.error("VWAP-stack calc failed for %s: %s", symbol, e)
                 vwap_frac = vwap_exp = vwap_slope = 0.0
 
-            # ---- Legacy research features (kept for DB & compat) --------------------
+            # ---------------- Legacy research feats --------------
             tf_minutes = 5
             boom_bars = int((cfg.PRICE_BOOM_PERIOD_H * 60) / tf_minutes)
             slowdown_bars = int((cfg.PRICE_SLOWDOWN_PERIOD_H * 60) / tf_minutes)
             df5['price_boom_ago'] = df5['close'].shift(boom_bars)
             df5['price_slowdown_ago'] = df5['close'].shift(slowdown_bars)
 
-            # Basic daily trend return used elsewhere
             df1d = dfs.get('1d')
             ret_30d = 0.0
             if df1d is not None and len(df1d) > cfg.STRUCTURAL_TREND_DAYS:
@@ -702,19 +704,16 @@ class LiveTrader:
             boom_ret_pct = (last['close'] / last['price_boom_ago'] - 1)
             slowdown_ret_pct = (last['close'] / last['price_slowdown_ago'] - 1)
             is_ema_crossed_down = last['ema_fast'] < last['ema_slow']
-            atr_frac = (last['atr_1h'] / last['close']) if last['close'] > 0 else 0.0  # fraction, e.g. 0.001 = 0.1%
+            atr_pct = (last['atr_1h'] / last['close']) if last['close'] > 0 else 0.0
 
             hour_of_day = now_utc.hour
             day_of_week = now_utc.weekday()
-            session_tag = "ASIA" if 0 <= hour_of_day < 8 else "EUROPE" if 8 <= hour_of_day < 16 else "US"
 
-            # ---- Build the meta-model feature row -----------------------------------
-            # CATEGORICALS expected by your OHE (raw names)
+            # -------------- Meta-model feature row ---------------
             entry_rule = getattr(verdict, "entry_rule", None) or self.cfg.get("ENTRY_RULE", "close_above_break")
             pullback_type = getattr(verdict, "pullback_type", None) or self.cfg.get("PULLBACK_TYPE", "retest")
-            regime_1d = getattr(verdict, "regime_1d", None) or ""  # if you have a daily regime label
+            regime_1d = getattr(verdict, "regime_1d", None) or ""  # optional
 
-            # Donch breakout info (if verdict provided), else compute reference level from 1D Donch(20) shifted
             don_len = int(getattr(verdict, "don_break_len", self.cfg.get("DON_N_DAYS", 20)))
             don_level = None
             try:
@@ -728,39 +727,35 @@ class LiveTrader:
             if don_level is None:
                 don_level = float(last['close'])
 
-            # volume multiple: current 5m volume / rolling 30d median (bounded by available bars)
+            # volume multiple: current 5m volume / rolling ~30d median
             try:
                 bars_needed = int(self.cfg.get("VOL_LOOKBACK_DAYS", 30) * 24 * (60 // tf_minutes))
-                bars_needed = max(96, min(bars_needed, len(df5)))  # >= ~2d; cap to available
+                bars_needed = max(96, min(bars_needed, len(df5)))
                 vol_med = df5['volume'].tail(bars_needed).median()
                 vol_mult = float(last['volume'] / vol_med) if vol_med > 0 else 0.0
             except Exception:
                 vol_mult = 0.0
 
-            # RS percentile from universe (0..100), else 0
             rs_pct = float(univ.get("rs_pct", 0.0) or 0.0)
 
-            # ETH MACD histogram (4h) and above-signal flag
+            # ETH MACD hist & above-signal
             eth_hist = float((eth_macd or {}).get("hist", 0.0) or 0.0)
             eth_above = 1.0 if float((eth_macd or {}).get("macd", 0.0)) > float((eth_macd or {}).get("signal", 0.0)) else 0.0
             regime_up = 1.0 if (eth_hist > 0 and eth_above == 1.0) else 0.0
 
-            # time features
-            hour_sin = np.sin(2 * np.pi * hour_of_day / 24.0)
-            hour_cos = np.cos(2 * np.pi * hour_of_day / 24.0)
+            hour_sin = math.sin(2 * math.pi * hour_of_day / 24.0)
+            hour_cos = math.cos(2 * math.pi * hour_of_day / 24.0)
 
-            # distance from donch level in ATRs (defensive against div/0)
-            don_dist_atr = (float(last['close']) - float(don_level)) / (float(last['atr_1h']) if float(last['atr_1h']) > 0 else np.nan)
+            don_dist_atr = (float(last['close']) - float(don_level)) / float(last['atr_1h'] if last['atr_1h'] > 0 else np.nan)
             if not np.isfinite(don_dist_atr):
                 don_dist_atr = 0.0
 
-            # Build the meta row; names must match your export (feature_names.json)
             meta_row = {
                 # numerics
                 "atr_1h": float(last['atr_1h']),
                 "rsi_1h": float(last['rsi_1h']),
                 "adx_1h": float(last['adx_1h']),
-                "atr_pct": float(atr_frac),
+                "atr_pct": float(atr_pct),
                 "don_break_len": float(don_len),
                 "don_break_level": float(don_level),
                 "don_dist_atr": float(don_dist_atr),
@@ -771,43 +766,36 @@ class LiveTrader:
                 "vol_mult": float(vol_mult),
                 "eth_macd_hist_4h": float(eth_hist),
                 "regime_up": float(regime_up),
+                "prior_1d_ret": float(ret_30d),  # harmless if unused
 
-                # optional numerics you might have trained with (safe defaults)
-                "prior_1d_ret": float(ret_30d),
-                "eth_macd_above": float(eth_above),
-                "markov_prob_up_4h": 0.0,
-                "vol_prob_low_1d": 0.0,
-                "trend_bull_1d": 0.0,
-                "vol_low_1d": 0.0,
-                "regime_code_1d": 0.0,
-                "markov_state_up_4h": 0.0,
-
-                # categoricals (RAW) for OHE
+                # categoricals
                 "entry_rule": str(entry_rule),
                 "pullback_type": str(pullback_type),
                 "regime_1d": str(regime_1d),
             }
 
-            # ---- Optional entry heuristics (OFF by default) ---------------------------
+            # -------------- Optional entry heuristics ------------
             enter_ok = True
             if bool(self.cfg.get("ENTRY_REQUIRE_EMA_CROSS", False)):
                 enter_ok = enter_ok and ((last['ema_fast'] > last['ema_slow']) if side == "long" else (last['ema_fast'] < last['ema_slow']))
             if bool(self.cfg.get("ENTRY_REQUIRE_VWAP_CONSOL", False)):
                 enter_ok = enter_ok and bool(last.get('vwap_consolidated', False))
-            min_atr_frac = float(self.cfg.get("ENTRY_MIN_ATR_PCT", 0.0))  # expect fraction, e.g. 0.0001 = 0.01%
-            if min_atr_frac > 0:
-                enter_ok = enter_ok and (atr_frac >= min_atr_frac)
+            min_atr_pct = float(self.cfg.get("ENTRY_MIN_ATR_PCT", 0.0))
+            if min_atr_pct > 0:
+                enter_ok = enter_ok and (atr_pct >= min_atr_pct)
             if not enter_ok:
+                if bool(self.cfg.get("DEBUG_SIGNAL_DIAG", True)):
+                    LOG.debug("— %s vetoed by local entry heuristics.", symbol)
                 return None
 
-            # ---- Compose Signal (DB/journaling & sizing) ------------------------------
+            # -------------- Compose Signal object ----------------
             signal_obj = Signal(
                 symbol=symbol,
                 entry=float(last['close']),
                 atr=float(last['atr_1h']),
                 rsi=float(last['rsi_1h']),
                 adx=float(last['adx_1h']),
-                atr_pct=float(atr_frac) * 100.0,  # stored as percent in DB
+                atr_pct=float(atr_pct) * 100.0,  # DB stores as %
                 market_regime=market_regime,
                 price_boom_pct=float(boom_ret_pct),
                 price_slowdown_pct=float(slowdown_ret_pct),
@@ -817,22 +805,21 @@ class LiveTrader:
                 ema_fast=float(last['ema_fast']),
                 ema_slow=float(last['ema_slow']),
                 listing_age_days=int(listing_age_days),
-                session_tag=session_tag,
+                session_tag=("ASIA" if 0 <= hour_of_day < 8 else "EUROPE" if 8 <= hour_of_day < 16 else "US"),
                 day_of_week=day_of_week,
                 hour_of_day=hour_of_day,
                 vwap_consolidated=bool(last.get('vwap_consolidated', False)),
                 is_ema_crossed_down=bool(is_ema_crossed_down),
                 side=side,
             )
-            # VWAP diagnostics for DB/reporting
             signal_obj.vwap_stack_frac = vwap_frac
             signal_obj.vwap_stack_expansion_pct = vwap_exp
             signal_obj.vwap_stack_slope_pph = vwap_slope
 
-            # ---- Win-prob scoring (meta model) --------------------------------------
+            # -------------- Win-prob scoring ---------------------
             try:
                 if self.winprob.is_loaded:
-                    wp = self.winprob.score(meta_row)  # WinProbScorer handles OHE + exact feature order
+                    wp = self.winprob.score(meta_row)
                     signal_obj.win_probability = max(0.0, min(1.0, float(wp)))
                 else:
                     signal_obj.win_probability = 0.0
@@ -840,8 +827,49 @@ class LiveTrader:
                 LOG.warning("Failed to score signal for %s: %s", symbol, e)
                 signal_obj.win_probability = 0.0
 
-            LOG.info("SIGNAL %s @ %.6f | regime=%s | wp=%.2f%%",
-                    symbol, float(last['close']), market_regime, signal_obj.win_probability * 100.0)
+            # -------------- Rich DEBUG diagnostics ---------------
+            if bool(self.cfg.get("DEBUG_SIGNAL_DIAG", True)):
+                def _ok(b): return "✅" if b else "❌"
+                rs_min = float(self.cfg.get("RS_MIN_PERCENTILE", 70))
+                vol_needed = float(self.cfg.get("VOL_MULTIPLE", 2.0))
+                regime_block = bool(self.cfg.get("REGIME_BLOCK_WHEN_DOWN", True))
+                meta_thresh = float(getattr(self.winprob, "pstar", self.cfg.get("META_PROB_THRESHOLD", 0.0)) or 0.0)
+
+                # These gates mirror your spec; some are already enforced inside StrategyEngine
+                g_rs = rs_pct >= rs_min
+                g_liq = bool(univ.get("liq_ok", True))
+                g_regime = (regime_up == 1.0) or (not regime_block)
+                g_vol = vol_mult >= vol_needed
+                g_micro = (atr_pct >= float(self.cfg.get("ENTRY_MIN_ATR_PCT", 0.0)))
+                g_meta = (signal_obj.win_probability >= meta_thresh)
+
+                LOG.debug(
+                    (
+                        f"\n--- {symbol} | {last.name.strftime('%Y-%m-%d %H:%M')} UTC ---\n"
+                        f"[TFs] base={base_tf} ema={ema_tf} 1h-features=ON 1d=ON\n"
+                        f"Price: {last['close']:.6f}\n"
+                        f"ATR1h: {last['atr_1h']:.6f} ({atr_pct*100:.3f}%)  RSI1h: {last['rsi_1h']:.2f}  ADX1h: {last['adx_1h']:.2f}\n"
+                        f"RS pct: {rs_pct:.1f}%  LiquidityOK: {g_liq}\n"
+                        f"ETH MACD hist(4h): {eth_hist:.4f}  MACD>signal: {bool(eth_above)}  → regime_up={bool(regime_up)}\n"
+                        f"Donch({don_len}d prev) upper: {don_level:.6f}  dist_atr={don_dist_atr:+.3f}\n"
+                        f"Vol mult (median {int(self.cfg.get('VOL_LOOKBACK_DAYS',30))}d): x{vol_mult:.2f}\n"
+                        f"VWAP: dev={float(last.get('vwap_dev_pct',0.0))*100:.2f}%  z={float(last.get('vwap_z_score',0.0)):.2f}\n"
+                        f"Pullback/Entry: {pullback_type} + {entry_rule}   Side: {side.upper()}\n"
+                        f"GATES:\n"
+                        f"  RS≥{rs_min:.0f} ............. {_ok(g_rs)}\n"
+                        f"  Liquidity≥median500k ........ {_ok(g_liq)}\n"
+                        f"  RegimeUp (or not blocked) ... {_ok(g_regime)} (block_when_down={regime_block})\n"
+                        f"  Volume spike x{vol_needed:.1f} .... {_ok(g_vol)}\n"
+                        f"  Micro-ATR min ............... {_ok(g_micro)} (min={float(self.cfg.get('ENTRY_MIN_ATR_PCT',0.0)):.5f})\n"
+                        f"META: p*={meta_thresh:.2f},  p={signal_obj.win_probability:.3f} → {_ok(g_meta)}\n"
+                        f"===================================================="
+                    )
+                )
+
+            LOG.info(
+                "SIGNAL %s @ %.6f | regime=%s | wp=%.2f%%",
+                symbol, float(last['close']), market_regime, signal_obj.win_probability * 100.0
+            )
             return signal_obj
 
         except ccxt.BadSymbol:
