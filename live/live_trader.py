@@ -345,11 +345,26 @@ class LiveTrader:
         self.symbol_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
         # Meta / win-prob scorer
-        self.winprob = WinProbScorer(self.cfg.get("WINPROB_MODEL_DIR", "results/meta_export"))
+
+
+        art_dir = self.cfg.get("WINPROB_ARTIFACT_DIR", "results/meta_export")
+        self.winprob = WinProbScorer(art_dir)
+
         if self.winprob.is_loaded:
-            LOG.info("WinProb ready (kind=%s, features=%d)", self.winprob.kind, len(self.winprob.expected_features))
+            # Be robust to older WinProbScorer without .kind or .expected_features
+            kind = getattr(self.winprob, "kind", "lgbm+ohe")
+            feats = (getattr(self.winprob, "feature_order", None)
+                    or getattr(self.winprob, "expected_features", None)
+                    or [])
+            nfeats = len(feats) if feats is not None else 0
+            pstar = getattr(self.winprob, "pstar", None)
+            if isinstance(pstar, (int, float)):
+                LOG.info("WinProb ready (kind=%s, features=%d, p*=%.2f)", kind, nfeats, float(pstar))
+            else:
+                LOG.info("WinProb ready (kind=%s, features=%d)", kind, nfeats)
         else:
             LOG.warning("WinProb not loaded; using wp=0.0")
+
 
     async def _build_universe_context(self) -> dict[str, dict]:
         """

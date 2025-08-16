@@ -24,6 +24,7 @@ DEDUP_WINDOW_HOURS: 2
 
 # where you scp’d the artifact
 WINPROB_MODEL_DIR: "results/meta_export"
+WINPROB_ARTIFACT_DIR: results/meta_export
 
 # live gate; can be tuned without re-exporting the model
 MIN_WINPROB_TO_TRADE: 0.60
