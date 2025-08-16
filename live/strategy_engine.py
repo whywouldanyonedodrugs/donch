@@ -135,6 +135,14 @@ def _build_ops_registry() -> Dict[str, Callable]:
         "blacklist_symbol": _op_blacklist_symbol,
         "cooldown_hours": _op_cooldown_hours,
         "min_listing_age_days": _op_min_listing_age_days,
+        "eth_macd_hist_above": _op_eth_macd_hist_above,
+        "universe_rs_pct_gte": _op_universe_rs_pct_gte,
+        "liquidity_median_24h_usd_gte": _op_liquidity_median_24h_usd_gte,
+        "eth_macd_bull": _op_eth_macd_bull,
+        "donch_breakout_daily_confirm": _op_donch_breakout_daily_confirm,
+        "volume_median_multiple": _op_volume_median_multiple,
+        "pullback_retest_close_above_break": _op_pullback_retest_close_above_break,
+        "micro_vol_filter": _op_micro_vol_filter,
     }
 
 def _get_tf_df(dfs: Dict[str, pd.DataFrame], tfs: Dict[str, str], tf_key: str) -> Optional[pd.DataFrame]:
@@ -237,6 +245,162 @@ def _op_min_listing_age_days(args, dfs, tfs, ctx, resolve):
     if age is None:
         return False, "list_age:unknown"
     return (age >= days, f"list_age_{age}d")
+
+def _op_eth_macd_hist_above(args, dfs, tfs, ctx, resolve):
+    """
+    Gate by ETH 4h MACD histogram (provided via context).
+    args: { min: 0.0 }  # trade only if hist >= min
+    Context key expected: ctx["eth_macdhist"] (float)
+    """
+    thr = float(resolve(args.get("min", 0.0)) or 0.0)
+    val = float(ctx.get("eth_macdhist", 0.0) or 0.0)
+    ok = (val >= thr)
+    return ok, f"eth_hist_{val:.3f}_{'>=' if ok else '<'}_{thr:.3f}"
+
+def _op_universe_rs_pct_gte(args, dfs, tfs, ctx, resolve):
+    """
+    Require a minimum weekly relative-strength percentile (0..100).
+    Expects ctx["rs_pct"] precomputed by the bot's universe pass.
+    """
+    thr = float(resolve(args.get("min", 0)) or 0)
+    rs = float(ctx.get("rs_pct", 0.0) or 0.0)
+    return (rs >= thr), f"rs_pct={rs:.1f}>= {thr:.1f}"
+
+def _op_liquidity_median_24h_usd_gte(args, dfs, tfs, ctx, resolve):
+    """
+    Liquidity cut: median 24h USD turnover >= threshold.
+    Expects ctx["median_24h_turnover_usd"] from universe pass.
+    """
+    thr = float(resolve(args.get("min_usd", 5e5)) or 0.0)
+    med = float(ctx.get("median_24h_turnover_usd", 0.0) or 0.0)
+    return (med >= thr), f"liq_med24h=${med:,.0f}>={thr:,.0f}"
+
+def _op_eth_macd_bull(args, dfs, tfs, ctx, resolve):
+    """
+    Gate by ETH 4h MACD regime.
+    Requires BOTH (macd > signal) AND (hist > 0).
+    Expects ctx['eth_macd'] dict: {'macd':..., 'signal':..., 'hist':...}
+    """
+    ed = ctx.get("eth_macd") or {}
+    macd = float(ed.get("macd", 0.0) or 0.0)
+    sig  = float(ed.get("signal", 0.0) or 0.0)
+    hist = float(ed.get("hist", 0.0) or 0.0)
+    ok = (macd > sig) and (hist > 0.0)
+    return ok, f"eth_bull(macd={macd:.3f},sig={sig:.3f},hist={hist:.3f})"
+
+def _op_donch_breakout_daily_confirm(args, dfs, tfs, ctx, resolve):
+    """
+    Daily Donchian breakout using prior N *full* days (shifted by 1 day).
+    Require CLOSE above the upper band on the breakout bar.
+    Args: { donch_tf: '1d', period: 20 }
+    Returns (ok, meta) and stores ctx['donch_break_level'] for later ops.
+    """
+    donch_tf = str(resolve(args.get("donch_tf", "1d")))
+    n = int(resolve(args.get("period", 20)))
+    ddf = dfs.get(donch_tf)
+    if ddf is None or len(ddf) < n + 2:
+        return False, "donch_daily:insufficient"
+
+    # Use prior N full days (exclude the current unfinished/most recent day)
+    dd = ddf.copy()
+    # Ensure index UTC and sorted
+    dd = dd.sort_index()
+    # Shift upper channel by 1 day to avoid look-ahead
+    highs = dd["high"].rolling(n).max().shift(1)
+    # Breakout today means last daily close > yesterday's upper channel
+    last_close = float(dd["close"].iloc[-1])
+    upper = float(highs.iloc[-1])
+    ok = last_close > upper and np.isfinite(upper)
+
+    if ok:
+        ctx["donch_break_level"] = upper
+        # distance (pct) for meta features
+        ctx["donch_dist_pct"] = (last_close - upper) / upper if upper > 0 else 0.0
+    return ok, f"donch20_close>{upper:.6f}"
+
+def _op_micro_vol_filter(args, dfs, tfs, ctx, resolve):
+    """
+    Avoid dust moves: ATR(1h) / last_price >= min_ratio.
+    Args: { atr_tf: '1h', min_ratio: 0.0001, atr_len: 14 }
+    """
+    atr_tf = str(resolve(args.get("atr_tf", "1h")))
+    atr_len = int(resolve(args.get("atr_len", 14)))
+    min_ratio = float(resolve(args.get("min_ratio", 0.0001)))
+    basetf = tfs.get("base", "5m")
+    df_base = dfs.get(basetf)
+    df_atr = dfs.get(atr_tf)
+    if df_base is None or df_atr is None or len(df_atr) < atr_len + 5:
+        return False, "microvol:short"
+
+    # compute ATR on atr_tf then ffill to base
+    from . import indicators as ta
+    atr_s = ta.atr(df_atr, atr_len)
+    atr_last = float(atr_s.iloc[-1])
+    price_last = float(df_base["close"].iloc[-1])
+    ratio = (atr_last / price_last) if price_last > 0 else 0.0
+    ok = ratio >= min_ratio
+    return ok, f"atr1h/px={ratio:.5f}>={min_ratio:.5f}"
+
+def _op_pullback_retest_close_above_break(args, dfs, tfs, ctx, resolve):
+    """
+    After a Donchian breakout (ctx['donch_break_level']), require:
+      - a retest near the break level within a lookback window, then
+      - current close above the break.
+    Args: {
+      tf: '5m', eps_pct: 0.003, lookback_bars: 288
+    }
+    """
+    level = ctx.get("donch_break_level", None)
+    if level is None or not np.isfinite(level):
+        return False, "retest:no_break_ctx"
+
+    tf = str(resolve(args.get("tf", "5m")))
+    eps = float(resolve(args.get("eps_pct", 0.003)))  # 0.3% band
+    lb  = int(resolve(args.get("lookback_bars", 288)))
+
+    df = dfs.get(tf)
+    if df is None or len(df) < lb + 5:
+        return False, "retest:short"
+
+    sub = df.tail(lb)
+    lo_ok = (sub["low"] <= level * (1.0 + eps)).any() and (sub["high"] >= level * (1.0 - eps)).any()
+    cur_close = float(sub["close"].iloc[-1])
+    trig_ok = cur_close > level
+    ok = bool(lo_ok and trig_ok)
+    return ok, f"retest@{level:.6f}&close>{level:.6f}"
+
+def _op_volume_median_multiple(args, dfs, tfs, ctx, resolve):
+    """
+    Volume confirmation on base tf (usually 5m).
+    Args: { tf: '5m', days: 30, min_mult: 2.0, cap_bars: 9000 }
+    Uses rolling median of volume over last 'days' (bounded by 'cap_bars').
+    """
+    tf = str(resolve(args.get("tf", "5m")))
+    days = int(resolve(args.get("days", 30)))
+    mult = float(resolve(args.get("min_mult", 2.0)))
+    cap = int(resolve(args.get("cap_bars", 9000)))
+
+    df = dfs.get(tf)
+    if df is None or df.empty:
+        return False, "vol:missing"
+    # Bars per day estimate from existing df (assume regular spacing)
+    try:
+        bpd = int(round(24*60 / max(1, int((df.index[1]-df.index[0]).total_seconds()/60))))
+    except Exception:
+        bpd = 288  # 5m fallback
+
+    lookback = min(cap, days * bpd)
+    sub = df.tail(lookback)
+    if len(sub) < max(100, bpd):  # need at least a day-ish
+        return False, "vol:short"
+
+    cur_vol = float(sub["volume"].iloc[-1])
+    med_vol = float(sub["volume"].median())
+    ratio = (cur_vol / med_vol) if med_vol > 0 else 0.0
+    ok = ratio >= mult
+    # stash for meta features
+    ctx["vol_mult"] = float(ratio)
+    return ok, f"vol×={ratio:.2f}>={mult:.2f}"
 
 def _eval_one(op_dict, dfs, tfs, ctx, resolve, registry):
     if not isinstance(op_dict, dict) or len(op_dict) != 1:

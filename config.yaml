@@ -1,50 +1,37 @@
-STRATEGY_SPEC_PATH: "strategies/dummy_long_ema500.yaml"
-META_PROB_THRESHOLD: 0.0   # don’t gate entries while wiring
-RISK_MODE: "fixed"
-RISK_USD: 1.00            # tiny test risk
+# Strategy selection
+STRATEGY_SPEC_PATH: "strategy/donch_pullback_long.yaml"
 
-
-# --- gating (optional but recommended) ---
-MIN_WINPROB_TO_TRADE: 0.00    # replaces/duplicates META_PROB_THRESHOLD; code patch below
-
-# --- base risk ---
-RISK_MODE: "fixed"             # or "percent"
-RISK_USD: 0.10                 # start small; raise later (you had 5.0)
-RISK_EQUITY_PCT: 0.01
-RISK_USD_MIN: 0.05
-RISK_USD_MAX: 2.00
-
-# --- win-prob sizing (kept) ---
-WINPROB_SIZING_ENABLED: false
-WINPROB_PROB_FLOOR: 0.55
-WINPROB_PROB_CAP:   0.80
-WINPROB_MIN_MULTIPLIER: 0.90
-WINPROB_MAX_MULTIPLIER: 1.20
-
-# --- VWAP-stack sizing (kept, narrow influence) ---
-VWAP_STACK_SIZING_ENABLED: false
-VWAP_STACK_MIN_MULTIPLIER: 0.95
-VWAP_STACK_MAX_MULTIPLIER: 1.05
-VWAP_STACK_FRAC_MIN: 0.50
-VWAP_STACK_FRAC_GOOD: 0.75
-VWAP_STACK_EXPANSION_ABS_MIN: 0.006
-VWAP_STACK_EXPANSION_GOOD: 0.015
-VWAP_STACK_FRAC_WEIGHT: 0.6
-VWAP_STACK_EXP_WEIGHT: 0.4
-
-# --- generic scalers (off for now to avoid double-counting) ---
-SIZING_SCALERS: []
-SIZING_MULT_MIN: 0.5
-SIZING_MULT_MAX: 2.0
-
-ENTRY_REQUIRE_EMA_CROSS: false
-ENTRY_REQUIRE_VWAP_CONSOL: false
-ENTRY_MIN_ATR_PCT: 0.0
-
-SCAN_INTERVAL_SEC: 20
-
-ETH_BAROMETER_ENABLED: false
-
-
+# Sizing
+RISK_MODE: "cash"           # or "percent"
+RISK_USD: 10.0              # used if RISK_MODE="cash"
+RISK_EQUITY_PCT: 0.01       # used if RISK_MODE="percent"
 MIN_TRADE_AUTOPAD_ENABLED: true
 MIN_TRADE_AUTOPAD_CAP_USD: 5.0
+
+# Exits: SL/TP via ATR(1h)
+SL_ATR_MULT: 2.0
+FINAL_TP_ENABLED: true
+PARTIAL_TP_ENABLED: false   # per spec: no partials
+TRAIL_DISTANCE_ATR_MULT: 0.0  # trailing OFF
+TIME_EXIT_HOURS_ENABLED: true
+TIME_EXIT_HOURS: 72
+
+# Throughput
+SYMBOL_COOLDOWN_HOURS: 2
+SCAN_INTERVAL_SEC: 60
+
+DEDUP_WINDOW_HOURS: 2
+
+# where you scp’d the artifact
+WINPROB_MODEL_DIR: "results/meta_export"
+
+# live gate; can be tuned without re-exporting the model
+MIN_WINPROB_TO_TRADE: 0.60
+ETH_BAROMETER_ENABLED: false        # as requested for testing
+REGIME_BLOCK_WHEN_DOWN: false       # let entries through while testing
+# optional sizing-by-prob (already supported in your bot)
+WINPROB_SIZING_ENABLED: true
+WINPROB_MIN_MULTIPLIER: 0.8
+WINPROB_MAX_MULTIPLIER: 1.3
+WINPROB_PROB_FLOOR: 0.55
+WINPROB_PROB_CAP: 0.80

@@ -1,24 +1,57 @@
-name: DonchPullbackLong
+name: DonchPullbackLong_v1
+
 timeframes:
-  base: 5m
-  donch: 1h
-  volume: 5m
+  base: 5m     # decision frame
+  donch: 1d    # daily breakout
+  atr: 1h      # ATR for micro-vol & sizing
 
 params:
-  DONCH_PERIOD: 55
-  PULLBACK_PCT_MAX: 0.015
-  VOL_SMA_WIN: 50
+  DONCH_PERIOD: 20
+  VOLUME_DAYS: 30
+  VOLUME_MIN_MULT: 2.0
+  RETEST_EPS_PCT: 0.003
+  RETEST_LOOKBACK_BARS: 288
+  RS_MIN_PCT: 70
+  LIQ_MIN_USD: 500000
+  MICRO_VOL_MIN: 0.0001
 
 entry:
   side: long
   all:
-    - trend_filter_ema: { tf: base, fast: 50, slow: 200, direction: up }
-    - donch_breakout:   { tf: donch, period: "@params.DONCH_PERIOD", direction: up }
-    - pullback_under_ma:{ tf: base, ema_period: 200, max_pullback_pct: "@params.PULLBACK_PCT_MAX" }
-    - volume_surge:     { tf: volume, win: "@params.VOL_SMA_WIN", min_mult: 1.5 }
+    # 1) Universe/quality
+    - universe_rs_pct_gte: { min: "@params.RS_MIN_PCT" }
+    - liquidity_median_24h_usd_gte: { min_usd: "@params.LIQ_MIN_USD" }
+
+    # 2) Regime (ETH MACD 4h: macd>signal & hist>0). For testing, comment this line out.
+    - eth_macd_bull: {}
+
+    # 3) Donchian breakout (daily), confirm close above prior upper
+    - donch_breakout_daily_confirm:
+        donch_tf: donch
+        period: "@params.DONCH_PERIOD"
+
+    # 4) Volume spike (median-multiple on 5m)
+    - volume_median_multiple:
+        tf: base
+        days: "@params.VOLUME_DAYS"
+        min_mult: "@params.VOLUME_MIN_MULT"
+        cap_bars: 9000
+
+    # 5) Pullback + trigger (retest, then close > break)
+    - pullback_retest_close_above_break:
+        tf: base
+        eps_pct: "@params.RETEST_EPS_PCT"
+        lookback_bars: "@params.RETEST_LOOKBACK_BARS"
+
+    # 6) Micro-vol filter
+    - micro_vol_filter:
+        atr_tf: atr
+        atr_len: 14
+        min_ratio: "@params.MICRO_VOL_MIN"
 
 veto:
   any:
+    # 7) Throughput guards
+    - cooldown_hours: { hours: 2 }          # per-symbol cooldown 120 minutes (after exit)
+    - min_listing_age_days: { days: 7 }     # avoid newly listed
     - blacklist_symbol: {}
-    - cooldown_hours: { hours: "@cfg.SYMBOL_COOLDOWN_HOURS" }
-    - min_listing_age_days: { days: 7 }

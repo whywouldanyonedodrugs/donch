@@ -1,130 +1,111 @@
-# live/winprob_loader.py
+# winprob_loader.py
 from __future__ import annotations
-
-import joblib
-import logging
-from dataclasses import dataclass
+import json, joblib, numpy as np, pandas as pd
 from pathlib import Path
-from typing import Any, Optional, Sequence, Tuple
-
-import numpy as np
-import pandas as pd
-
-LOG = logging.getLogger("winprob")
-
-@dataclass
-class _Loaded:
-    kind: str                          # "statsmodels" | "sklearn_bundle" | "sklearn_dict" | "sklearn_estimator"
-    model: Any
-    features: Sequence[str]
-    path: Optional[Path] = None        # <— new: remember which file we loaded
+from typing import Dict, Any, Optional
 
 class WinProbScorer:
     """
-    Loads a win-probability model from disk and scores a single feature dict.
-    Supports:
-      1) statsmodels results (expects .model.exog_names and .predict)
-      2) research ModelBundle (with .feature_names and .calibrator.predict_proba)
-      3) legacy sklearn dict {"pipeline": estimator, "features": [...]}
+    Loads:
+      - donch_meta_lgbm.joblib  (sklearn LGBMClassifier)
+      - ohe.joblib               (sklearn OneHotEncoder for raw string cats)
+      - feature_names.json       (FINAL column order: numerics + one-hot names)
+      - calibrator.joblib        (optional Platt/Isotonic; .predict(prob) → prob)
+      - pstar.txt                (optional threshold, read by the bot separately)
+    Usage:
+      s = WinProbScorer("models/donch_meta"); s.score(raw_feature_dict)
     """
-    def __init__(self, paths: Optional[Sequence[str]] = None):
-        # Default search order: joblib (statsmodels), then research pkl, then any leftover pkl
-        self.paths = [Path(p) for p in (paths or [
-            "win_probability_model.joblib",
-            "win_probability_model.pkl",
-        ])]
-        self._loaded: Optional[_Loaded] = None
-        self._try_load_any()
-
-    @property
-    def is_loaded(self) -> bool:
-        return self._loaded is not None
-
-    @property
-    def expected_features(self) -> Sequence[str]:
-        return self._loaded.features if self._loaded else []
-
-    @property
-    def kind(self) -> str:             # <— new: expose kind for logging in live_trader
-        return self._loaded.kind if self._loaded else "none"
-
-    def _try_load_any(self):
-        for p in self.paths:
-            if not p.exists():
-                continue
-            try:
-                obj = joblib.load(p)
-                loaded = self._coerce(obj)
-                if loaded:
-                    self._loaded = loaded
-                    LOG.info(                       # <— one-line, clear startup message
-                        "WinProb model loaded: kind=%s file=%s features=%d",
-                        loaded.kind, p.name, len(loaded.features)
-                    )
-                    return
-            except Exception as e:
-                LOG.warning("Failed to load model %s: %s", p, e)
-        LOG.warning("No compatible win-probability model found. Sizing will use wp=0.0.")
-
-    def _coerce(self, obj: Any) -> Optional[_Loaded]:
-        # 1) statsmodels results
-        try:
-            import statsmodels.api as sm  # noqa: F401 (import to ensure dep exists)
-            if hasattr(obj, "model") and hasattr(obj, "predict"):
-                exog = getattr(obj.model, "exog_names", None)
-                if isinstance(exog, (list, tuple)) and "const" in exog:
-                    feats = [c for c in exog if c != "const"]
-                    return _Loaded(kind="statsmodels", model=obj, features=feats)
-        except Exception:
-            pass
-
-        # 2) research ModelBundle (dataclass with .feature_names and .calibrator)
-        if hasattr(obj, "feature_names") and hasattr(obj, "calibrator"):
-            cal = getattr(obj, "calibrator")
-            if hasattr(cal, "predict_proba"):
-                feats = list(getattr(obj, "feature_names"))
-                return _Loaded(kind="sklearn_bundle", model=cal, features=feats)
-
-        # 3) legacy sklearn dict {"pipeline": estimator, "features": [...]}
-        if isinstance(obj, dict) and "pipeline" in obj and "features" in obj:
-            est = obj["pipeline"]
-            feats = list(obj["features"])
-            if hasattr(est, "predict_proba"):
-                return _Loaded(kind="sklearn_dict", model=est, features=feats)
-
-        # 4) plain sklearn estimator with feature names
-        if hasattr(obj, "predict_proba"):
-            feats = getattr(obj, "feature_names_in_", None)
-            if feats is not None:
-                return _Loaded(kind="sklearn_estimator", model=obj, features=list(feats))
-
-        return None
-
-    def score(self, features: dict) -> float:
-        """Return calibrated P(win) in [0,1] for a single example."""
-        if not self._loaded:
-            return 0.0
-
-        kind = self._loaded.kind
-        model = self._loaded.model
-        cols = list(self._loaded.features)
-
-        X = pd.DataFrame([features], index=[0])
-        X = X.reindex(columns=cols, fill_value=0.0)
+    def __init__(self, model_dir: str = "models/donch_meta"):
+        self.dir = Path(model_dir)
+        self.is_loaded = False
+        self.kind = "lgbm+ohe"
+        self.model = None
+        self.ohe = None
+        self.calibrator = None
+        self.expected_features: list[str] = []  # final training order (numeric + one-hot)
 
         try:
-            if kind == "statsmodels":
-                import statsmodels.api as sm
-                Xc = sm.add_constant(X.astype(float), prepend=True, has_constant="add")
-                p = float(model.predict(Xc)[0])
-
-            else:
-                # sklearn flavors
-                p = float(model.predict_proba(X)[:, 1][0])
-
+            self.model = joblib.load(self.dir / "donch_meta_lgbm.joblib")
+            # optional encoder
+            ohe_path = self.dir / "ohe.joblib"
+            if ohe_path.exists():
+                self.ohe = joblib.load(ohe_path)
+            # expected final columns
+            self.expected_features = json.loads((self.dir / "feature_names.json").read_text())
+            # optional calibrator
+            cal = self.dir / "calibrator.joblib"
+            if cal.exists():
+                self.calibrator = joblib.load(cal)
+            self.is_loaded = True
         except Exception as e:
-            LOG.warning("WinProb scoring failed (%s); returning 0.0", e)
-            return 0.0
+            # leave is_loaded False; caller will degrade gracefully
+            print(f"[WinProbScorer] load failed from {self.dir}: {e}")
 
+    def _build_vector(self, raw: Dict[str, Any]) -> np.ndarray:
+        """
+        Accepts a dict of raw features. It can include:
+          - numerics directly named as in training
+          - raw categorical strings matching the OHE's feature_names_in_
+        We assemble a single 1×N row in EXACT training order self.expected_features.
+        Missing values → 0.0; missing/unknown categories → all-zeros one-hot.
+        """
+        # 1) Prepare a one-row DataFrame with everything we were given
+        df = pd.DataFrame([raw])
+        # 2) If we have an OHE, transform the raw categorical inputs
+        ohe_out = None
+        ohe_cols = []
+        if self.ohe is not None:
+            cat_in = list(getattr(self.ohe, "feature_names_in_", []))
+            # ensure the categorical columns exist (string type)
+            for c in cat_in:
+                if c not in df.columns:
+                    df[c] = ""  # safe fallback cat
+            Xo = self.ohe.transform(df[cat_in].astype(str))  # (1, k)
+            ohe_cols = list(self.ohe.get_feature_names_out(cat_in))
+            # convert sparse to dense if needed
+            ohe_out = np.asarray(Xo.todense() if hasattr(Xo, "todense") else Xo, dtype=np.float64)
+
+        # 3) Build a dict of all columns we can populate now
+        row_vals: Dict[str, float] = {}
+        # numeric features are "expected_features minus OHE-output names"
+        numeric_expected = [c for c in self.expected_features if c not in set(ohe_cols)]
+        for c in numeric_expected:
+            v = df[c].iloc[0] if c in df.columns else 0.0
+            try:
+                row_vals[c] = float(v) if v is not None and np.isfinite(v) else 0.0
+            except Exception:
+                row_vals[c] = 0.0
+
+        # 4) If we have OHE output columns, scatter them by name; else leave zeros
+        ohe_map: Dict[str, float] = {}
+        if ohe_out is not None:
+            assert len(ohe_cols) == ohe_out.shape[1], "OHE shape mismatch"
+            for j, name in enumerate(ohe_cols):
+                ohe_map[name] = float(ohe_out[0, j])
+        # 5) Assemble in the exact expected order
+        out = []
+        for name in self.expected_features:
+            if name in ohe_map:
+                out.append(ohe_map[name])
+            else:
+                out.append(row_vals.get(name, 0.0))
+        X = np.asarray([out], dtype=np.float64)
+        return X
+
+    def score(self, raw: Dict[str, Any]) -> float:
+        if not self.is_loaded:
+            return 0.0
+        X = self._build_vector(raw)
+        try:
+            p = float(self.model.predict_proba(X)[:, 1][0])
+        except Exception:
+            # try decision_function (rare)
+            p = float(self.model.predict_proba(X)[:, 1][0])
+        if self.calibrator is not None:
+            try:
+                # isotonic & Platt both expose predict()
+                p = float(self.calibrator.predict([p])[0])
+            except Exception:
+                pass
         # clamp
         return max(0.0, min(1.0, p))

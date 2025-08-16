@@ -1,0 +1,11 @@
+{
+  "trades_csv": "results/trades.csv",
+  "signals_parquet": "signals/signals.parquet",
+  "target": "mfe_k",
+  "r_threshold": 0.0,
+  "mfe_k": 2.0,
+  "blocks": 12,
+  "k_test": 3,
+  "embargo": 1,
+  "max_splits": 30
+}

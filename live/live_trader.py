@@ -345,11 +345,77 @@ class LiveTrader:
         self.symbol_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
         # Meta / win-prob scorer
-        self.winprob = WinProbScorer()
+        self.winprob = WinProbScorer(self.cfg.get("WINPROB_MODEL_DIR", "results/meta_export"))
         if self.winprob.is_loaded:
             LOG.info("WinProb ready (kind=%s, features=%d)", self.winprob.kind, len(self.winprob.expected_features))
         else:
             LOG.warning("WinProb not loaded; using wp=0.0")
+
+    async def _build_universe_context(self) -> dict[str, dict]:
+        """
+        Compute:
+        - weekly RS percentile (based on 1d closes: last / close[-7d])
+        - median 24h USD turnover (approx from 1h bars; median of rolling 24h sums over last 7d)
+        Returns { symbol: {"rs_pct": float, "median_24h_turnover_usd": float} }
+        """
+        syms = list(self.symbols)
+        # concurrent pulls: 1d and 1h per symbol
+        async with self.api_semaphore:
+            tasks_1d = {s: self.exchange.fetch_ohlcv(s, '1d', limit=10) for s in syms}
+            tasks_1h = {s: self.exchange.fetch_ohlcv(s, '1h', limit=168) for s in syms}
+            res_1d = await asyncio.gather(*tasks_1d.values(), return_exceptions=True)
+            res_1h = await asyncio.gather(*tasks_1h.values(), return_exceptions=True)
+
+        one_d = {s: r for s, r in zip(tasks_1d.keys(), res_1d)}
+        one_h = {s: r for s, r in zip(tasks_1h.keys(), res_1h)}
+
+        weekly_ret = {}
+        med24 = {}
+        for s in syms:
+            # weekly return from 1d
+            d = one_d.get(s)
+            rs = 0.0
+            try:
+                if isinstance(d, list) and len(d) >= 8:
+                    close_series = pd.Series([row[4] for row in d], index=pd.to_datetime([row[0] for row in d], unit='ms', utc=True))
+                    last = float(close_series.iloc[-1])
+                    # 7 days ago close (approx; daily granularity)
+                    prev = float(close_series.iloc[-8])  # T-7d
+                    rs = (last / prev - 1.0) if prev > 0 else 0.0
+            except Exception:
+                rs = 0.0
+            weekly_ret[s] = rs
+
+            # median 24h turnover from 1h bars
+            h = one_h.get(s)
+            med = 0.0
+            try:
+                if isinstance(h, list) and len(h) >= 48:
+                    dfh = pd.DataFrame(h, columns=['ts','o','h','l','c','v'])
+                    dfh['ts'] = pd.to_datetime(dfh['ts'], unit='ms', utc=True)
+                    dfh.set_index('ts', inplace=True)
+                    # USD notional per hour ~ close * volume
+                    notional = dfh['c'] * dfh['v']
+                    # rolling 24h sum (24 bars)
+                    roll_24h = notional.rolling(24).sum().dropna()
+                    # median over last 7 windows if available
+                    med = float(roll_24h.tail(7).median()) if len(roll_24h) >= 1 else 0.0
+            except Exception:
+                med = 0.0
+            med24[s] = med
+
+        # percentile ranks
+        rets = np.array([weekly_ret[s] for s in syms], dtype=float)
+        ranks = np.argsort(np.argsort(rets))  # 0..N-1
+        pct = 100.0 * ranks / max(1, len(syms) - 1)
+
+        out = {}
+        for i, s in enumerate(syms):
+            out[s] = {
+                "rs_pct": float(pct[i]),
+                "median_24h_turnover_usd": float(med24[s]),
+            }
+        return out
 
     # ---- Robust listing-age helper (UTC-safe) --------------------------------
     def _listing_age_days(self, symbol: str, dfs: dict[str, pd.DataFrame] | None = None) -> int | None:
@@ -471,22 +537,24 @@ class LiveTrader:
         symbol: str,
         market_regime: str,
         eth_macd: Optional[dict],
-        gov_ctx: Optional[dict] = None  # placeholder for future governance integration
+        gov_ctx: Optional[dict] = None  # placeholder
     ) -> Optional[Signal]:
         LOG.info("Checking %s...", symbol)
         try:
             # ---- Timeframes to fetch -------------------------------------------------
-            base_tf = self.cfg.get('TIMEFRAME', '5m')
-            ema_tf  = self.cfg.get('EMA_TIMEFRAME', '4h')
-            rsi_tf  = self.cfg.get('RSI_TIMEFRAME', '1h')
-            atr_tf  = self.cfg.get('ADX_TIMEFRAME', '1h')
+            base_tf = str(self.cfg.get('TIMEFRAME', '5m'))
+            ema_tf  = str(self.cfg.get('EMA_TIMEFRAME', '4h'))
+            rsi_tf  = str(self.cfg.get('RSI_TIMEFRAME', '1h'))
+            adx_tf  = str(self.cfg.get('ADX_TIMEFRAME', '1h'))
 
-            required_tfs = {base_tf, ema_tf, rsi_tf, atr_tf, '1d'}
+            # we also need these for meta features (ensure presence)
+            required_tfs = {base_tf, ema_tf, rsi_tf, adx_tf, '1d', '1h'}
             required_tfs |= set(self.strategy_engine.required_timeframes() or [])
 
             # ---- OHLCV fetch (all TFs) ----------------------------------------------
             async with self.api_semaphore:
-                tasks = {tf: self.exchange.fetch_ohlcv(symbol, tf, limit=500) for tf in sorted(required_tfs)}
+                tasks = {tf: self.exchange.fetch_ohlcv(symbol, tf, limit=1500 if tf == base_tf else 500)
+                        for tf in sorted(required_tfs)}
                 results = await asyncio.gather(*tasks.values(), return_exceptions=True)
                 ohlcv_data = dict(zip(tasks.keys(), results))
 
@@ -523,37 +591,55 @@ class LiveTrader:
             df5 = dfs[base_tf]
 
             # ---- Indicators aligned to base index -----------------------------------
+            # EMA on ema_tf (for your heuristic only)
             df5['ema_fast'] = ta.ema(dfs[ema_tf]['close'], cfg.EMA_FAST_PERIOD).reindex(df5.index, method='ffill')
             df5['ema_slow'] = ta.ema(dfs[ema_tf]['close'], cfg.EMA_SLOW_PERIOD).reindex(df5.index, method='ffill')
-            df5['rsi']      = ta.rsi(dfs[rsi_tf]['close'], cfg.RSI_PERIOD).reindex(df5.index, method='ffill')
-            df5['atr']      = ta.atr(dfs[atr_tf], cfg.ADX_PERIOD).reindex(df5.index, method='ffill')
-            df5['adx']      = ta.adx(dfs[atr_tf], cfg.ADX_PERIOD).reindex(df5.index, method='ffill')
 
-            # ---- Robust listing age (UTC), one place, one value ---------------------
+            # Training features are *1h* ATR/RSI/ADX → compute on 1h, then ffill to 5m
+            atr_len = int(self.cfg.get("ATR_LEN", 14))
+            df1h = dfs.get('1h')
+            if df1h is None or df1h.empty:
+                LOG.warning("No 1h data for %s; cannot compute ATR/RSI/ADX features.", symbol)
+                return None
+            atr_1h = ta.atr(df1h, atr_len)
+            rsi_1h = ta.rsi(df1h['close'], atr_len)
+            adx_1h = ta.adx(df1h, atr_len)
+
+            df5['atr_1h'] = atr_1h.reindex(df5.index, method='ffill')
+            df5['rsi_1h'] = rsi_1h.reindex(df5.index, method='ffill')
+            df5['adx_1h'] = adx_1h.reindex(df5.index, method='ffill')
+
+            # Keep your legacy 1h ADX/ATR fields too (if you use them elsewhere)
+            df5['atr'] = df5['atr_1h']
+            df5['adx'] = df5['adx_1h']
+            df5['rsi'] = df5['rsi_1h']
+
+            # ---- Robust listing age (UTC) -------------------------------------------
             age_opt = self._listing_age_days(symbol, dfs)
-            # If unknown, treat as very old so filters won't veto as "new"
             listing_age_days = int(age_opt) if age_opt is not None else 9999
 
+            # ---- StrategyEngine verdict ---------------------------------------------
+            univ = (getattr(self, "_universe_ctx", {}) or {}).get(symbol, {})  # e.g., {"rs_pct": 78, "liq_ok": True}
+            eth_ctx = {"eth_macd": dict(eth_macd or {})}
             ctx = {
                 "symbol": symbol,
                 "market_regime": market_regime,
                 "listing_age_days": listing_age_days,
                 "last_exit_dt": self.last_exit.get(symbol),
                 "is_symbol_blacklisted": is_blacklisted(symbol),
+                **univ, **eth_ctx,
             }
-
-            # ---- StrategyEngine verdict & side --------------------------------------
             verdict = self.strategy_engine.evaluate(dfs, ctx)
             if not verdict.should_enter:
                 return None
 
             side = self._resolve_side(verdict)  # "long" | "short"
             LOG.info("Side chosen for %s: %s (verdict=%s, yaml=%s)",
-                     symbol, side.upper(),
-                     getattr(verdict, "side", None),
-                     self._strategy_declared_side())
+                    symbol, side.upper(),
+                    getattr(verdict, "side", None),
+                    self._strategy_declared_side())
 
-            # ---- VWAP-stack diagnostics (for sizing/DB/reporting) -------------------
+            # ---- VWAP-stack diagnostics (DB/reporting only) -------------------------
             lookback = int(self.cfg.get("VWAP_STACK_LOOKBACK_BARS", 12))
             band_pct = float(self.cfg.get("VWAP_STACK_BAND_PCT", 0.004))
             try:
@@ -568,18 +654,20 @@ class LiveTrader:
                 LOG.error("VWAP-stack calc failed for %s: %s", symbol, e)
                 vwap_frac = vwap_exp = vwap_slope = 0.0
 
-            # ---- Legacy research features (boom/slowdown, 30d trend, VWAP dev/z) ----
-            tf_minutes = 5  # base_tf defaults to '5m'
+            # ---- Legacy research features (kept for DB & compat) --------------------
+            tf_minutes = 5
             boom_bars = int((cfg.PRICE_BOOM_PERIOD_H * 60) / tf_minutes)
             slowdown_bars = int((cfg.PRICE_SLOWDOWN_PERIOD_H * 60) / tf_minutes)
             df5['price_boom_ago'] = df5['close'].shift(boom_bars)
             df5['price_slowdown_ago'] = df5['close'].shift(slowdown_bars)
 
+            # Basic daily trend return used elsewhere
             df1d = dfs.get('1d')
             ret_30d = 0.0
             if df1d is not None and len(df1d) > cfg.STRUCTURAL_TREND_DAYS:
                 ret_30d = (df1d['close'].iloc[-1] / df1d['close'].iloc[-cfg.STRUCTURAL_TREND_DAYS] - 1)
 
+            # VWAP dev/z (legacy)
             vwap_bars = int((cfg.GAP_VWAP_HOURS * 60) / tf_minutes)
             vwap_num = (df5['close'] * df5['volume']).shift(1).rolling(vwap_bars).sum()
             vwap_den = df5['volume'].shift(1).rolling(vwap_bars).sum()
@@ -596,25 +684,96 @@ class LiveTrader:
                 return None
 
             last = df5.iloc[-1]
-            now_utc = datetime.now(timezone.utc)  # UTC-aware
+            now_utc = datetime.now(timezone.utc)
 
             boom_ret_pct = (last['close'] / last['price_boom_ago'] - 1)
             slowdown_ret_pct = (last['close'] / last['price_slowdown_ago'] - 1)
             is_ema_crossed_down = last['ema_fast'] < last['ema_slow']
-            atr_pct = (last['atr'] / last['close']) * 100 if last['close'] > 0 else 0.0
+            atr_pct = (last['atr_1h'] / last['close']) if last['close'] > 0 else 0.0
 
             hour_of_day = now_utc.hour
             day_of_week = now_utc.weekday()
             session_tag = "ASIA" if 0 <= hour_of_day < 8 else "EUROPE" if 8 <= hour_of_day < 16 else "US"
 
-            # ---- Optional side-aware built-in entry heuristic (OFF by default) ----
+            # ---- Build the meta-model feature row -----------------------------------
+            # CATEGORICALS used by your OHE (provide best-available values; fall back to baseline)
+            entry_rule = getattr(verdict, "entry_rule", None) or self.cfg.get("ENTRY_RULE", "close_above_break")
+            pullback_type = getattr(verdict, "pullback_type", None) or self.cfg.get("PULLBACK_TYPE", "retest")
+            regime_1d = getattr(verdict, "regime_1d", None) or ""  # optional daily regime label if you compute it
+
+            # Donch breakout info (if verdict provided), else compute reference level from 1D Donch(20) shifted
+            don_len = int(getattr(verdict, "don_break_len", self.cfg.get("DON_N_DAYS", 20)))
+            don_level = None
+            try:
+                if df1d is not None and len(df1d) >= (don_len + 2):
+                    don_upper = df1d['high'].rolling(don_len).max().shift(1)  # prior N full days
+                    don_level = float(don_upper.iloc[-1])
+            except Exception:
+                pass
+            if getattr(verdict, "don_break_level", None) is not None:
+                don_level = float(verdict.don_break_level)
+            if don_level is None:
+                don_level = float(last['close'])
+
+            # volume multiple: current 5m volume / rolling 30d median (bounded by available bars)
+            try:
+                bars_needed = int(self.cfg.get("VOL_LOOKBACK_DAYS", 30) * 24 * (60 // tf_minutes))
+                bars_needed = max(96, min(bars_needed, len(df5)))  # at least ~2 days; cap to available
+                vol_med = df5['volume'].tail(bars_needed).median()
+                vol_mult = float(last['volume'] / vol_med) if vol_med > 0 else 0.0
+            except Exception:
+                vol_mult = 0.0
+
+            # RS percentile from universe (0..100), else 0
+            rs_pct = float(univ.get("rs_pct", 0.0) or 0.0)
+
+            # ETH MACD histogram (4h) and above- signal flag
+            eth_hist = float((eth_macd or {}).get("hist", 0.0) or 0.0)
+            eth_above = 1.0 if float((eth_macd or {}).get("macd", 0.0)) > float((eth_macd or {}).get("signal", 0.0)) else 0.0
+            regime_up = 1.0 if (eth_hist > 0 and eth_above == 1.0) else 0.0
+
+            # time features
+            hour_sin = math.sin(2 * math.pi * hour_of_day / 24.0)
+            hour_cos = math.cos(2 * math.pi * hour_of_day / 24.0)
+
+            # distance from donch level in ATRs
+            don_dist_atr = (float(last['close']) - float(don_level)) / float(last['atr_1h'] if last['atr_1h'] > 0 else np.nan)
+            if not np.isfinite(don_dist_atr):
+                don_dist_atr = 0.0
+
+            meta_row = {
+                # numerics you trained on (names must match your feature_names.json)
+                "atr_1h": float(last['atr_1h']),
+                "rsi_1h": float(last['rsi_1h']),
+                "adx_1h": float(last['adx_1h']),
+                "atr_pct": float(atr_pct),
+                "don_break_len": float(don_len),
+                "don_break_level": float(don_level),
+                "don_dist_atr": float(don_dist_atr),
+                "rs_pct": float(rs_pct),
+                "hour_sin": float(hour_sin),
+                "hour_cos": float(hour_cos),
+                "dow": float(day_of_week),
+                "vol_mult": float(vol_mult),
+                "eth_macd_hist_4h": float(eth_hist),
+                "regime_up": float(regime_up),
+
+                # anything else you included numerically in training (defaults are fine if absent)
+                "prior_1d_ret": float(ret_30d),  # if you trained with a 1d return-like feature
+                # "markov_prob_up_4h": 0.0,
+                # "vol_prob_low_1d": 0.0,
+                # ...
+
+                # CATEGORICAL INPUTS for OHE:
+                "entry_rule": str(entry_rule),
+                "pullback_type": str(pullback_type),
+                "regime_1d": str(regime_1d),
+            }
+
+            # ---- Optional extra entry heuristics (kept OFF by default) ---------------
             enter_ok = True
-            need_cross = bool(self.cfg.get("ENTRY_REQUIRE_EMA_CROSS", False))
-            if need_cross:
-                if side == "long":
-                    enter_ok = enter_ok and bool(last['ema_fast'] > last['ema_slow'])
-                else:
-                    enter_ok = enter_ok and bool(last['ema_fast'] < last['ema_slow'])
+            if bool(self.cfg.get("ENTRY_REQUIRE_EMA_CROSS", False)):
+                enter_ok = enter_ok and ((last['ema_fast'] > last['ema_slow']) if side == "long" else (last['ema_fast'] < last['ema_slow']))
             if bool(self.cfg.get("ENTRY_REQUIRE_VWAP_CONSOL", False)):
                 enter_ok = enter_ok and bool(last.get('vwap_consolidated', False))
             min_atr_pct = float(self.cfg.get("ENTRY_MIN_ATR_PCT", 0.0))
@@ -623,76 +782,54 @@ class LiveTrader:
             if not enter_ok:
                 return None
 
+            # ---- Compose Signal (for DB/journaling & sizing) -------------------------
             signal_obj = Signal(
                 symbol=symbol,
                 entry=float(last['close']),
-                atr=float(last['atr']),
-                rsi=float(last['rsi']),
-                adx=float(last['adx']),
-                atr_pct=atr_pct,
+                atr=float(last['atr_1h']),
+                rsi=float(last['rsi_1h']),
+                adx=float(last['adx_1h']),
+                atr_pct=float(atr_pct) * 100.0,       # your DB stored pct in %
                 market_regime=market_regime,
-                price_boom_pct=boom_ret_pct,
-                price_slowdown_pct=slowdown_ret_pct,
+                price_boom_pct=float(boom_ret_pct),
+                price_slowdown_pct=float(slowdown_ret_pct),
                 vwap_dev_pct=float(last.get('vwap_dev_pct', 0.0)),
                 vwap_z_score=float(last.get('vwap_z_score', 0.0)),
-                ret_30d=ret_30d,
+                ret_30d=float(ret_30d),
                 ema_fast=float(last['ema_fast']),
                 ema_slow=float(last['ema_slow']),
                 listing_age_days=int(listing_age_days),
-                session_tag=session_tag,
+                session_tag=("ASIA" if 0 <= hour_of_day < 8 else "EUROPE" if 8 <= hour_of_day < 16 else "US"),
                 day_of_week=day_of_week,
                 hour_of_day=hour_of_day,
                 vwap_consolidated=bool(last.get('vwap_consolidated', False)),
                 is_ema_crossed_down=bool(is_ema_crossed_down),
                 side=side,
             )
-
-            # Attach VWAP-stack diagnostics (used later in sizing + DB)
+            # VWAP diagnostics for DB/reporting
             signal_obj.vwap_stack_frac = vwap_frac
             signal_obj.vwap_stack_expansion_pct = vwap_exp
             signal_obj.vwap_stack_slope_pph = vwap_slope
 
             # ---- Win-prob scoring (meta model) --------------------------------------
             try:
-                eth_hist = float(eth_macd.get("hist", 0.0)) if eth_macd else 0.0
-                live_data = {
-                    "rsi_at_entry": float(signal_obj.rsi),
-                    "adx_at_entry": float(signal_obj.adx),
-                    "price_boom_pct_at_entry": float(signal_obj.price_boom_pct),
-                    "price_slowdown_pct_at_entry": float(signal_obj.price_slowdown_pct),
-                    "vwap_z_at_entry": float(signal_obj.vwap_z_score),
-                    "ema_spread_pct_at_entry": (
-                        (float(signal_obj.ema_fast) - float(signal_obj.ema_slow)) / float(signal_obj.ema_slow)
-                        if float(signal_obj.ema_slow) > 0.0 else 0.0
-                    ),
-                    "is_ema_crossed_down_at_entry": int(bool(signal_obj.is_ema_crossed_down)),
-                    "day_of_week_at_entry": int(signal_obj.day_of_week),
-                    "hour_of_day_at_entry": int(signal_obj.hour_of_day),
-                    "eth_macdhist_at_entry": eth_hist,
-                    "vwap_stack_frac_at_entry": float(getattr(signal_obj, "vwap_stack_frac", 0.0) or 0.0),
-                    "vwap_stack_expansion_pct_at_entry": float(getattr(signal_obj, "vwap_stack_expansion_pct", 0.0) or 0.0),
-                    "vwap_stack_slope_pph_at_entry": float(getattr(signal_obj, "vwap_stack_slope_pph", 0.0) or 0.0),
-                }
                 if self.winprob.is_loaded:
-                    win_prob = self.winprob.score(live_data)
-                    signal_obj.win_probability = max(0.0, min(1.0, float(win_prob)))
+                    wp = self.winprob.score(meta_row)
+                    signal_obj.win_probability = max(0.0, min(1.0, float(wp)))
                 else:
                     signal_obj.win_probability = 0.0
             except Exception as e:
                 LOG.warning("Failed to score signal for %s: %s", symbol, e)
                 signal_obj.win_probability = 0.0
 
-            LOG.info(
-                "SIGNAL %s @ %.6f | regime=%s | wp=%.2f%%",
-                symbol, float(last['close']), market_regime, signal_obj.win_probability * 100.0
-            )
+            LOG.info("SIGNAL %s @ %.6f | regime=%s | wp=%.2f%%",
+                    symbol, float(last['close']), market_regime, signal_obj.win_probability * 100.0)
             return signal_obj
 
         except ccxt.BadSymbol:
             LOG.warning("Invalid symbol on exchange: %s", symbol)
         except Exception as e:
-            LOG.error("Error scanning symbol %s: %s", symbol, e)
-            traceback.print_exc()
+            LOG.error("Error scanning symbol %s: %s", symbol, e, exc_info=True)
         return None
 
     # ───────────────────── Sizing helpers ─────────────────────
@@ -848,6 +985,17 @@ class LiveTrader:
         except Exception as e:
             LOG.error("Pre-flight check failed for %s: %s", sig.symbol, e)
             return
+
+        try:
+            dd_hours = float(self.cfg.get("DEDUP_WINDOW_HOURS", 8.0))
+            recent_open = await self.db.pool.fetchval(
+                "SELECT MAX(opened_at) FROM positions WHERE symbol=$1", sig.symbol
+            )
+            if recent_open and (datetime.now(timezone.utc) - recent_open) < timedelta(hours=dd_hours):
+                LOG.info("De-dup window: last %s open at %s < %sh → skip.", sig.symbol, recent_open, dd_hours)
+                return
+        except Exception as _e:
+            LOG.warning("De-dup check failed for %s: %s (continuing)", sig.symbol, _e)
 
         # --- Win-probability gate (optional) ---
         thr = float(self.cfg.get("MIN_WINPROB_TO_TRADE", self.cfg.get("META_PROB_THRESHOLD", 0.0)))
@@ -1700,6 +1848,12 @@ class LiveTrader:
                 current_market_regime = await self.regime_detector.get_current_regime()
                 LOG.info("New scan cycle for %d symbols | regime: %s", len(self.symbols), current_market_regime)
 
+                try:
+                    self._universe_ctx = await self._build_universe_context()
+                except Exception as e:
+                    LOG.warning("Universe context failed: %s (continuing with empty).", e)
+                    self._universe_ctx = {}
+
                 # ETH MACD Barometer (4h)
                 eth_macd_data = None
                 try:
@@ -2175,7 +2329,7 @@ class LiveTrader:
         self._listing_dates_cache = await self._load_listing_dates()
 
         await self._resume()
-        await self.tg.send("🤖 DONCH v0.7b")
+        await self.tg.send("🤖 DONCH v0.9b test")
 
         try:
             async with asyncio.TaskGroup() as tg:
