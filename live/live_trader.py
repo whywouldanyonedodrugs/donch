@@ -650,10 +650,132 @@ class LiveTrader:
                 **univ, **eth_ctx,
             }
             verdict = self.strategy_engine.evaluate(dfs, ctx)
+
+            # ---------- DEEP DIAGNOSTICS even if StrategyEngine says no ----------
+            if bool(self.cfg.get("DEBUG_SIGNAL_DIAG", True)):
+                try:
+                    last = dfs[base_tf].iloc[-1]  # already built above
+                    tf_minutes = 5
+                    # Donch/entry params (use verdict if present; else sensible defaults)
+                    don_len = int(getattr(verdict, "don_break_len", self.cfg.get("DON_N_DAYS", 20)))
+                    df1d = dfs.get("1d")
+                    don_level = None
+                    try:
+                        if df1d is not None and len(df1d) >= (don_len + 2):
+                            don_upper = df1d["high"].rolling(don_len).max().shift(1)
+                            don_level = float(don_upper.iloc[-1])
+                    except Exception:
+                        pass
+                    if getattr(verdict, "don_break_level", None) is not None:
+                        don_level = float(verdict.don_break_level)
+                    if don_level is None:
+                        don_level = float(last["close"])
+
+                    # Volume multiple (~30d median on base tf)
+                    try:
+                        bars_needed = int(self.cfg.get("VOL_LOOKBACK_DAYS", 30) * 24 * (60 // tf_minutes))
+                        bars_needed = max(96, min(bars_needed, len(dfs[base_tf])))
+                        vol_med = dfs[base_tf]["volume"].tail(bars_needed).median()
+                        vol_mult = float(last["volume"] / vol_med) if vol_med > 0 else 0.0
+                    except Exception:
+                        vol_mult = 0.0
+
+                    # RS & Liquidity from universe snapshot
+                    rs_pct = float((getattr(self, "_universe_ctx", {}) or {}).get(symbol, {}).get("rs_pct", 0.0))
+                    liq_usd = float((getattr(self, "_universe_ctx", {}) or {}).get(symbol, {}).get("median_24h_turnover_usd", 0.0))
+                    liq_thr = float(self.cfg.get("LIQ_MIN_24H_USD", 500_000.0))
+                    liq_ok_univ = (getattr(self, "_universe_ctx", {}) or {}).get(symbol, {}).get("liq_ok", None)
+                    g_liq = (bool(liq_ok_univ) if liq_ok_univ is not None else (liq_usd >= liq_thr))
+
+                    # ETH barometer → regime_up
+                    eth_hist = float((eth_macd or {}).get("hist", 0.0) or 0.0)
+                    eth_above = float((eth_macd or {}).get("macd", 0.0)) > float((eth_macd or {}).get("signal", 0.0))
+                    regime_up = 1.0 if (eth_hist > 0 and eth_above) else 0.0
+
+                    # Simple deriveds
+                    atr_pct = float(last["atr_1h"] / last["close"]) if last["close"] > 0 else 0.0
+                    don_dist_atr = (float(last["close"]) - float(don_level)) / float(last["atr_1h"] if last["atr_1h"] > 0 else np.nan)
+                    if not np.isfinite(don_dist_atr):
+                        don_dist_atr = 0.0
+
+                    entry_rule = getattr(verdict, "entry_rule", None) or self.cfg.get("ENTRY_RULE", "close_above_break")
+                    pullback_type = getattr(verdict, "pullback_type", None) or self.cfg.get("PULLBACK_TYPE", "retest")
+
+                    # Main gates (mirror your spec thresholds)
+                    rs_min = float(self.cfg.get("RS_MIN_PERCENTILE", 70))
+                    vol_needed = float(self.cfg.get("VOL_MULTIPLE", 2.0))
+                    regime_block = bool(self.cfg.get("REGIME_BLOCK_WHEN_DOWN", True))
+                    g_rs = rs_pct >= rs_min
+                    g_vol = vol_mult >= vol_needed
+                    g_regime = (regime_up == 1.0) or (not regime_block)
+                    g_micro = (atr_pct >= float(self.cfg.get("ENTRY_MIN_ATR_PCT", 0.0)))
+
+                    # Try to show why StrategyEngine said no, if it exposes anything
+                    why = None
+                    for attr in ("reasons", "why", "debug", "failures"):
+                        if hasattr(verdict, attr):
+                            why = getattr(verdict, attr)
+                            break
+
+                    # Optional: score meta even on failures, just for visibility
+                    wp_txt = ""
+                    try:
+                        if self.winprob.is_loaded:
+                            meta_row = {
+                                "atr_1h": float(last["atr_1h"]),
+                                "rsi_1h": float(last["rsi_1h"]),
+                                "adx_1h": float(last["adx_1h"]),
+                                "atr_pct": float(atr_pct),
+                                "don_break_len": float(don_len),
+                                "don_break_level": float(don_level),
+                                "don_dist_atr": float(don_dist_atr),
+                                "rs_pct": float(rs_pct),
+                                "hour_sin": 0.0, "hour_cos": 1.0,  # fine for diag
+                                "dow": float(datetime.now(timezone.utc).weekday()),
+                                "vol_mult": float(vol_mult),
+                                "eth_macd_hist_4h": float(eth_hist),
+                                "regime_up": float(regime_up),
+                                "prior_1d_ret": 0.0,
+                                "entry_rule": str(entry_rule),
+                                "pullback_type": str(pullback_type),
+                                "regime_1d": str(getattr(verdict, "regime_1d", "") or ""),
+                            }
+                            wp = float(self.winprob.score(meta_row))
+                            meta_thresh = float(getattr(self.winprob, "pstar", self.cfg.get("META_PROB_THRESHOLD", 0.0)) or 0.0)
+                            g_meta = wp >= meta_thresh
+                            wp_txt = f"META: p*={meta_thresh:.2f},  p={wp:.3f} → {'✅' if g_meta else '❌'}\n"
+                    except Exception:
+                        pass
+
+                    def _ok(b): return "✅" if b else "❌"
+                    LOG.debug(
+                        (
+                            f"\n--- {symbol} | {last.name.strftime('%Y-%m-%d %H:%M')} UTC ---\n"
+                            f"[Strategy verdict] should_enter={getattr(verdict, 'should_enter', None)}"
+                            f"{'  why=' + str(why) if why is not None else ''}\n"
+                            f"[Inputs]\n"
+                            f"  Price: {last['close']:.6f}\n"
+                            f"  ATR1h: {last['atr_1h']:.6f} ({atr_pct*100:.3f}%)  RSI1h: {last['rsi_1h']:.2f}  ADX1h: {last['adx_1h']:.2f}\n"
+                            f"  RS pct: {rs_pct:.1f}%  Liquidity(24h med USD): {liq_usd:,.0f} (thr {liq_thr:,.0f})\n"
+                            f"  ETH MACD(4h) hist: {eth_hist:.4f}  macd>signal: {eth_above}  → regime_up={bool(regime_up)}\n"
+                            f"  Donch({don_len}d prev) upper: {don_level:.6f}  dist_atr={don_dist_atr:+.3f}\n"
+                            f"  Vol mult (median {int(self.cfg.get('VOL_LOOKBACK_DAYS',30))}d): x{vol_mult:.2f}\n"
+                            f"  Pullback/Entry: {pullback_type} + {entry_rule}\n"
+                            f"[Gates]\n"
+                            f"  RS≥{rs_min:.0f} ............. {_ok(g_rs)}\n"
+                            f"  Liquidity≥{liq_thr:,.0f} ..... {_ok(g_liq)}\n"
+                            f"  RegimeUp / not blocked ...... {_ok(g_regime)} (block_when_down={regime_block})\n"
+                            f"  Volume spike x{vol_needed:.1f} .... {_ok(g_vol)}\n"
+                            f"  Micro-ATR min ............... {_ok(g_micro)} (min={float(self.cfg.get('ENTRY_MIN_ATR_PCT',0.0)):.5f})\n"
+                            f"{wp_txt}"
+                            f"===================================================="
+                        )
+                    )
+                except Exception as _e_diag:
+                    LOG.debug("diag failed for %s: %s", symbol, _e_diag)
+            # ---------------------------------------------------------------------------
+
             if not verdict.should_enter:
-                # we still emit a quick diagnostic if enabled
-                if bool(self.cfg.get("DEBUG_SIGNAL_DIAG", True)):
-                    LOG.debug("— %s skipped by StrategyEngine (should_enter=False).", symbol)
                 return None
 
             side = self._resolve_side(verdict)  # "long" | "short"
@@ -1911,7 +2033,7 @@ class LiveTrader:
                 except Exception as e:
                     LOG.warning("Universe context failed: %s (continuing with empty).", e)
                     self._universe_ctx = {}
-                    
+
                 # ETH MACD Barometer (4h)
                 eth_macd_data = None
                 try:
