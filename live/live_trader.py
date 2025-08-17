@@ -368,6 +368,89 @@ class LiveTrader:
         else:
             LOG.warning("WinProb not loaded; using wp=0.0")
 
+    def _score_winprob_safe(self, symbol: str, meta_row: dict) -> Optional[float]:
+        """
+        Try multiple input protocols for WinProbScorer:
+        - dict -> score()
+        - ordered list of (name, value) pairs -> score()
+        - 1-row DataFrame with feature_order columns -> score_df() / predict_proba()
+        Returns float in [0,1] or None on failure.
+        """
+        if not getattr(self, "winprob", None) or not getattr(self.winprob, "is_loaded", False):
+            return None
+
+        feats = (getattr(self.winprob, "feature_order", None)
+                or getattr(self.winprob, "expected_features", None))
+
+        if feats:
+            ordered = []
+            for f in feats:
+                v = meta_row.get(f, 0)
+                if isinstance(v, (list, dict, tuple, set)):
+                    v = str(v)
+                ordered.append((f, v))
+        else:
+            ordered = [(k, meta_row[k]) for k in sorted(meta_row.keys())]
+
+        def _extract_scalar(x):
+            try:
+                return float(x)
+            except Exception:
+                pass
+            try:
+                import numpy as _np
+                return float(_np.asarray(x).ravel()[0])
+            except Exception:
+                pass
+            try:
+                return float((x[0] if isinstance(x, (list, tuple)) else next(iter(x))))
+            except Exception:
+                return None
+
+        # A) dict
+        try:
+            p = self.winprob.score(dict(ordered))
+            ps = _extract_scalar(p)
+            if ps is not None and 0.0 <= ps <= 1.0:
+                return ps
+        except Exception as eA:
+            LOG.debug("WinProb A(dict) failed for %s: %s", symbol, eA)
+
+        # B) list of pairs
+        try:
+            p = self.winprob.score(ordered)
+            ps = _extract_scalar(p)
+            if ps is not None and 0.0 <= ps <= 1.0:
+                return ps
+        except Exception as eB:
+            LOG.debug("WinProb B(pairs) failed for %s: %s", symbol, eB)
+
+        # C) 1-row DataFrame
+        try:
+            import pandas as _pd
+            cols = [name for (name, _) in ordered]
+            vals = [val for (_, val) in ordered]
+            X = _pd.DataFrame([vals], columns=cols)
+
+            if hasattr(self.winprob, "score_df"):
+                p = self.winprob.score_df(X)
+            elif hasattr(self.winprob, "predict_proba"):
+                p = self.winprob.predict_proba(X)
+            elif hasattr(self.winprob, "model") and hasattr(self.winprob.model, "predict_proba"):
+                p = self.winprob.model.predict_proba(X)
+            else:
+                raise RuntimeError("No compatible scoring method found")
+
+            ps = _extract_scalar(p if p is not None else float("nan"))
+            if ps is not None and 0.0 <= ps <= 1.0:
+                return ps
+        except Exception as eC:
+            LOG.debug("WinProb C(DataFrame) failed for %s: %s", symbol, eC)
+
+        return None
+
+
+
     def _load_universe_cache_if_fresh(self) -> Optional[dict]:
         """Return {symbol: {rs_pct, median_24h_turnover_usd}} if cache exists & fresh & symbols match."""
         if not bool(self.cfg.get("UNIVERSE_CACHE_ENABLED", True)):
@@ -794,13 +877,23 @@ class LiveTrader:
             }
 
             # -------------- Score meta (even on rejects) ----------
-            p = None
             pstar = float(getattr(self.winprob, "pstar", self.cfg.get("META_PROB_THRESHOLD", 0.0)) or 0.0)
-            try:
-                if self.winprob.is_loaded:
-                    p = float(self.winprob.score(meta_row))
-            except Exception as e:
-                LOG.debug("Meta score failed for %s (diag only): %s", symbol, e)
+            p = self._score_winprob_safe(symbol, meta_row)
+
+            # ---------- DIAGNOSTICS (always) ----------------------
+            # ...
+            g_meta = (p is not None and np.isfinite(p) and p >= pstar)
+
+            def _ok(b): return "✅" if b else "❌"
+            p_txt = "n/a" if (p is None or not np.isfinite(p)) else f"{p:.3f}"
+
+            LOG.debug(
+                (
+                    # ...
+                    f"  META: p*={pstar:.2f},  p={p_txt} → {_ok(g_meta)}\n"
+                    f"===================================================="
+                )
+            )
 
             # ---------- DIAGNOSTICS (always) ----------------------
             if bool(self.cfg.get("DEBUG_SIGNAL_DIAG", True)):
@@ -959,14 +1052,12 @@ class LiveTrader:
 
             # -------------- Win-prob: reuse p if available -------
             try:
-                if p is not None:
+                if p is not None and np.isfinite(p):
                     signal_obj.win_probability = max(0.0, min(1.0, float(p)))
-                elif self.winprob.is_loaded:
-                    # Fallback: score again if p was None
-                    wp2 = self.winprob.score(meta_row)
-                    signal_obj.win_probability = max(0.0, min(1.0, float(wp2)))
                 else:
-                    signal_obj.win_probability = 0.0
+                    # one more attempt on the fully-computed row, same protocol
+                    p2 = self._score_winprob_safe(symbol, meta_row)
+                    signal_obj.win_probability = max(0.0, min(1.0, float(p2))) if (p2 is not None and np.isfinite(p2)) else 0.0
             except Exception as e:
                 LOG.warning("Failed to score signal for %s: %s", symbol, e)
                 signal_obj.win_probability = 0.0
