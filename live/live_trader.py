@@ -370,85 +370,67 @@ class LiveTrader:
 
     def _score_winprob_safe(self, symbol: str, meta_row: dict) -> Optional[float]:
         """
-        Try multiple input protocols for WinProbScorer:
-        - dict -> score()
-        - ordered list of (name, value) pairs -> score()
-        - 1-row DataFrame with feature_order columns -> score_df() / predict_proba()
-        Returns float in [0,1] or None on failure.
+        Prefer the scorer's canonical DataFrame protocol (columns=self.winprob.expected_features).
+        Fallback to dict->score() only if needed. Returns float in [0,1] or None.
         """
-        if not getattr(self, "winprob", None) or not getattr(self.winprob, "is_loaded", False):
+        wp = getattr(self, "winprob", None)
+        if not wp or not getattr(wp, "is_loaded", False):
             return None
 
-        feats = (getattr(self.winprob, "feature_order", None)
-                or getattr(self.winprob, "expected_features", None))
+        # Build an ordered 1xN DataFrame first (best path for our scorer)
+        feats = getattr(wp, "expected_features", None) or getattr(wp, "feature_order", None)
+        tried = []
 
+        # C) DataFrame-first (canonical)
         if feats:
-            ordered = []
-            for f in feats:
-                v = meta_row.get(f, 0)
-                if isinstance(v, (list, dict, tuple, set)):
-                    v = str(v)
-                ordered.append((f, v))
-        else:
-            ordered = [(k, meta_row[k]) for k in sorted(meta_row.keys())]
-
-        def _extract_scalar(x):
             try:
-                return float(x)
-            except Exception:
-                pass
-            try:
-                import numpy as _np
-                return float(_np.asarray(x).ravel()[0])
-            except Exception:
-                pass
-            try:
-                return float((x[0] if isinstance(x, (list, tuple)) else next(iter(x))))
-            except Exception:
-                return None
+                import pandas as _pd
+                cols, vals = [], []
+                for f in feats:
+                    v = meta_row.get(f, 0)
+                    # force scalars, stringify non-scalars defensively
+                    if isinstance(v, (list, dict, tuple, set)):
+                        v = str(v)
+                    cols.append(f); vals.append(v)
+                X = _pd.DataFrame([vals], columns=cols)
 
-        # A) dict
+                # Call into the model directly (raw) or via scorer if it exposes a DF method
+                if hasattr(wp, "score_df"):
+                    p = wp.score_df(X)
+                elif hasattr(wp, "model") and hasattr(wp.model, "predict_proba"):
+                    p = wp.model.predict_proba(X)[:, 1][0]
+                    # apply calibrator when present
+                    if hasattr(wp, "_calibrate"):
+                        try:
+                            p = wp._calibrate(float(p))
+                        except Exception:
+                            pass
+                else:
+                    raise RuntimeError("No compatible scoring method for DataFrame input")
+                p = float(p)
+                if np.isfinite(p) and 0.0 <= p <= 1.0:
+                    return p
+            except Exception as e_df:
+                # log once per boot to avoid per-scan noise
+                if not hasattr(self, "_wp_df_warned"):
+                    LOG.debug("WinProb (DataFrame) path failed for %s: %s", symbol, e_df)
+                    self._wp_df_warned = True
+                tried.append("df")
+
+        # A) dict -> score() (supported by our WinProbScorer)
         try:
-            p = self.winprob.score(dict(ordered))
-            ps = _extract_scalar(p)
-            if ps is not None and 0.0 <= ps <= 1.0:
-                return ps
-        except Exception as eA:
-            LOG.debug("WinProb A(dict) failed for %s: %s", symbol, eA)
+            p = wp.score(meta_row)
+            p = float(p)
+            if np.isfinite(p) and 0.0 <= p <= 1.0:
+                return p
+        except Exception as e_dict:
+            if not hasattr(self, "_wp_dict_warned"):
+                LOG.debug("WinProb (dict) path failed for %s: %s", symbol, e_dict)
+                self._wp_dict_warned = True
+            tried.append("dict")
 
-        # B) list of pairs
-        try:
-            p = self.winprob.score(ordered)
-            ps = _extract_scalar(p)
-            if ps is not None and 0.0 <= ps <= 1.0:
-                return ps
-        except Exception as eB:
-            LOG.debug("WinProb B(pairs) failed for %s: %s", symbol, eB)
-
-        # C) 1-row DataFrame
-        try:
-            import pandas as _pd
-            cols = [name for (name, _) in ordered]
-            vals = [val for (_, val) in ordered]
-            X = _pd.DataFrame([vals], columns=cols)
-
-            if hasattr(self.winprob, "score_df"):
-                p = self.winprob.score_df(X)
-            elif hasattr(self.winprob, "predict_proba"):
-                p = self.winprob.predict_proba(X)
-            elif hasattr(self.winprob, "model") and hasattr(self.winprob.model, "predict_proba"):
-                p = self.winprob.model.predict_proba(X)
-            else:
-                raise RuntimeError("No compatible scoring method found")
-
-            ps = _extract_scalar(p if p is not None else float("nan"))
-            if ps is not None and 0.0 <= ps <= 1.0:
-                return ps
-        except Exception as eC:
-            LOG.debug("WinProb C(DataFrame) failed for %s: %s", symbol, eC)
-
+        # (We intentionally skip the list-of-pairs path: our scorer expects dict/DF)
         return None
-
 
 
     def _load_universe_cache_if_fresh(self) -> Optional[dict]:

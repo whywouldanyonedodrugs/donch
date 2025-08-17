@@ -67,36 +67,41 @@ class WinProbScorer:
     # -------------------- public API --------------------
 
     def score(self, row: dict) -> float:
-        # 1) Build X exactly as used today
-        X, used_cols = self._build_X(row)   # your existing method that returns ndarray (1, n_features)
+        """
+        Robustly score a single meta feature row (dict). Builds the exact column
+        order the model expects and returns a calibrated probability in [0, 1].
+        """
+        # 1) Build design matrix (1 x n_features) in the expected order
+        X = self._build_X(row)  # returns a single pandas.DataFrame
 
-        # 2) Model raw proba
+        # 2) Raw proba -> calibrate (if calibrator available)
         p_raw = float(self.model.predict_proba(X)[:, 1][0])
         p = self._calibrate(p_raw)
 
-        # 3) One-shot deep diag
+        # 3) One-shot diagnostics (uses expected_features, not undefined feature_order)
         if not self._diag_once:
-            # What did we *think* the categorical inputs are?
-            cat_in = list(getattr(self.ohe, "feature_names_in_", [])) if getattr(self, "ohe", None) is not None else []
-            ohe_out = list(self.ohe.get_feature_names_out(cat_in)) if getattr(self, "ohe", None) is not None else []
+            cat_in = list(getattr(self.ohe, "feature_names_in_", [])) if self.ohe is not None else []
+            ohe_out = (list(self.ohe.get_feature_names_out(cat_in))
+                    if self.ohe is not None and hasattr(self.ohe, "get_feature_names_out")
+                    else [])
 
-            # Feature coverage:
-            missing = [f for f in self.feature_order if f not in used_cols]
-            present = [f for f in self.feature_order if f in used_cols]
+            feature_order = list(self.expected_features)  # canonical
+            used_cols = list(X.columns)
 
-            # Nonzero snapshot (which columns are actually influencing)
-            nz_idx = list(np.where(X[0] != 0.0)[0])
-            nz_names = [self.feature_order[i] for i in nz_idx][:20]  # first 20 for brevity
+            missing = [f for f in feature_order if f not in used_cols]
+            present = [f for f in feature_order if f in used_cols]
 
-            LOG.warning(
-                "[WINPROB DIAG]\n"
-                "  n_features: %d\n"
-                "  raw_proba: %.6f  calibrated: %.6f\n"
+            # First 20 non-zero feature names for sanity
+            nz_idx = np.where(X.to_numpy()[0] != 0.0)[0].tolist()
+            nz_names = [feature_order[i] for i in nz_idx][:20] if feature_order else []
+
+            LOG.info(
+                "[WINPROB DIAG] features=%d  raw=%.6f  calibrated=%.6f\n"
                 "  cat_inputs_expected: %s\n"
                 "  ohe_outputs_seen: %d\n"
                 "  present_cols: %d  missing_cols: %d\n"
-                "  first_20_nonzero: %s\n",
-                len(self.feature_order), p_raw, p,
+                "  first_20_nonzero: %s",
+                len(feature_order), p_raw, p,
                 cat_in, len(ohe_out),
                 len(present), len(missing),
                 nz_names
@@ -105,21 +110,26 @@ class WinProbScorer:
                 LOG.warning("[WINPROB DIAG] Missing features (first 30): %s", missing[:30])
             self._diag_once = True
 
-        # 4) Vector hash: are many calls identical?
-        h = hashlib.md5(X.tobytes()).hexdigest()
-        if self._last_hash is None:
-            self._last_hash = h
-        else:
-            if h == self._last_hash:
-                self._same_vec_count += 1
-                if self._same_vec_count in (5, 25, 100):
-                    LOG.warning("[WINPROB DIAG] Detected %d consecutive identical feature vectors (hash=%s).",
-                                self._same_vec_count, h)
-            else:
+        # 4) Hash identical vectors (uses ndarray bytes)
+        try:
+            vec_bytes = X.to_numpy().tobytes()
+            h = hashlib.md5(vec_bytes).hexdigest()
+            if self._last_hash is None:
                 self._last_hash = h
-                self._same_vec_count = 0
+            else:
+                if h == self._last_hash:
+                    self._same_vec_count += 1
+                    if self._same_vec_count in (5, 25, 100):
+                        LOG.warning("[WINPROB DIAG] Detected %d consecutive identical feature vectors (hash=%s).",
+                                    self._same_vec_count, h)
+                else:
+                    self._last_hash = h
+                    self._same_vec_count = 0
+        except Exception:
+            # purely diagnostic; never break scoring
+            pass
 
-        return p
+        return float(max(0.0, min(1.0, p)))
 
     # -------------------- internals --------------------
 
