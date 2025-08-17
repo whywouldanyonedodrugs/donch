@@ -51,6 +51,9 @@ from pydantic import Field, ValidationError
 from pydantic_settings import BaseSettings
 from .strategy_engine import StrategyEngine
 
+from live.winprob_loader import WinProbScorer
+self.winprob = WinProbScorer(os.getenv("DONCH_WINPROB_DIR", "results/meta_export"))
+
 UNIVERSE_CACHE_PATH = Path("universe_cache.json")
 # ──────────────────────────────────────────────────────────────────────────────
 # Shims/utilities that may be referenced by joblib'd pipelines from research
@@ -376,9 +379,7 @@ class LiveTrader:
             p = float(wp.score(meta_row))
             return p if np.isfinite(p) and 0.0 <= p <= 1.0 else None
         except Exception as e:
-            if not hasattr(self, "_wp_err_once"):
-                LOG.debug("WinProb error for %s: %s", symbol, e)
-                self._wp_err_once = True
+            LOG.debug("WinProb error for %s: %s", symbol, e)
             return None
 
 
@@ -809,23 +810,18 @@ class LiveTrader:
             }
 
             # -------------- Score meta (even on rejects) ----------
-            pstar = float(getattr(self.winprob, "pstar", self.cfg.get("META_PROB_THRESHOLD", 0.0)) or 0.0)
             p = self._score_winprob_safe(symbol, meta_row)
+            pstar = float(getattr(self.winprob, "pstar", None) or self.cfg.get("META_PSTAR", 0.60))
 
-            # ---------- DIAGNOSTICS (always) ----------------------
-            # ...
-            g_meta = (p is not None and np.isfinite(p) and p >= pstar)
+            if p is None or not np.isfinite(p):
+                meta_ok = True  # don’t block if model unavailable
+                p_disp = "n/a"
+            else:
+                meta_ok = (p >= pstar)
+                p_disp = f"{p:.3f}"
 
-            def _ok(b): return "✅" if b else "❌"
-            p_txt = "n/a" if (p is None or not np.isfinite(p)) else f"{p:.3f}"
+            LOG.debug("  META: p*=%0.2f,  p=%s → %s", pstar, p_disp, "✅" if meta_ok else "❌")
 
-            LOG.debug(
-                (
-                    # ...
-                    f"  META: p*={pstar:.2f},  p={p_txt} → {_ok(g_meta)}\n"
-                    f"===================================================="
-                )
-            )
 
             # ---------- DIAGNOSTICS (always) ----------------------
             if bool(self.cfg.get("DEBUG_SIGNAL_DIAG", True)):
