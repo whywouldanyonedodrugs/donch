@@ -51,7 +51,7 @@ from pydantic import Field, ValidationError
 from pydantic_settings import BaseSettings
 from .strategy_engine import StrategyEngine
 
-mask = pyinotify.IN_CLOSE_WRITE | pyinotify.IN_MOVED_TO
+
 
 UNIVERSE_CACHE_PATH = Path("universe_cache.json")
 # ──────────────────────────────────────────────────────────────────────────────
