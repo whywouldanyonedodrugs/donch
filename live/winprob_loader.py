@@ -4,6 +4,7 @@ from __future__ import annotations
 import json, os, re, hashlib, logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from difflib import get_close_matches
 
 import joblib
 import numpy as np
@@ -25,6 +26,11 @@ def _find(dir_: Path, names: List[str]) -> Optional[Path]:
     return None
 
 
+def _normkey(s: str) -> str:
+    """Normalize key for fuzzy matching: lowercase, strip non-alnum."""
+    return re.sub(r"[^0-9a-z]+", "", str(s).lower())
+
+
 class WinProbScorer:
     """
     Loads win-probability artifacts and scores a single meta-row (dict).
@@ -33,10 +39,11 @@ class WinProbScorer:
       - feature_names.json
       - ohe.joblib (optional)
       - calibrator.joblib (optional)
-      - pstar.txt (optional; convenience only)
+      - pstar.txt (optional)
     Also tolerates older names (model.pkl, expected_features.json, etc.).
     """
 
+    # Aliases for raw keys that often vary at runtime
     KEY_ALIASES = {
         "symbol": "sym",
         "pair": "sym",
@@ -44,6 +51,42 @@ class WinProbScorer:
         "base": "sym",
         "market": "sym",
         "instrument": "sym",
+    }
+
+    # Numeric feature name -> likely live variants (case/spacing differ)
+    NUMERIC_ALIASES = {
+        "entry": ["entry", "entry_score", "entry_conf", "entry_strength"],
+        "atr": ["atr", "ATR", "atr_1d", "ATR1d"],
+        "atr_1h": ["atr1h", "ATR1h", "atr_h1", "atr60m"],
+        "atr_pct": ["atr_pct", "ATR_pct", "atr_percent"],
+        "don_break_len": ["don_break_len", "donch_break_len", "break_len", "break_length"],
+        "don_break_level": ["don_break_level", "donch_break_level", "break_level"],
+        "don_dist_atr": ["dist_atr", "donch_dist_atr", "don_upper_dist_atr", "dist_from_donch_upper_atr"],
+        "rs_pct": ["rs_pct", "RS_pct", "rspercent", "rs%"],
+        "hour_sin": ["hour_sin", "hour_of_day_sin", "hod_sin"],
+        "hour_cos": ["hour_cos", "hour_of_day_cos", "hod_cos"],
+        "dow": ["dow", "day_of_week", "weekday_idx", "wd"],
+        "rsi_1h": ["rsi1h", "RSI1h", "rsi_h1"],
+        "adx_1h": ["adx1h", "ADX1h", "adx_h1"],
+        "vol_mult": ["vol_mult", "vol_mult_30d", "vol_mult_med_30d", "vol_mult_median_30d", "volume_mult", "Vol mult (median 30d)"],
+        "eth_macd_hist_4h": ["eth_macd_hist_4h", "ETH_MACD_hist_4h", "eth_macd_hist", "ETH MACD(4h) hist"],
+        "days_since_prev_break": ["days_since_prev_break", "days_since_break"],
+        "consolidation_range_atr": ["consolidation_range_atr", "consol_range_atr"],
+        "prior_1d_ret": ["prior_1d_ret", "ret_1d_prior", "ret_prev_1d"],
+        "rv_3d": ["rv_3d", "realized_vol_3d"],
+        "markov_state_4h": ["markov_state_4h", "ms_4h"],
+        "markov_state_up_4h": ["markov_state_up_4h", "ms_up_4h"],
+        "markov_prob_up_4h": ["markov_prob_up_4h", "mp_up_4h"],
+        "vol_prob_low_1d": ["vol_prob_low_1d", "prob_vol_low_1d"],
+        "regime_code_1d": ["regime_code_1d", "regime_code"],
+    }
+
+    # One-hot groups as they appear in feature_names.json
+    # Columns like "pullback_type_retest", "entry_rule_close_above_break", "regime_1d_NA_LOW_VOL"
+    GROUP_OHE_PREFIXES: Dict[str, List[str]] = {
+        "pullback_type_": ["pullback_type"],
+        "entry_rule_": ["entry_rule"],
+        "regime_1d_": ["regime_1d", "regime_1d_name", "regime"],
     }
 
     def __init__(self, artifacts_dir: Optional[str | Path] = None) -> None:
@@ -60,9 +103,10 @@ class WinProbScorer:
         self._same_vec_count = 0
 
         # schema inferred from expected_features
-        self._ohe_cols: List[str] = []
+        self._ohe_cols: List[str] = []          # scikit-OHE style (not used by your features, but supported)
         self._cat_raw_keys: List[str] = []
-        self._num_cols: List[str] = []
+        self._num_cols: List[str] = []          # numeric features only
+        self._grp_ohe_cols: Dict[str, List[str]] = {}  # prefix -> list of columns
 
         # Resolve directory: ENV → common defaults
         if artifacts_dir is None:
@@ -141,20 +185,39 @@ class WinProbScorer:
             self.calibrator = None
 
     def _infer_schema_from_expected(self) -> None:
+        """Split expected_features into numeric vs group-OHE vs scikit-OHE."""
         ohe_cols, cat_keys, num_cols = [], set(), []
+        grp_map: Dict[str, List[str]] = {pfx: [] for pfx in self.GROUP_OHE_PREFIXES.keys()}
+
         for col in self.expected_features:
+            # scikit-OHE style (rare in your export)
             if "=" in col or col.startswith(("cat__", "ohe__")):
                 ohe_cols.append(col)
                 left = col.split("=")[0]
                 rk = left.split("__")[-1] if "__" in left else left
                 cat_keys.add(rk)
-            else:
-                num_cols.append(col)
+                continue
+
+            # our group one-hots
+            matched_group = False
+            for pfx in self.GROUP_OHE_PREFIXES.keys():
+                if col.startswith(pfx):
+                    grp_map[pfx].append(col)
+                    matched_group = True
+                    break
+            if matched_group:
+                continue
+
+            # numeric
+            num_cols.append(col)
+
         self._ohe_cols = ohe_cols
         self._cat_raw_keys = list(cat_keys)
         self._num_cols = num_cols
+        # drop empty groups
+        self._grp_ohe_cols = {pfx: cols for pfx, cols in grp_map.items() if cols}
 
-    # ───────────────────────── build X ─────────────────────────
+    # ───────────────────────── helpers ─────────────────────────
     def _normalize_keys(self, row: Dict[str, Any]) -> Dict[str, Any]:
         out: Dict[str, Any] = {}
         for k, v in row.items():
@@ -223,27 +286,92 @@ class WinProbScorer:
             df = df[self._ohe_cols]
         return df
 
+    # --- numeric & group OHE mapping ---
+    def _pick_num(self, row: Dict[str, Any], expected_key: str):
+        # 1) exact
+        if expected_key in row:
+            return row.get(expected_key)
+        # 2) alias list
+        for alt in self.NUMERIC_ALIASES.get(expected_key, []):
+            if alt in row:
+                return row.get(alt)
+        # 3) normalized exact
+        nk = _normkey(expected_key)
+        inv = {_normkey(k): k for k in row.keys()}
+        if nk in inv:
+            return row.get(inv[nk])
+        # 4) fuzzy on normalized keys (conservative)
+        m = get_close_matches(nk, list(inv.keys()), n=1, cutoff=0.84)
+        if m:
+            return row.get(inv[m[0]])
+        return None
+
+    def _apply_group_ohe(self, row: Dict[str, Any], X: pd.DataFrame) -> Tuple[int, List[str]]:
+        """Set one-hot groups like pullback_type_*, entry_rule_*, regime_1d_* based on row values."""
+        set_cols: List[str] = []
+        count = 0
+        for pfx, raw_keys in self.GROUP_OHE_PREFIXES.items():
+            cols = [c for c in X.columns if c.startswith(pfx)]
+            if not cols:
+                continue
+            # find a value from any of the candidate raw keys
+            val = None
+            for rk in raw_keys:
+                if rk in row and row[rk] not in (None, ""):
+                    val = str(row[rk]).strip()
+                    break
+            if val is None:
+                continue
+            for c in cols:
+                on = c[len(pfx):]  # the category part
+                bit = 1.0 if on == val else 0.0
+                X.at[0, c] = bit
+                if bit == 1.0:
+                    set_cols.append(c)
+                    count += 1
+        return count, set_cols
+
+    # ───────────────────────── build X ─────────────────────────
     def _build_X(self, row: Dict[str, Any]) -> pd.DataFrame:
         if not self.expected_features:
             raise RuntimeError("WinProbScorer not loaded")
+
         r = self._normalize_keys(row)
-        df_cat = self._ohe_transform(r)
 
-        num_vals: Dict[str, float] = {}
+        # Start with an all-zero row with expected columns
+        X = pd.DataFrame([[0.0] * len(self.expected_features)], columns=list(self.expected_features))
+
+        # 1) scikit-OHE block (rare for your export)
+        if self._ohe_cols:
+            df_cat = self._ohe_transform(r)
+            for c in df_cat.columns:
+                if c in X.columns:
+                    X.at[0, c] = float(df_cat.iloc[0][c])
+
+        # 2) group OHE block (your export style)
+        grp_set_count, grp_set_cols = self._apply_group_ohe(r, X)
+
+        # 3) numeric block
+        numeric_matched = 0
         for c in self._num_cols:
-            raw_key = c.split("__")[-1] if "__" in c else c
-            v = r.get(c, r.get(raw_key, 0.0))
+            v = self._pick_num(r, c)
             try:
-                num_vals[c] = float(v) if v is not None and np.isfinite(v) else 0.0
+                X.at[0, c] = float(v) if v is not None and np.isfinite(v) else 0.0
+                if v is not None and np.isfinite(v):
+                    numeric_matched += 1
             except Exception:
-                num_vals[c] = 0.0
-        df_num = pd.DataFrame([num_vals], columns=self._num_cols) if self._num_cols else pd.DataFrame([{}])
+                X.at[0, c] = 0.0
 
-        X = pd.concat([df_cat, df_num], axis=1)
-        for c in self.expected_features:
-            if c not in X.columns:
-                X[c] = 0.0
-        return X[self.expected_features].astype(float)
+        # one-time diagnostics
+        if not self._diag_once:
+            nz = int((np.abs(X.to_numpy()) > 0).sum())
+            first_nz = [name for name, val in zip(X.columns, X.to_numpy()[0]) if val != 0.0][:15]
+            LOG.info("[WINPROB DIAG] features=%d  nonzero=%d  numeric_matched=%d  group_ohe_set=%d",
+                     len(self.expected_features), nz, numeric_matched, grp_set_count)
+            LOG.info("[WINPROB DIAG] first_nonzero: %s", first_nz)
+            self._diag_once = True
+
+        return X.astype(float)
 
     # ───────────────────────── scoring ─────────────────────────
     def _calibrate(self, p_raw: float) -> float:
@@ -263,25 +391,22 @@ class WinProbScorer:
     def score(self, row: Dict[str, Any]) -> float:
         if not self.is_loaded:
             return 0.0
+
         X = self._build_X(row)
-        # one-shot diag
-        if not self._diag_once:
-            nz = int((np.abs(X.to_numpy()) > 0).sum())
-            LOG.info("[WINPROB DIAG] features=%d  nonzero=%d  first_nonzero=%s",
-                     len(self.expected_features), nz,
-                     [c for c, v in zip(X.columns, X.to_numpy()[0]) if v != 0][:15])
-            self._diag_once = True
 
         p_raw = float(self.model.predict_proba(X)[:, 1][0])
         p = self._calibrate(p_raw)
 
-        # identical vector detector (helps catch mapping bugs)
+        # identical vector detector (to catch mapping issues early)
         try:
-            h = hashlib.md5(X.to_numpy().tobytes()).hexdigest()
+            vec = X.to_numpy()
+            h = hashlib.md5(vec.tobytes()).hexdigest()
             if self._last_hash == h:
                 self._same_vec_count += 1
-                if self._same_vec_count in (2, 5, 25, 100):
-                    LOG.warning("[WINPROB DIAG] %d identical vectors in a row (hash=%s).", self._same_vec_count, h)
+                if self._same_vec_count in (2, 5, 10):
+                    nz = int((np.abs(vec) > 0).sum())
+                    LOG.info("[WINPROB DIAG] %d identical feature vectors in a row (hash=%s, nonzero=%d).",
+                             self._same_vec_count, h, nz)
             else:
                 self._last_hash = h
                 self._same_vec_count = 0
