@@ -1,4 +1,6 @@
 name: DonchPullbackLong_v1
+mask: pyinotify.IN_CLOSE_WRITE | pyinotify.IN_MOVED_TO
+
 
 timeframes:
   base: 5m     # decision frame

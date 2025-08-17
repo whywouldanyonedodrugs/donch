@@ -138,20 +138,40 @@ class WinProbScorer:
                 raise FileNotFoundError("model artifact not found (donch_meta_lgbm.joblib/model.pkl)")
             self.model = joblib.load(model_path)
 
-            # 2) Features
+            # 2) Features: prefer LightGBM's own names (training truth) over JSON
+            json_feats = None
             ef_path = _find(self.dir, [
                 "feature_names.json", "expected_features.json", "feature_order.json", "columns.json"
             ])
             if ef_path is not None:
-                self.expected_features = list(_load_json(ef_path))
+                try:
+                    json_feats = list(_load_json(ef_path))
+                except Exception:
+                    json_feats = None
+
+            booster_feats = None
+            try:
+                booster = getattr(self.model, "booster_", None)
+                if booster is not None and hasattr(booster, "feature_name"):
+                    booster_feats = list(booster.feature_name())
+            except Exception:
+                booster_feats = None
+
+            if booster_feats and len(booster_feats) > 0:
+                self.expected_features = booster_feats
+                if json_feats and len(json_feats) != len(booster_feats):
+                    LOG.warning("[WINPROB] feature_names.json len=%d, but booster expects len=%d. "
+                                "Using booster names.", len(json_feats), len(booster_feats))
+            elif json_feats:
+                self.expected_features = json_feats
             else:
-                # last-ditch: try introspecting
+                # last ditch: sklearn-style attributes
                 if hasattr(self.model, "feature_names_in_"):
                     self.expected_features = list(self.model.feature_names_in_)
                 elif hasattr(self.model, "feature_names_"):
                     self.expected_features = list(self.model.feature_names_)
                 else:
-                    raise FileNotFoundError("feature_names.json / expected_features.json not found")
+                    raise FileNotFoundError("Could not determine expected features (no booster names, no JSON).")
 
             # 3) Optional artifacts
             ohe_path = _find(self.dir, ["ohe.joblib", "ohe.pkl", "onehot.joblib"])
@@ -170,12 +190,12 @@ class WinProbScorer:
             self._infer_schema_from_expected()
 
             LOG.info("[WINPROB] loaded dir=%s  model=%s  features=%d  ohe=%s  calibrator=%s  pstar=%s",
-                     str(self.dir),
-                     model_path.name,
-                     len(self.expected_features),
-                     getattr(ohe_path, "name", "none") if ohe_path else "none",
-                     getattr(calib_path, "name", "none") if calib_path else "none",
-                     f"{self.pstar:.2f}" if isinstance(self.pstar, float) else "none")
+                    str(self.dir),
+                    model_path.name,
+                    len(self.expected_features),
+                    getattr(ohe_path, "name", "none") if ohe_path else "none",
+                    getattr(calib_path, "name", "none") if calib_path else "none",
+                    f"{self.pstar:.2f}" if isinstance(self.pstar, float) else "none")
 
         except Exception as e:
             LOG.exception("[WinProbScorer] load failed from %s: %s", self.dir, e)
@@ -183,6 +203,7 @@ class WinProbScorer:
             self.expected_features = []
             self.ohe = None
             self.calibrator = None
+
 
     def _infer_schema_from_expected(self) -> None:
         """Split expected_features into numeric vs group-OHE vs scikit-OHE."""
