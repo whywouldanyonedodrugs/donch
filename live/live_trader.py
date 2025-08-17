@@ -51,8 +51,7 @@ from pydantic import Field, ValidationError
 from pydantic_settings import BaseSettings
 from .strategy_engine import StrategyEngine
 
-from live.winprob_loader import WinProbScorer
-self.winprob = WinProbScorer(os.getenv("DONCH_WINPROB_DIR", "results/meta_export"))
+
 
 UNIVERSE_CACHE_PATH = Path("universe_cache.json")
 # ──────────────────────────────────────────────────────────────────────────────
@@ -351,7 +350,8 @@ class LiveTrader:
         self.symbol_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
         # Meta / win-prob scorer
-
+        from live.winprob_loader import WinProbScorer
+        self.winprob = WinProbScorer(os.getenv("DONCH_WINPROB_DIR", "results/meta_export"))
 
         art_dir = self.cfg.get("WINPROB_ARTIFACT_DIR", "results/meta_export")
         self.winprob = WinProbScorer(art_dir)
