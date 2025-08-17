@@ -368,18 +368,18 @@ class LiveTrader:
         else:
             LOG.warning("WinProb not loaded; using wp=0.0")
 
-def _score_winprob_safe(self, symbol: str, meta_row: dict) -> Optional[float]:
-    wp = getattr(self, "winprob", None)
-    if not wp or not getattr(wp, "is_loaded", False):
-        return None
-    try:
-        p = float(wp.score(meta_row))
-        return p if np.isfinite(p) and 0.0 <= p <= 1.0 else None
-    except Exception as e:
-        if not hasattr(self, "_wp_err_once"):
-            LOG.debug("WinProb error for %s: %s", symbol, e)
-            self._wp_err_once = True
-        return None
+    def _score_winprob_safe(self, symbol: str, meta_row: dict) -> Optional[float]:
+        wp = getattr(self, "winprob", None)
+        if not wp or not getattr(wp, "is_loaded", False):
+            return None
+        try:
+            p = float(wp.score(meta_row))
+            return p if np.isfinite(p) and 0.0 <= p <= 1.0 else None
+        except Exception as e:
+            if not hasattr(self, "_wp_err_once"):
+                LOG.debug("WinProb error for %s: %s", symbol, e)
+                self._wp_err_once = True
+            return None
 
 
 
