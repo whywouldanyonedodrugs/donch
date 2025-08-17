@@ -368,48 +368,19 @@ class LiveTrader:
         else:
             LOG.warning("WinProb not loaded; using wp=0.0")
 
-    def _score_winprob_safe(self, symbol: str, meta_row: dict) -> Optional[float]:
-        """
-        Use scorer's canonical builder to avoid constant vectors from mis-mapped features.
-        Returns float in [0,1] or None.
-        """
-        wp = getattr(self, "winprob", None)
-        if not wp or not getattr(wp, "is_loaded", False):
-            return None
+def _score_winprob_safe(self, symbol: str, meta_row: dict) -> Optional[float]:
+    wp = getattr(self, "winprob", None)
+    if not wp or not getattr(wp, "is_loaded", False):
+        return None
+    try:
+        p = float(wp.score(meta_row))
+        return p if np.isfinite(p) and 0.0 <= p <= 1.0 else None
+    except Exception as e:
+        if not hasattr(self, "_wp_err_once"):
+            LOG.debug("WinProb error for %s: %s", symbol, e)
+            self._wp_err_once = True
+        return None
 
-        # Preferred: build design matrix via scorer, then predict + calibrate
-        try:
-            X = wp._build_X(meta_row)  # 1xN DataFrame with final feature names (incl. OHE)
-            p_raw = float(wp.model.predict_proba(X)[:, 1][0])
-            p = float(wp._calibrate(p_raw)) if hasattr(wp, "_calibrate") else p_raw
-
-            # One-shot warning if vectors are identical (helps catch config mistakes)
-            try:
-                import hashlib, numpy as _np
-                vec = X.to_numpy()
-                h = hashlib.md5(vec.tobytes()).hexdigest()
-                if getattr(self, "_wp_last_hash", None) == h and not getattr(self, "_wp_dup_warned", False):
-                    nz = int((_np.abs(vec) > 0).sum())
-                    LOG.warning("[WINPROB] identical feature vector across symbols (hash=%s, nonzero=%d). "
-                                "This usually means expected_features don't match live meta keys.",
-                                h, nz)
-                    self._wp_dup_warned = True
-                else:
-                    self._wp_last_hash = h
-            except Exception:
-                pass
-
-            return p if 0.0 <= p <= 1.0 and _np.isfinite(p) else None
-        except Exception as e_df:
-            LOG.debug("WinProb (build_X) failed for %s: %s", symbol, e_df)
-
-        # Fallback: dict → score()
-        try:
-            p = float(wp.score(meta_row))
-            return p if 0.0 <= p <= 1.0 and np.isfinite(p) else None
-        except Exception as e_dict:
-            LOG.debug("WinProb (dict) failed for %s: %s", symbol, e_dict)
-            return None
 
 
     def _load_universe_cache_if_fresh(self) -> Optional[dict]:

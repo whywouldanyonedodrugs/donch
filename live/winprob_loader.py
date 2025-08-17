@@ -2,245 +2,284 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import joblib
 import numpy as np
 import pandas as pd
-
 import hashlib
 import logging
+
 LOG = logging.getLogger("winprob")
+
+
+def _read_json_any(path: Path) -> Any:
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _find_first(dir: Path, names: List[str]) -> Optional[Path]:
+    for n in names:
+        p = dir / n
+        if p.exists():
+            return p
+    return None
+
 
 class WinProbScorer:
     """
-    Robust loader + scorer for the exported meta-model.
+    Robust loader + scorer for the research win-probability model.
 
-    Looks for (preferred names):
-      - donch_meta_lgbm.joblib       (sklearn LightGBM wrapper)
-      - ohe.joblib                   (sklearn OneHotEncoder fitted on training cats)
-      - feature_names.json           (FINAL input column order used for training; numeric + OHE outputs)
-      - calibrator.joblib            (optional Platt/isotonic calibration)
-      - pstar.txt                    (optional threshold for live gating)
+    Artifacts directory is expected to contain at least:
+      - expected_features.json  (list[str] in final model order)
+      - model.pkl or model.joblib  (sklearn estimator with predict_proba)
 
-    If feature_names.json is missing or stale, falls back to model feature
-    names from the booster. Always constructs a DataFrame with EXACT column order
-    expected by the model to avoid shape/name mismatches.
+    Optionally:
+      - calibrator.pkl / calib.pkl / calibration.pkl (isotonic or Platt)
+      - ohe.joblib / ohe.pkl / onehot.joblib (sklearn OneHotEncoder)
     """
-
-    def __init__(self, artifact_dir: str | Path = "results/meta_export"):
-        self.dir = Path(artifact_dir)
+    def __init__(self, artifacts_dir: Optional[str | Path] = None) -> None:
+        self.dir: Optional[Path] = None
         self.model = None
-        self.ohe = None
         self.calibrator = None
-        self.pstar: Optional[float] = None
+        self.ohe = None
         self.expected_features: List[str] = []
-        self.raw_cat_cols: List[str] = []
-
-        self.is_loaded = False
-        try:
-            self._load()
-            self.is_loaded = True
-        except Exception as e:
-            print(f"[WinProbScorer] load failed from {self.dir}: {e}")
-            self.is_loaded = False
-
         self._diag_once = False
         self._last_hash = None
         self._same_vec_count = 0
 
-        def _calibrate(self, p_raw: float) -> float:
-            if self.calibrator is None:
-                return p_raw
-            # Try isotonic first (has .predict), else Platt (.predict_proba)
-            if hasattr(self.calibrator, "predict") and not hasattr(self.calibrator, "predict_proba"):
-                # isotonic regression returns calibrated probas
-                return float(self.calibrator.predict([p_raw])[0])
-            elif hasattr(self.calibrator, "predict_proba"):
-                # logistic regression: need predict_proba on [[p_raw]]
-                import numpy as _np
-                return float(self.calibrator.predict_proba(_np.array([[p_raw]]))[:,1][0])
+        # inferred schema
+        self._ohe_cols: List[str] = []
+        self._cat_raw_keys: List[str] = []
+        self._num_cols: List[str] = []
+
+        self.KEY_ALIASES = {
+            "symbol": "sym",
+            "pair": "sym",
+            "ticker": "sym",
+            "base": "sym",
+            "market": "sym",
+            "instrument": "sym",
+        }
+
+        if artifacts_dir is not None:
+            self.load(artifacts_dir)
+
+    @property
+    def is_loaded(self) -> bool:
+        return self.model is not None and bool(self.expected_features)
+
+    # ── Loading ───────────────────────────────────────────────────────
+    def load(self, artifacts_dir: str | Path) -> None:
+        self.dir = Path(artifacts_dir)
+        try:
+            ef_path = _find_first(self.dir, ["expected_features.json", "feature_order.json", "columns.json"])
+            if ef_path is None:
+                raise FileNotFoundError("expected_features.json not found")
+            self.expected_features = list(_read_json_any(ef_path))
+
+            model_path = _find_first(self.dir, ["model.pkl", "model.joblib", "clf.pkl", "estimator.pkl"])
+            if model_path is None:
+                raise FileNotFoundError("model.pkl/joblib not found")
+            self.model = joblib.load(model_path)
+
+            calib_path = _find_first(self.dir, ["calibrator.pkl", "calib.pkl", "calibration.pkl"])
+            self.calibrator = joblib.load(calib_path) if calib_path else None
+
+            ohe_path = _find_first(self.dir, ["ohe.joblib", "ohe.pkl", "onehot.joblib"])
+            self.ohe = joblib.load(ohe_path) if ohe_path else None
+
+            self._infer_schema_from_expected()
+
+            LOG.info("[WINPROB] loaded model=%s  calibrator=%s  ohe=%s  features=%d",
+                     model_path.name,
+                     calib_path.name if calib_path else "none",
+                     getattr(ohe_path, "name", "none") if ohe_path else "none",
+                     len(self.expected_features))
+        except Exception as e:
+            LOG.exception("[WinProbScorer] load failed from %s: %s", self.dir, e)
+            self.model = None
+            self.expected_features = []
+
+    def _infer_schema_from_expected(self) -> None:
+        """Infer OHE output cols, raw categorical keys, and numeric cols from expected feature names."""
+        ohe_cols, cat_keys, num_cols = [], set(), []
+        for col in self.expected_features:
+            if "=" in col or col.startswith(("cat__", "ohe__")):
+                ohe_cols.append(col)
+                left = col.split("=")[0]
+                rk = left.split("__")[-1] if "__" in left else left
+                cat_keys.add(rk)
             else:
-                return p_raw  # unknown calibrator type
+                num_cols.append(col)
+        self._ohe_cols = list(ohe_cols)
+        self._cat_raw_keys = list(cat_keys)
+        self._num_cols = list(num_cols)
 
-    # -------------------- public API --------------------
+    # ── Builders ──────────────────────────────────────────────────────
+    def _normalize_row_keys(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        for k, v in row.items():
+            lk = str(k).strip().lower()
+            lk = self.KEY_ALIASES.get(lk, lk)
+            out[lk] = v
+        return out
 
-    def score(self, row: dict) -> float:
-        """
-        Build DF via _build_X(row) and return calibrated proba in [0,1].
-        """
-        if not getattr(self, "is_loaded", False):
+    def _cat_value_from_row(self, row: Dict[str, Any], raw_key: str) -> Any:
+        v = row.get(raw_key, None)
+        if v is None and raw_key == "sym":
+            for alt in ("symbol", "pair", "ticker", "base", "market", "instrument"):
+                vv = row.get(alt)
+                if vv is not None:
+                    v = vv
+                    break
+        return v
+
+    def _parse_ohe_target(self, colname: str) -> Optional[Tuple[str, str]]:
+        # "cat__sym=ETHUSDT" | "ohe__sym=BTCUSDT" | "sym=SOLUSDT"
+        if "=" in colname:
+            left, right = colname.split("=", 1)
+            raw_key = left.split("__")[-1] if "__" in left else left
+            return raw_key, right
+        # Fallback: "cat__sym_ETHUSDT"
+        m = re.match(r"^(?:cat__|ohe__)?([^_]+)_(.+)$", colname)
+        if m:
+            return m.group(1), m.group(2)
+        return None
+
+    def _manual_ohe(self, row_norm: Dict[str, Any]) -> pd.DataFrame:
+        data = {}
+        for col in self._ohe_cols:
+            tgt = self._parse_ohe_target(col)
+            if not tgt:
+                data[col] = 0.0
+                continue
+            raw_key, want_val = tgt
+            have_val = self._cat_value_from_row(row_norm, raw_key)
+            data[col] = 1.0 if have_val is not None and str(have_val) == str(want_val) else 0.0
+        return pd.DataFrame([data], columns=self._ohe_cols)
+
+    def _ohe_transform(self, row_norm: Dict[str, Any]) -> pd.DataFrame:
+        if self.ohe is None:
+            return self._manual_ohe(row_norm)
+
+        cat_in = list(getattr(self.ohe, "feature_names_in_", [])) or self._cat_raw_keys
+        raw = {k: self._cat_value_from_row(row_norm, k) for k in cat_in}
+        X_cat = pd.DataFrame([raw], columns=cat_in)
+        try:
+            arr = self.ohe.transform(X_cat)
+            arr = arr.toarray() if hasattr(arr, "toarray") else np.asarray(arr)
+            names = (list(self.ohe.get_feature_names_out(cat_in))
+                     if hasattr(self.ohe, "get_feature_names_out") else self._ohe_cols)
+            df = pd.DataFrame(arr, columns=names)
+        except Exception as e:
+            LOG.debug("[WINPROB] ohe.transform failed (%s); falling back to manual OHE.", e)
+            df = self._manual_ohe(row_norm)
+
+        # align to expected
+        if self._ohe_cols:
+            drop = [c for c in df.columns if c not in self._ohe_cols]
+            if drop:
+                df.drop(columns=drop, inplace=True)
+            for c in self._ohe_cols:
+                if c not in df.columns:
+                    df[c] = 0.0
+            df = df[self._ohe_cols]
+        return df
+
+    def _build_X(self, row: Dict[str, Any]) -> pd.DataFrame:
+        if not self.expected_features:
+            raise RuntimeError("WinProbScorer not loaded")
+
+        row_norm = self._normalize_row_keys(row)
+
+        # 1) Categorical block
+        df_cat = self._ohe_transform(row_norm) if self._ohe_cols else pd.DataFrame([{}])
+
+        # 2) Numeric block
+        num_vals: Dict[str, float] = {}
+        for c in self._num_cols:
+            raw_key = c.split("__")[-1] if "__" in c else c
+            v = row_norm.get(c, None)
+            if v is None:
+                v = row_norm.get(raw_key, None)
+            try:
+                num_vals[c] = float(v) if v is not None and np.isfinite(v) else 0.0
+            except Exception:
+                num_vals[c] = 0.0
+        df_num = pd.DataFrame([num_vals], columns=self._num_cols) if self._num_cols else pd.DataFrame([{}])
+
+        # 3) Concatenate and enforce final order
+        X = pd.concat([df_cat, df_num], axis=1)
+        for c in self.expected_features:
+            if c not in X.columns:
+                X[c] = 0.0
+        X = X[self.expected_features].astype(float)
+        return X
+
+    # ── Scoring ───────────────────────────────────────────────────────
+    def _calibrate(self, p_raw: float) -> float:
+        if self.calibrator is None:
+            return p_raw
+        try:
+            if hasattr(self.calibrator, "predict") and not hasattr(self.calibrator, "predict_proba"):
+                out = self.calibrator.predict(np.array([[p_raw]]))
+                return float(np.clip(out[0], 0.0, 1.0))
+            elif hasattr(self.calibrator, "predict_proba"):
+                out = self.calibrator.predict_proba(np.array([[p_raw]]))[:, 1]
+                return float(np.clip(out[0], 0.0, 1.0))
+        except Exception as e:
+            LOG.debug("[WINPROB] calibrator failed: %s", e)
+        return float(np.clip(p_raw, 0.0, 1.0))
+
+    def score(self, row: Dict[str, Any]) -> float:
+        if not self.is_loaded:
             return 0.0
 
-        # 1) Canonical design matrix
-        X = self._build_X(row)  # returns 1xN DataFrame with self.expected_features
+        X = self._build_X(row)
 
-        # 2) Raw proba -> calibrate (isotonic or Platt if present)
+        # one-shot diag
+        if not self._diag_once:
+            present = [c for c in self.expected_features if c in X.columns]
+            missing = [c for c in self.expected_features if c not in X.columns]
+            nz = int((np.abs(X.to_numpy()) > 0).sum())
+            LOG.info("[WINPROB DIAG] features=%d  present=%d  missing=%d  nonzero=%d",
+                     len(self.expected_features), len(present), len(missing), nz)
+            if missing[:30]:
+                LOG.warning("[WINPROB DIAG] Missing (first 30): %s", missing[:30])
+            nz_idx = np.where(np.abs(X.to_numpy())[0] > 0)[0].tolist()
+            nz_names = [self.expected_features[i] for i in nz_idx][:15]
+            LOG.info("[WINPROB DIAG] first_nonzero: %s", nz_names)
+            self._diag_once = True
+
         p_raw = float(self.model.predict_proba(X)[:, 1][0])
-        p = float(self._calibrate(p_raw))
+        p = self._calibrate(p_raw)
 
-        # 3) Optional: detect identical vectors (helps catch mapping bugs)
+        # identical vector detector
         try:
-            vec = X.to_numpy()
-            h = hashlib.md5(vec.tobytes()).hexdigest()
-            if getattr(self, "_last_hash", None) == h:
+            vec_bytes = X.to_numpy().tobytes()
+            h = hashlib.md5(vec_bytes).hexdigest()
+            if self._last_hash == h:
                 self._same_vec_count += 1
-                if self._same_vec_count in (2, 5, 25):
-                    nz = int((vec != 0.0).sum())
-                    LOG.warning("[WINPROB DIAG] %d identical vectors in a row (hash=%s, nonzero=%d).",
-                                self._same_vec_count, h, nz)
+                if self._same_vec_count in (2, 5, 25, 100):
+                    LOG.warning("[WINPROB DIAG] %d identical vectors in a row (hash=%s).", self._same_vec_count, h)
             else:
                 self._last_hash = h
                 self._same_vec_count = 0
         except Exception:
             pass
 
-        return max(0.0, min(1.0, p))
+        return float(max(0.0, min(1.0, p)))
 
-
-    # -------------------- internals --------------------
-
-    def _load(self):
-        if not self.dir.exists():
-            raise FileNotFoundError(self.dir)
-
-        # 1) core model
-        self.model = joblib.load(self.dir / "donch_meta_lgbm.joblib")
-
-        # 2) ohe (optional but strongly recommended)
-        ohe_path = self.dir / "ohe.joblib"
-        if ohe_path.exists():
-            self.ohe = joblib.load(ohe_path)
-            # raw categorical columns used at train time
-            try:
-                self.raw_cat_cols = list(getattr(self.ohe, "feature_names_in_", []))
-            except Exception:
-                self.raw_cat_cols = []
-        else:
-            self.ohe = None
-            self.raw_cat_cols = []
-
-        # 3) calibrator (optional)
-        cal_path = self.dir / "calibrator.joblib"
-        if cal_path.exists():
-            try:
-                self.calibrator = joblib.load(cal_path)
-            except Exception:
-                self.calibrator = None
-
-        # 4) threshold (optional)
-        pstar_path = self.dir / "pstar.txt"
-        if pstar_path.exists():
-            try:
-                self.pstar = float(pstar_path.read_text().strip())
-            except Exception:
-                self.pstar = None
-
-        # 5) expected (input) feature names — FIRST try JSON, then model's booster
-        feat_json = self.dir / "feature_names.json"
-        names_from_json: List[str] = []
-        if feat_json.exists():
-            try:
-                names_from_json = list(json.loads(feat_json.read_text()))
-            except Exception:
-                names_from_json = []
-
-        names_from_model = self._model_feature_names()
-
-        # sanity reconcile: prefer JSON if it matches model.n_features_in_
-        n_model = self._model_n_features()
-        if names_from_json and len(names_from_json) == n_model:
-            self.expected_features = names_from_json
-        else:
-            self.expected_features = names_from_model or names_from_json
-            if self.expected_features and len(self.expected_features) != n_model:
-                print(
-                    f"[WinProbScorer] feature_names mismatch: JSON={len(names_from_json)} "
-                    f"model={n_model}. Using model feature names."
-                )
-                self.expected_features = names_from_model
-            if not self.expected_features:
-                # last resort: generate generic names
-                self.expected_features = [f"f{i}" for i in range(n_model)]
-
-    def _model_feature_names(self) -> List[str]:
-        # LightGBM sklearn wrapper stores names in booster_ or sometimes .feature_name_
-        try:
-            if hasattr(self.model, "feature_name_") and self.model.feature_name_:
-                return list(self.model.feature_name_)
-        except Exception:
-            pass
-        try:
-            if hasattr(self.model, "booster_"):
-                f = self.model.booster_.feature_name()
-                if f:
-                    return list(f)
-        except Exception:
-            pass
-        # If the model was trained on a numpy array, names may be absent
-        return []
-
-    def _model_n_features(self) -> int:
-        try:
-            return int(getattr(self.model, "n_features_in_", len(self._model_feature_names())))
-        except Exception:
-            return len(self._model_feature_names())
-
-    def _build_X(self, row: Dict[str, Any]) -> pd.DataFrame:
-        """
-        Build a 1xN DataFrame with columns in EXACT order self.expected_features.
-        Steps:
-          1) Make a one-row DataFrame from 'row'
-          2) Expand known categoricals via ohe.joblib -> dense array with OHE names
-          3) Fill numeric features -> 0.0 if missing
-          4) Combine into target DataFrame with expected column order; fill absent cols with 0.0
-        """
-        # base one-row frame
-        base = pd.DataFrame([row])
-
-        # OHE expansion (if provided)
-        ohe_cols_out: List[str] = []
-        ohe_vals: Optional[np.ndarray] = None
-        if self.ohe is not None and self.raw_cat_cols:
-            # ensure all raw cat columns exist as strings
-            for c in self.raw_cat_cols:
-                if c not in base.columns:
-                    base[c] = ""
-            try:
-                Xo = self.ohe.transform(base[self.raw_cat_cols].astype(str))
-                if hasattr(Xo, "toarray"):
-                    Xo = Xo.toarray()
-                ohe_vals = np.asarray(Xo, dtype=float)  # shape (1, n_ohe)
-                ohe_cols_out = list(self.ohe.get_feature_names_out(self.raw_cat_cols))
-            except Exception:
-                # if transform fails, fall back to empty OHE
-                ohe_cols_out = []
-                ohe_vals = None
-
-        # Prepare empty X with expected columns
-        cols = list(self.expected_features)
-        X = pd.DataFrame(data=np.zeros((1, len(cols)), dtype=float), columns=cols)
-
-        # Fill OHE outputs where names match expected columns
-        if ohe_vals is not None and ohe_cols_out:
-            # intersect in order of expected cols
-            common = [c for c in ohe_cols_out if c in X.columns]
-            if common:
-                # map positions from ohe to expected
-                idx_in_ohe = [ohe_cols_out.index(c) for c in common]
-                X.loc[0, common] = ohe_vals[0, idx_in_ohe]
-
-        # Fill numeric columns: any expected column not in ohe_cols_out
-        for c in X.columns:
-            if c in ohe_cols_out:
-                continue
-            # treat as numeric; pick from 'row' if present, else 0
-            v = row.get(c, 0.0)
-            try:
-                X.at[0, c] = float(v) if v is not None and np.isfinite(v) else 0.0
-            except Exception:
-                X.at[0, c] = 0.0
-
-        # Final defensive cast
-        return X.astype(float)
+    def score_df(self, X: pd.DataFrame) -> float:
+        if not self.is_loaded:
+            return 0.0
+        if list(X.columns) != list(self.expected_features):
+            for c in self.expected_features:
+                if c not in X.columns:
+                    X[c] = 0.0
+            X = X[self.expected_features]
+        p_raw = float(self.model.predict_proba(X)[:, 1][0])
+        return self._calibrate(p_raw)
