@@ -52,12 +52,8 @@ from pydantic_settings import BaseSettings
 from .strategy_engine import StrategyEngine
 
 import logging
-for name in (
-    "watchdog",
-    "watchdog.observers",
-    "watchdog.observers.inotify_buffer",
-):
-    logging.getLogger(name).setLevel(logging.WARNING)  # or ERROR
+logging.getLogger("watchdog").setLevel(logging.WARNING)
+logging.getLogger("watchdog.observers.inotify_buffer").setLevel(logging.WARNING)
 
 UNIVERSE_CACHE_PATH = Path("universe_cache.json")
 # ──────────────────────────────────────────────────────────────────────────────
