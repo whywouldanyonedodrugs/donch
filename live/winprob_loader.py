@@ -265,6 +265,21 @@ class WinProbScorer:
                 self._last_hash, self._same_vec_count = h, 0
         except Exception:
             pass
+
+        # 1) log p_raw and calibrated p
+        p_raw = float(self.model.predict_proba(X)[:, 1][0])
+        LOG.info("[WINPROB] p_raw=%.6f  p_cal=%.6f", p_raw, self._calibrate(p_raw))
+
+        # 2) LightGBM contributions to confirm the model is actually using features
+        try:
+            contrib = self.model.predict(X, pred_contrib=True)  # last col is base value
+            vals = contrib[0]
+            names = list(self.expected_features) + ["<base>"]
+            top = sorted(zip(names, vals), key=lambda z: abs(z[1]), reverse=True)[:6]
+            LOG.info("[WINPROB] top_contrib: %s", top)
+        except Exception as e:
+            LOG.debug("pred_contrib failed: %s", e)
+
         return float(np.clip(p, 0.0, 1.0))
 
     def score_df(self, X: pd.DataFrame) -> float:
