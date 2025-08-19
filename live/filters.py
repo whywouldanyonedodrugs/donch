@@ -41,9 +41,15 @@ def evaluate(
             ok = False
 
     # ── 3. Primary RSI window ───────────────────────────────────────────
-    if not (cfg.RSI_ENTRY_MIN <= sig.rsi <= cfg.RSI_ENTRY_MAX):
-        vetoes.append("RSI_RANGE")
-        ok = False
+    # Allow toggle + small epsilon to avoid borderline 0.1–0.5pt misses.
+    if getattr(cfg, "RSI_FILTER_ENABLED", True):
+        _rsi = float(getattr(sig, "rsi", 0.0) or 0.0)
+        _lo  = float(getattr(cfg, "RSI_ENTRY_MIN", 30))
+        _hi  = float(getattr(cfg, "RSI_ENTRY_MAX", 70))
+        _eps = float(getattr(cfg, "RSI_EPS", 0.0))
+        if not ((_lo - _eps) <= _rsi <= (_hi + _eps)):
+            vetoes.append(f"RSI_RANGE(rsi={_rsi:.2f}∉[{_lo:.0f},{_hi:.0f}])")
+            ok = False
         
     # ── 4. 30‑day structural‑trend veto ─────────────────────────────────
     # Use getattr for a safe way to check for the new switch

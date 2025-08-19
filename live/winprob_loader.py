@@ -59,6 +59,8 @@ class WinProbScorer:
         self.ohe = None
         self.expected_features: List[str] = []
         self.pstar: Optional[float] = None
+        # NEW: strict parity check (set by live_trader based on META_REQUIRED)
+        self.strict_parity: bool = False
 
         self._diag_once = False
         self._last_hash = None
@@ -66,6 +68,8 @@ class WinProbScorer:
 
         self._ohe_cols: List[str] = []
         self._num_cols: List[str] = []
+
+
 
         if artifacts_dir is None:
             env_dir = os.getenv("DONCH_WINPROB_DIR") or os.getenv("WINPROB_DIR")
@@ -167,6 +171,13 @@ class WinProbScorer:
                 return 0.0
         return 0.0
 
+    def _has_num(self, row: Dict[str, Any], col: str) -> bool:
+        try:
+            v = self._lookup_num(row, col)
+            return v is not None and np.isfinite(float(v))
+        except Exception:
+            return False
+
     def _manual_ohe(self, row: Dict[str, Any]) -> pd.DataFrame:
         """Produce columns in self._ohe_cols, including group-style one-hots like 'pullback_type_retest'."""
         data: Dict[str, float] = {}
@@ -213,6 +224,28 @@ class WinProbScorer:
         if not self.expected_features:
             raise RuntimeError("WinProbScorer not loaded")
         r = self._normalize_keys(row)
+
+        # --- NEW: strict parity (fail closed if live features set mismatches) -
+        if self.strict_parity:
+            # numeric presence
+            num_req = len(self._num_cols)
+            num_have = sum(1 for c in self._num_cols if self._has_num(r, c))
+            # categorical presence (use OHE bases if available; otherwise group prefixes)
+            if self.ohe is not None and hasattr(self.ohe, "feature_names_in_"):
+                cat_bases = list(getattr(self.ohe, "feature_names_in_", []))
+                cat_req = len(cat_bases)
+                cat_have = sum(1 for b in cat_bases if (b in r) and str(r.get(b, "")).strip() != "")
+            else:
+                gp = []
+                for pref in self.GROUP_PREFIXES:
+                    if any(col.startswith(pref) for col in self._ohe_cols):
+                        base = pref[:-1] if pref.endswith("_") else pref
+                        gp.append(base)
+                cat_bases = sorted(set(gp))
+                cat_req = len(cat_bases)
+                cat_have = sum(1 for b in cat_bases if str(r.get(b, "")).strip() != "")
+            if (num_have != num_req) or (cat_have != cat_req):
+                raise RuntimeError(f"feature_parity_mismatch: num {num_have}/{num_req}, cat {cat_have}/{cat_req}")
 
         # categorical block (group OHE + optional sklearn OHE)
         df_cat = self._ohe_transform(r)

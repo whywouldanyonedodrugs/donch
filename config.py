@@ -28,7 +28,9 @@ ADX_PERIOD      = 14
 ADX_TIMEFRAME   = "1h"
 
 RSI_ENTRY_MIN   = 30
-RSI_ENTRY_MAX   = 70
+RSI_ENTRY_MAX   = 95
+RSI_FILTER_ENABLED = True
+RSI_EPS           = 0.5
 
 ADX_FILTER_ENABLED = False  # enable in YAML/Telegram if desired
 ADX_MIN           = 10       # skip if trendless

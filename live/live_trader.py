@@ -358,6 +358,16 @@ class LiveTrader:
         art_dir = self.cfg.get("WINPROB_ARTIFACT_DIR", "results/meta_export")
         self.winprob = WinProbScorer(art_dir)
 
+        try:
+            self.winprob.strict_parity = bool(self.cfg.get("META_REQUIRED", False))
+        except Exception:
+            pass
+
+        if self.winprob.is_loaded:
+            # Be robust to older WinProbScorer without .kind or .expected_features
+            kind = getattr(self.winprob, "kind", "lgbm+ohe")
+            feats = getattr(self.winprob, "feature_order", None)
+
         if self.winprob.is_loaded:
             # Be robust to older WinProbScorer without .kind or .expected_features
             kind = getattr(self.winprob, "kind", "lgbm+ohe")
@@ -372,6 +382,8 @@ class LiveTrader:
                 LOG.info("WinProb ready (kind=%s, features=%d)", kind, nfeats)
         else:
             LOG.warning("WinProb not loaded; using wp=0.0")
+
+
 
     def _score_winprob_safe(self, symbol: str, meta_row: dict) -> Optional[float]:
         wp = getattr(self, "winprob", None)
@@ -496,6 +508,13 @@ class LiveTrader:
         ranks = np.argsort(np.argsort(rets))  # 0..N-1
         pct = 100.0 * ranks / max(1, len(syms) - 1)
 
+        rs_arr = np.asarray(rets, dtype=float)
+        to_arr = np.asarray([med24[s] for s in syms], dtype=float)
+        mu_rs = float(np.nanmean(rs_arr)); sd_rs = float(np.nanstd(rs_arr));  sd_rs = sd_rs if sd_rs > 0 else 1.0
+        mu_to = float(np.nanmean(to_arr)); sd_to = float(np.nanstd(to_arr));  sd_to = sd_to if sd_to > 0 else 1.0
+        rs_z  = (rs_arr - mu_rs) / sd_rs
+        to_z  = (to_arr - mu_to) / sd_to
+
         out = {}
         for i, s in enumerate(syms):
             out[s] = {
@@ -507,6 +526,50 @@ class LiveTrader:
         return out
 
     # ---- Robust listing-age helper (UTC-safe) --------------------------------
+    # ---- Prior Donchian breakout quality (fail count & rate) ---------------
+    def _prior_breakout_stats(
+        self,
+        df1d: pd.DataFrame,
+        period: int = 20,
+        lookback_days: int = 60,
+        fallback_days: int = 3,
+    ) -> tuple[int, int, float]:
+        """
+        Count breakouts in last `lookback_days` where close[t] crossed above the
+        prior-N-day Donch upper (shifted) and within `fallback_days` the close
+        fell back below that upper (failed breakout).
+        Returns: (num_breakouts, num_failures, fail_rate)
+        """
+        try:
+            if df1d is None or len(df1d) < period + fallback_days + 5:
+                return 0, 0, 0.0
+            dd = df1d.sort_index()
+            highs = dd["high"].rolling(period).max().shift(1)
+            close = dd["close"].astype(float)
+            # limit to lookback window (exclude last 1 bar to avoid lookahead)
+            sub = dd.iloc[-(lookback_days + fallback_days + 1):-1]
+            if sub.empty: return 0, 0, 0.0
+
+            highs_sub = highs.loc[sub.index]
+            cls_sub   = close.loc[sub.index]
+
+            brk_idx = cls_sub > highs_sub
+            breakout_days = list(np.where(brk_idx.to_numpy())[0])
+            n_b = 0; n_f = 0
+            for idx in breakout_days:
+                n_b += 1
+                upper = float(highs_sub.iloc[idx])
+                # window of next k daily closes (guard tail)
+                nxt = cls_sub.iloc[idx+1: idx+1+fallback_days]
+                if len(nxt) and np.nanmin(nxt.to_numpy()) < upper:
+                    n_f += 1
+            fail_rate = float(n_f / n_b) if n_b > 0 else 0.0
+            return int(n_b), int(n_f), float(fail_rate)
+        except Exception:
+            return 0, 0, 0.0
+
+
+    
     def _listing_age_days(self, symbol: str, dfs: dict[str, pd.DataFrame] | None = None) -> int | None:
         """
         Order of preference:
@@ -793,6 +856,55 @@ class LiveTrader:
             pullback_type = getattr(verdict, "pullback_type", None) or self.cfg.get("PULLBACK_TYPE", "retest")
             regime_1d = getattr(verdict, "regime_1d", None) or ""  # optional
 
+            # --- NEW: AVWAP (rolling VWAP) stack features on base tf ----------
+            try:
+                vwap_lb   = int(self.cfg.get("VWAP_LOOKBACK_BARS", 12))
+                vwap_band = float(self.cfg.get("VWAP_BAND_PCT", 0.004))
+                vwap_feats = vwap_stack_features(df5, lookback_bars=vwap_lb, band_pct=vwap_band)
+            except Exception:
+                vwap_feats = {"vwap_frac_in_band": 0.0, "vwap_expansion_pct": 0.0, "vwap_slope_pph": 0.0}
+
+            # --- NEW: perp basis (mark-index) and funding rate ----------------
+            basis_pct = 0.0
+            funding_8h = 0.0
+            try:
+                tk = await self.exchange.fetch_ticker(symbol)
+                # try both top-level and .info for common exchanges
+                mark  = float(tk.get("markPrice", tk.get("mark", tk.get("last", 0.0)))) if tk else 0.0
+                index = float(tk.get("indexPrice", tk.get("index", 0.0))) if tk else 0.0
+                if isinstance(tk, dict) and "info" in tk:
+                    info = tk["info"] or {}
+                    mark  = float(info.get("markPrice", mark))
+                    index = float(info.get("indexPrice", index))
+                if index and np.isfinite(mark) and np.isfinite(index) and index > 0:
+                    basis_pct = float((mark - index) / index)
+            except Exception:
+                pass
+            try:
+                fr = await self.exchange.fetch_funding_rate(symbol)
+                # ccxt unifies as fundingRate (8h); fallback to info
+                funding_8h = float(fr.get("fundingRate", 0.0)) if isinstance(fr, dict) else 0.0
+                if not np.isfinite(funding_8h):
+                    funding_8h = 0.0
+            except Exception:
+                pass
+
+            # --- NEW: prior breakout quality from 1d --------------------------
+            prior_b, prior_f, prior_fail_rate = (0, 0, 0.0)
+            try:
+                prior_b, prior_f, prior_fail_rate = self._prior_breakout_stats(
+                    df1d, period=don_len, lookback_days=int(self.cfg.get("PRIOR_BRK_LOOKBACK_DAYS", 60)),
+                    fallback_days=int(self.cfg.get("PRIOR_BRK_FALLBACK_DAYS", 3))
+                )
+            except Exception:
+                pass
+
+            # --- NEW: pull RS/turnover z-scores from universe snapshot --------
+            rs_z = float(univ.get("rs_z", 0.0) or 0.0)
+            turnover_z = float(univ.get("turnover_z", 0.0) or 0.0)
+
+
+
             meta_row = {
                 # numerics
                 "atr_1h": float(last['atr_1h']),
@@ -809,13 +921,32 @@ class LiveTrader:
                 "vol_mult": float(vol_mult),
                 "eth_macd_hist_4h": float(eth_hist),
                 "regime_up": float(regime_up),
-                "prior_1d_ret": float(ret_30d),  # harmless if unused
+                "prior_1d_ret": float(ret_30d),
+
+                # --- NEW: AVWAP stack
+                "vwap_frac_in_band": float(vwap_feats.get("vwap_frac_in_band", 0.0)),
+                "vwap_expansion_pct": float(vwap_feats.get("vwap_expansion_pct", 0.0)),
+                "vwap_slope_pph": float(vwap_feats.get("vwap_slope_pph", 0.0)),
+
+                # --- NEW: basis / funding
+                "basis_pct": float(basis_pct),
+                "funding_8h": float(funding_8h),
+
+                # --- NEW: prior breakout quality
+                "prior_breakout_count": float(prior_b),
+                "prior_breakout_fail_count": float(prior_f),
+                "prior_breakout_fail_rate": float(prior_fail_rate),
+
+                # --- NEW: crowding proxies
+                "rs_z": float(rs_z),
+                "turnover_z": float(turnover_z),
 
                 # categoricals
                 "entry_rule": str(entry_rule),
                 "pullback_type": str(pullback_type),
                 "regime_1d": str(regime_1d),
             }
+
 
             # -------------- Score meta (even on rejects) ----------
             p = self._score_winprob_safe(symbol, meta_row)
@@ -1510,7 +1641,7 @@ class LiveTrader:
             tp1_cid, tp_final_cid = None, None
             if self.cfg.get("PARTIAL_TP_ENABLED", False):
                 tp1_cid = create_stable_cid(pid, "TP1")
-                tp1_mult = float(self.cfg.get("PARTIAL_TP_ATR_MULT", 1.0))
+                tp1_mult = float(self.cfg.get("PARTIAL_TP_ATR_MULT", self.cfg.get("TP1_ATR_MULT", 4.0)))
                 tp1_price = actual_entry_price + (tp1_mult * float(sig.atr) * (+1 if is_long else -1))
                 qty_tp1 = actual_size * float(self.cfg.get("PARTIAL_TP_PCT", 0.5))
                 qty_tp1 = max(0.0, min(qty_tp1, actual_size))
@@ -1524,7 +1655,7 @@ class LiveTrader:
                 )
                 if self.cfg.get("FINAL_TP_ENABLED", True):
                     tp_final_cid = create_stable_cid(pid, "TP_FINAL")
-                    tp_mult = float(self.cfg.get("FINAL_TP_ATR_MULT", 1.0))
+                    tp_mult = float(self.cfg.get("FINAL_TP_ATR_MULT", self.cfg.get("TP_ATR_MULT", 8.0)))
                     tp_final_price = actual_entry_price + (tp_mult * float(sig.atr) * (+1 if is_long else -1))
                     remainder = max(0.0, actual_size - qty_tp1)
                     await self.exchange.create_order(
@@ -1537,7 +1668,7 @@ class LiveTrader:
                     )
             elif self.cfg.get("FINAL_TP_ENABLED", True):
                 tp_final_cid = create_stable_cid(pid, "TP_FINAL")
-                tp_mult = float(self.cfg.get("FINAL_TP_ATR_MULT", 1.0))
+                tp_mult = float(self.cfg.get("FINAL_TP_ATR_MULT", self.cfg.get("TP_ATR_MULT", 8.0)))
                 tp_price = actual_entry_price + (tp_mult * float(sig.atr) * (+1 if is_long else -1))
                 await self.exchange.create_order(
                     sig.symbol, "market", tp_close_side, actual_size, None,
@@ -1607,7 +1738,7 @@ class LiveTrader:
             g_meta  = (wp >= meta_thresh)
 
             # TP preview (even if partials enabled, show final)
-            final_tp_mult  = float(self.cfg.get("FINAL_TP_ATR_MULT", 8.0))
+            final_tp_mult  = float(self.cfg.get("FINAL_TP_ATR_MULT", self.cfg.get("TP_ATR_MULT", 8.0)))
             tp_final_price = actual_entry_price + (final_tp_mult * float(sig.atr) * (+1 if is_long else -1))
 
             msg = (
@@ -1732,7 +1863,7 @@ class LiveTrader:
             try:
                 is_long = (pos.get("side","SHORT").upper() == "LONG")
                 tp_dir = (+1 if is_long else -1)
-                final_tp_price = float(pos["entry_price"]) + tp_dir * self.cfg["FINAL_TP_ATR_MULT"] * float(pos["atr"])
+                final_tp_price = float(pos["entry_price"]) + tp_dir * tp_mult * float(pos["atr"])
 
                 qty_left = float(pos["size"]) * (1 - self.cfg["PARTIAL_TP_PCT"])
                 tp2_cid = create_stable_cid(pid, "TP2")
