@@ -316,7 +316,7 @@ def _op_donch_breakout_daily_confirm(args, dfs, tfs, ctx, resolve):
         ctx["donch_break_level"] = upper
         # distance (pct) for meta features
         ctx["donch_dist_pct"] = (last_close - upper) / upper if upper > 0 else 0.0
-    return ok, f"donch20_close>{upper:.6f}"
+    return ok, f"donch{n}_close>{upper:.6f}"
 
 def _op_micro_vol_filter(args, dfs, tfs, ctx, resolve):
     """

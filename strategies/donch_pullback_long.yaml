@@ -25,7 +25,7 @@ entry:
     - liquidity_median_24h_usd_gte: { min_usd: "@params.LIQ_MIN_USD" }
 
     # 2) Regime (ETH MACD 4h: macd>signal & hist>0). For testing, comment this line out.
-    - eth_macd_bull: {}
+    #- eth_macd_bull: {}
 
     # 3) Donchian breakout (daily), confirm close above prior upper
     - donch_breakout_daily_confirm:

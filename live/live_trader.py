@@ -740,7 +740,13 @@ class LiveTrader:
 
             tf_minutes = 5  # base timeframe minutes (used for vol_mult window)
             # Donch breakout info
-            don_len = int(getattr(verdict, "don_break_len", self.cfg.get("DON_N_DAYS", 20)))
+            don_len = int(
+                getattr(verdict, "don_break_len",
+                        ((getattr(self.strategy_engine, "_spec", {}) or {}).get("params", {}) or {})
+                        .get("DONCH_PERIOD", self.cfg.get("DON_N_DAYS", 20)))
+            )
+
+
             don_level = None
             try:
                 if df1d is not None and len(df1d) >= (don_len + 2):
@@ -845,7 +851,7 @@ class LiveTrader:
 
                 # Try to expose "why" from StrategyEngine when present
                 why = None
-                for attr in ("reasons", "why", "debug", "failures"):
+                for attr in ("reason_tags", "tags", "reasons", "why", "debug", "failures"):
                     if hasattr(verdict, attr):
                         why = getattr(verdict, attr)
                         break
@@ -1171,7 +1177,11 @@ class LiveTrader:
             LOG.warning("De-dup check failed for %s: %s (continuing)", sig.symbol, _e)
 
         # --- Win-probability gate (optional) ---
-        thr = float(self.cfg.get("MIN_WINPROB_TO_TRADE", self.cfg.get("META_PROB_THRESHOLD", 0.0)))
+
+        thr = float(getattr(self.winprob, "pstar", None)
+                    or self.cfg.get("MIN_WINPROB_TO_TRADE",
+                                    self.cfg.get("META_PROB_THRESHOLD", 0.0)))
+
         wp  = float(getattr(sig, "win_probability", 0.0) or 0.0)
         if wp < thr:
             LOG.info("Skip %s: WinProb %.3f < threshold %.3f", sig.symbol, wp, thr)
