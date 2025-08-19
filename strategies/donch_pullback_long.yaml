@@ -1,5 +1,5 @@
 name: DonchPullbackLong_v1
-mask: pyinotify.IN_CLOSE_WRITE | pyinotify.IN_MOVED_TO
+
 
 
 timeframes:
@@ -8,13 +8,13 @@ timeframes:
   atr: 1h      # ATR for micro-vol & sizing
 
 params:
-  DONCH_PERIOD: 20
+  DONCH_PERIOD: 2
   VOLUME_DAYS: 30
   VOLUME_MIN_MULT: 2.0
   RETEST_EPS_PCT: 0.003
   RETEST_LOOKBACK_BARS: 288
-  RS_MIN_PCT: 70
-  LIQ_MIN_USD: 500000
+  RS_MIN_PCT: 50
+  LIQ_MIN_USD: 100000
   MICRO_VOL_MIN: 0.0001
 
 entry:
