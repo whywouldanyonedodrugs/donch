@@ -349,28 +349,30 @@ def _op_pullback_retest_close_above_break(args, dfs, tfs, ctx, resolve):
     After a Donchian breakout (ctx['donch_break_level']), require:
       - a retest near the break level within a lookback window, then
       - current close above the break.
-    Args: {
-      tf: '5m', eps_pct: 0.003, lookback_bars: 288
-    }
+    Args: { tf: '5m', eps_pct: 0.003, lookback_bars: 288 }
     """
     level = ctx.get("donch_break_level", None)
     if level is None or not np.isfinite(level):
         return False, "retest:no_break_ctx"
 
     tf = str(resolve(args.get("tf", "5m")))
-    eps = float(resolve(args.get("eps_pct", 0.003)))  # 0.3% band
+    eps = float(resolve(args.get("eps_pct", 0.003)))
     lb  = int(resolve(args.get("lookback_bars", 288)))
 
-    df = dfs.get(tf)
+    # ALIAS-SAFE (fix): use _get_tf_df instead of dfs.get(tf)
+    df = _get_tf_df(dfs, tfs, tf)
     if df is None or len(df) < lb + 5:
         return False, "retest:short"
 
     sub = df.tail(lb)
-    lo_ok = (sub["low"] <= level * (1.0 + eps)).any() and (sub["high"] >= level * (1.0 - eps)).any()
+    band_hi = level * (1.0 + eps)
+    band_lo = level * (1.0 - eps)
+    touched = ((sub["low"] <= band_hi) & (sub["high"] >= band_lo)).any()
     cur_close = float(sub["close"].iloc[-1])
     trig_ok = cur_close > level
-    ok = bool(lo_ok and trig_ok)
+    ok = bool(touched and trig_ok)
     return ok, f"retest@{level:.6f}&close>{level:.6f}"
+
 
 def _op_volume_median_multiple(args, dfs, tfs, ctx, resolve):
     """
@@ -382,10 +384,6 @@ def _op_volume_median_multiple(args, dfs, tfs, ctx, resolve):
     days = int(resolve(args.get("days", 30)))
     mult = float(resolve(args.get("min_mult", 2.0)))
     cap = int(resolve(args.get("cap_bars", 9000)))
-
-    # BEFORE:
-    # df = dfs.get(tf)
-    # AFTER (alias-safe):
     df = _get_tf_df(dfs, tfs, tf)
 
     if df is None or df.empty:
