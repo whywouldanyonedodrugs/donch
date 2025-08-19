@@ -295,26 +295,29 @@ def _op_donch_breakout_daily_confirm(args, dfs, tfs, ctx, resolve):
     Args: { donch_tf: '1d', period: 20 }
     Returns (ok, meta) and stores ctx['donch_break_level'] for later ops.
     """
+    # BEFORE:
+    # donch_tf = str(resolve(args.get("donch_tf", "1d")))
+    # n = int(resolve(args.get("period", 20)))
+    # ddf = dfs.get(donch_tf)
+    # if ddf is None or len(ddf) < n + 2:
+    #     return False, "donch_daily:insufficient"
+
+    # AFTER (alias-safe):
     donch_tf = str(resolve(args.get("donch_tf", "1d")))
     n = int(resolve(args.get("period", 20)))
-    ddf = dfs.get(donch_tf)
+    ddf = _get_tf_df(dfs, tfs, donch_tf)
     if ddf is None or len(ddf) < n + 2:
         return False, "donch_daily:insufficient"
 
     # Use prior N full days (exclude the current unfinished/most recent day)
-    dd = ddf.copy()
-    # Ensure index UTC and sorted
-    dd = dd.sort_index()
-    # Shift upper channel by 1 day to avoid look-ahead
-    highs = dd["high"].rolling(n).max().shift(1)
-    # Breakout today means last daily close > yesterday's upper channel
+    dd = ddf.copy().sort_index()
+    highs = dd["high"].rolling(n).max().shift(1)  # prior full day
     last_close = float(dd["close"].iloc[-1])
     upper = float(highs.iloc[-1])
     ok = last_close > upper and np.isfinite(upper)
 
     if ok:
         ctx["donch_break_level"] = upper
-        # distance (pct) for meta features
         ctx["donch_dist_pct"] = (last_close - upper) / upper if upper > 0 else 0.0
     return ok, f"donch{n}_close>{upper:.6f}"
 
