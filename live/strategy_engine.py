@@ -330,8 +330,8 @@ def _op_micro_vol_filter(args, dfs, tfs, ctx, resolve):
     atr_len = int(resolve(args.get("atr_len", 14)))
     min_ratio = float(resolve(args.get("min_ratio", 0.0001)))
     basetf = tfs.get("base", "5m")
-    df_base = dfs.get(basetf)
-    df_atr = dfs.get(atr_tf)
+    df_base = _get_tf_df(dfs, tfs, basetf)
+    df_atr  = _get_tf_df(dfs, tfs, str(resolve(args.get("atr_tf","1h"))))
     if df_base is None or df_atr is None or len(df_atr) < atr_len + 5:
         return False, "microvol:short"
 
@@ -383,10 +383,15 @@ def _op_volume_median_multiple(args, dfs, tfs, ctx, resolve):
     mult = float(resolve(args.get("min_mult", 2.0)))
     cap = int(resolve(args.get("cap_bars", 9000)))
 
-    df = dfs.get(tf)
+    # BEFORE:
+    # df = dfs.get(tf)
+    # AFTER (alias-safe):
+    df = _get_tf_df(dfs, tfs, tf)
+
     if df is None or df.empty:
         return False, "vol:missing"
-    # Bars per day estimate from existing df (assume regular spacing)
+
+    # Bars/day estimate (regular spacing fallback)
     try:
         bpd = int(round(24*60 / max(1, int((df.index[1]-df.index[0]).total_seconds()/60))))
     except Exception:
@@ -394,16 +399,16 @@ def _op_volume_median_multiple(args, dfs, tfs, ctx, resolve):
 
     lookback = min(cap, days * bpd)
     sub = df.tail(lookback)
-    if len(sub) < max(100, bpd):  # need at least a day-ish
+    if len(sub) < max(100, bpd):
         return False, "vol:short"
 
     cur_vol = float(sub["volume"].iloc[-1])
     med_vol = float(sub["volume"].median())
     ratio = (cur_vol / med_vol) if med_vol > 0 else 0.0
     ok = ratio >= mult
-    # stash for meta features
     ctx["vol_mult"] = float(ratio)
-    return ok, f"vol×={ratio:.2f}>={mult:.2f}"
+    return ok, f"vol×={ratio:.2f}"
+
 
 def _eval_one(op_dict, dfs, tfs, ctx, resolve, registry):
     if not isinstance(op_dict, dict) or len(op_dict) != 1:
