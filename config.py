@@ -189,3 +189,5 @@ UNFAVORABLE_RISK_RESIZE_FACTOR = 0.3
 
 # Debounce finalize of manual closes
 FINALIZE_BACKOFF_SEC        = 120   # don't retry finalize more often than this
+
+CANCEL_CLEANUP_BACKOFF_SEC  = 180

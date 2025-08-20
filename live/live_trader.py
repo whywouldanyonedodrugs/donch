@@ -334,6 +334,9 @@ class LiveTrader:
         self.last_exit: Dict[str, datetime] = {}
         self._zero_finalize_backoff: Dict[int, datetime] = {}
 
+        self._zero_finalize_backoff: Dict[int, datetime] = {}
+        self._cancel_cleanup_backoff: Dict[str, datetime] = {}
+
         self.strategy_engine = StrategyEngine(
             self.cfg.get("STRATEGY_SPEC_PATH", "strategy/donch_pullback_long.yaml"),
             cfg=self.cfg
@@ -569,7 +572,44 @@ class LiveTrader:
         except Exception:
             return 0, 0, 0.0
 
+    async def _cancel_reducing_orders(self, symbol: str, pos: dict):
+        """
+        Cancel any leftover reduce-only/close orders (TP/SL etc) for this symbol.
+        Uses both order id and clientOrderId when available.
+        """
+        try:
+            open_orders = await self._all_open_orders(symbol) or []
+        except Exception as e:
+            LOG.warning("Cancel sweep: failed to fetch open orders for %s: %s", symbol, e)
+            return
 
+        # Known client ids we created for this position
+        known_cids = {
+            pos.get("tp_final_cid"), pos.get("tp2_cid"), pos.get("tp1_cid"),
+            pos.get("sl_trail_cid"), pos.get("sl_cid")
+        }
+
+        for o in open_orders:
+            try:
+                oid  = o.get("id") or o.get("orderId")
+                coid = o.get("clientOrderId") or o.get("client_order_id")
+                # Reduce-only flags vary by venue/ccxt version
+                ro   = bool(o.get("reduceOnly") or o.get("reduce_only") or
+                            (o.get("info", {}).get("reduceOnly") if isinstance(o.get("info"), dict) else False))
+                # Heuristic: any order we created with a known CID is a child; cancel it.
+                is_child = (coid in known_cids)
+                if ro or is_child:
+                    try:
+                        if oid:
+                            await self.exchange.cancel_order(oid, symbol, {"clientOrderId": coid, "acknowledged": True})
+                        elif coid:
+                            # Some venues allow cancel by client id only
+                            await self.exchange.cancel_order(None, symbol, {"clientOrderId": coid, "acknowledged": True})
+                        LOG.info("Canceled stale child order %s (cid=%s) on %s", oid, coid, symbol)
+                    except Exception as ce:
+                        LOG.warning("Cancel failed for %s (cid=%s) on %s: %s", oid, coid, symbol, ce)
+            except Exception as e:
+                LOG.warning("Cancel sweep loop error on %s: %s", symbol, e)
     
     def _listing_age_days(self, symbol: str, dfs: dict[str, pd.DataFrame] | None = None) -> int | None:
         """
@@ -1794,24 +1834,33 @@ class LiveTrader:
 
                 
             if position_size == 0:
-                # Debounce repeated finalize attempts (avoid log spam if something upstream fails)
+                # 1) Sweep & cancel stale reduce-only/children (throttled)
+                if not hasattr(self, "_cancel_cleanup_backoff"):
+                    self._cancel_cleanup_backoff = {}
+                _now = datetime.now(timezone.utc)
+                _last_cancel = self._cancel_cleanup_backoff.get(symbol)
+                if (not _last_cancel) or (_now - _last_cancel).total_seconds() >= float(self.cfg.get("CANCEL_CLEANUP_BACKOFF_SEC", 180)):
+                    try:
+                        await self._cancel_reducing_orders(symbol, pos)
+                    finally:
+                        self._cancel_cleanup_backoff[symbol] = _now
+
+                # 2) Debounce finalize to avoid log spam during transient API hiccups
                 if not hasattr(self, "_zero_finalize_backoff"):
                     self._zero_finalize_backoff = {}
-                _now = datetime.now(timezone.utc)
-                _last = self._zero_finalize_backoff.get(pid)
-                if _last and (_now - _last).total_seconds() < float(self.cfg.get("FINALIZE_BACKOFF_SEC", 120)):
+                _last_fin = self._zero_finalize_backoff.get(pid)
+                if _last_fin and (_now - _last_fin).total_seconds() < float(self.cfg.get("FINALIZE_BACKOFF_SEC", 120)):
                     LOG.info("Position size is 0 for %s; finalize debounced.", symbol)
                     return
                 self._zero_finalize_backoff[pid] = _now
 
                 LOG.info("Position size for %s is 0. Inferring exit reason and finalizing…", symbol)
 
-                # Default to MANUAL_CLOSE; upgrade to TP/SL only if we can reasonably infer it
+                # 3) Infer exit type conservatively; MANUAL_CLOSE by default
                 inferred_reason = "MANUAL_CLOSE"
                 try:
                     open_orders = await self._all_open_orders(symbol)
                     open_cids = {o.get("clientOrderId") for o in (open_orders or [])}
-
                     if any([
                         (pos.get("tp_final_cid") and pos["tp_final_cid"] not in open_cids),
                         (pos.get("tp2_cid")     and pos["tp2_cid"]     not in open_cids),
@@ -1834,6 +1883,7 @@ class LiveTrader:
         except Exception as e:
             LOG.error("Could not fetch position size for %s during update: %s", symbol, e)
             return
+
 
 
         orders = await self._all_open_orders(symbol)
