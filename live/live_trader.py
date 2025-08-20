@@ -1960,35 +1960,6 @@ class LiveTrader:
         LOG.info("Trail updated %s to %.6f", symbol, new_stop)
 
 
-    async def _repair_closed_position(self, pid: int):
-        """Recompute PnL for a closed position using fallback logic and update DB."""
-        pos = await self.db.pool.fetchrow("SELECT * FROM positions WHERE id=$1", pid)
-        if not pos or str(pos["status"]).upper() != "CLOSED":
-            await self.tg.send(f"Repair: position {pid} not found or not closed."); return
-
-        side = (pos["side"] or "SHORT").lower()
-        size = float(pos["size"]); entry_price = float(pos["entry_price"])
-        exit_px = None
-        try:
-            # use last trade around closed_at
-            symbol = pos["symbol"]; closed_at = pos["closed_at"]
-            since_ts = int((closed_at - timedelta(minutes=10)).timestamp() * 1000)
-            my_trades = await self.exchange.fetch_my_trades(symbol, limit=50, since=since_ts)
-            close_side = "sell" if side == "long" else "buy"
-            t = next((t for t in reversed(my_trades) if str(t.get("side","")).lower()==close_side), None)
-            if t: exit_px = float(t["price"])
-        except Exception:
-            pass
-        if exit_px is None:
-            ticker = await self.exchange.fetch_ticker(pos["symbol"])
-            exit_px = float(ticker.get("last") or entry_price)
-
-        new_pnl = (entry_price - exit_px)*size if side=="short" else (exit_px-entry_price)*size
-        new_pct = (entry_price/exit_px-1.0)*100.0 if side=="short" else (exit_px/entry_price-1.0)*100.0
-        await self.db.update_position(pid, pnl=new_pnl, pnl_pct=new_pct)
-        await self.tg.send(f"🔧 Repaired PnL for {pos['symbol']} pid={pid}: {new_pnl:.4f} USDT")
-
-
     async def _finalize_position(self, pid: int, pos: Dict[str, Any], inferred_exit_reason: str = None):
         symbol = pos["symbol"]
         opened_at = pos["opened_at"]
@@ -2229,6 +2200,12 @@ class LiveTrader:
         self.open_positions.pop(pid, None)
         await self.tg.send(f"⏰ {symbol} closed by {tag}. PnL ≈ {pnl:.2f} USDT")
 
+
+
+
+
+
+
     # ───────────────────── Loops & commands ─────────────────────
 
     async def _main_signal_loop(self):
@@ -2355,6 +2332,69 @@ class LiveTrader:
                 LOG.error("Error in equity loop: %s", e)
             await asyncio.sleep(3600)
 
+    # ───────────────────── NEW: pid lookup + repair helpers ───────────────────
+    async def _find_pid_by_symbol(self, symbol: str, status: str = "CLOSED") -> Optional[int]:
+        """Return most recent position id for a symbol with given status."""
+        row = await self.db.pool.fetchrow(
+            "SELECT id FROM positions WHERE symbol=$1 AND status=$2 ORDER BY COALESCE(closed_at, opened_at) DESC LIMIT 1",
+            symbol.upper(), status.upper()
+        )
+        return int(row["id"]) if row else None
+
+    async def _recent_positions_text(self, symbol: Optional[str] = None, limit: int = 10) -> str:
+        """Human-readable recent positions list for TG."""
+        if symbol:
+            q = """
+            SELECT id, symbol, status, side, size, entry_price, closed_at, pnl
+            FROM positions WHERE symbol=$1 ORDER BY id DESC LIMIT $2
+            """
+            rows = await self.db.pool.fetch(q, symbol.upper(), limit)
+        else:
+            q = """
+            SELECT id, symbol, status, side, size, entry_price, closed_at, pnl
+            FROM positions ORDER BY id DESC LIMIT $1
+            """
+            rows = await self.db.pool.fetch(q, limit)
+        if not rows:
+            return "No positions."
+        lines = []
+        for r in rows:
+            lines.append(f"pid={r['id']}  {r['symbol']}  {r['status']}  "
+                         f"{r['side']}  sz={float(r['size']):.4g}  "
+                         f"EP={float(r['entry_price']):.6f}  "
+                         f"closed={str(r['closed_at'])[:19]}  "
+                         f"PnL={float(r['pnl'] or 0):.4f}")
+        return "Recent positions:\n" + "\n".join(lines)
+
+    async def _repair_closed_position(self, pid: int):
+        """Recompute PnL for a closed position using fallback logic and update DB."""
+        pos = await self.db.pool.fetchrow("SELECT * FROM positions WHERE id=$1", pid)
+        if not pos or str(pos["status"]).upper() != "CLOSED":
+            await self.tg.send(f"Repair: position {pid} not found or not closed."); return
+
+        side = (pos["side"] or "SHORT").lower()
+        size = float(pos["size"]); entry_price = float(pos["entry_price"])
+        exit_px = None
+        try:
+            symbol = pos["symbol"]; closed_at = pos["closed_at"]
+            since_ts = int((closed_at - timedelta(minutes=10)).timestamp() * 1000)
+            my_trades = await self.exchange.fetch_my_trades(symbol, limit=50, since=since_ts)
+            close_side = "sell" if side == "long" else "buy"
+            t = next((t for t in reversed(my_trades) if str(t.get("side","")).lower()==close_side), None)
+            if t: exit_px = float(t["price"])
+        except Exception:
+            pass
+        if exit_px is None:
+            ticker = await self.exchange.fetch_ticker(pos["symbol"])
+            exit_px = float(ticker.get("last") or entry_price)
+
+        new_pnl = (entry_price - exit_px)*size if side=="short" else (exit_px-entry_price)*size
+        new_pct = (entry_price/exit_px-1.0)*100.0 if side=="short" else (exit_px/entry_price-1.0)*100.0
+        await self.db.update_position(pid, pnl=new_pnl, pnl_pct=new_pct)
+        await self.tg.send(f"🔧 Repaired PnL for {pos['symbol']} pid={pid}: {new_pnl:.6f} USDT")
+
+
+
     async def _fetch_platform_balance(self) -> dict:
         account_type = self.cfg.get("BYBIT_ACCOUNT_TYPE", "STANDARD").upper()
         params = {}
@@ -2427,6 +2467,39 @@ class LiveTrader:
             except Exception as e:
                 await self.tg.send(f"❌ Failed to start analysis: {e}")
             return
+        elif root == "/recent":
+            # /recent                → last 10 of all symbols
+            # /recent XCNUSDT 5      → last 5 for XCNUSDT
+            sym = parts[1].upper() if len(parts) >= 2 and parts[1][0].isalpha() else None
+            lim = int(parts[-1]) if parts and parts[-1].isdigit() else 10
+            txt = await self._recent_positions_text(sym, lim)
+            await self.tg.send(txt)
+
+        elif root == "/pid" and len(parts) >= 2:
+            # /pid XCNUSDT            → most recent pid for symbol (any status)
+            sym = parts[1].upper()
+            row = await self.db.pool.fetchrow(
+                "SELECT id,status FROM positions WHERE symbol=$1 ORDER BY id DESC LIMIT 1", sym
+            )
+            if not row:
+                await self.tg.send(f"No positions for {sym}.")
+            else:
+                await self.tg.send(f"{sym}: last pid={int(row['id'])} status={row['status']}")
+
+        elif root == "/repair" and len(parts) >= 2:
+            # /repair 12345          → repair by pid
+            # /repair XCNUSDT        → repair most recent CLOSED pid for symbol
+            arg = parts[1]
+            if arg.isdigit():
+                await self._repair_closed_position(int(arg))
+            else:
+                pid = await self._find_pid_by_symbol(arg, status="CLOSED")
+                if pid is None:
+                    await self.tg.send(f"No CLOSED position found for {arg.upper()}.")
+                else:
+                    await self._repair_closed_position(pid)
+
+
 
     async def _resume(self):
         """
