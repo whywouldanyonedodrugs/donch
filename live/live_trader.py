@@ -332,6 +332,7 @@ class LiveTrader:
         self.peak_equity: float = 0.0
         self._listing_dates_cache: Dict[str, datetime.date] = {}
         self.last_exit: Dict[str, datetime] = {}
+        self._zero_finalize_backoff: Dict[int, datetime] = {}
 
         self.strategy_engine = StrategyEngine(
             self.cfg.get("STRATEGY_SPEC_PATH", "strategy/donch_pullback_long.yaml"),
@@ -1790,23 +1791,50 @@ class LiveTrader:
             position_size = 0.0
             if positions and positions[0]:
                 position_size = float(positions[0].get('info', {}).get('size', 0))
+
+                
             if position_size == 0:
+                # Debounce repeated finalize attempts (avoid log spam if something upstream fails)
+                if not hasattr(self, "_zero_finalize_backoff"):
+                    self._zero_finalize_backoff = {}
+                _now = datetime.now(timezone.utc)
+                _last = self._zero_finalize_backoff.get(pid)
+                if _last and (_now - _last).total_seconds() < float(self.cfg.get("FINALIZE_BACKOFF_SEC", 120)):
+                    LOG.info("Position size is 0 for %s; finalize debounced.", symbol)
+                    return
+                self._zero_finalize_backoff[pid] = _now
+
                 LOG.info("Position size for %s is 0. Inferring exit reason and finalizing…", symbol)
-                inferred_reason = "UNKNOWN"
-                open_orders = await self._all_open_orders(symbol)
-                open_cids = {o.get("clientOrderId") for o in open_orders}
-                if (pos.get("tp_final_cid") and pos["tp_final_cid"] not in open_cids) or \
-                   (pos.get("tp2_cid") and pos["tp2_cid"] not in open_cids) or \
-                   (pos.get("tp1_cid") and pos["tp1_cid"] not in open_cids):
-                    inferred_reason = "TP"
-                elif (pos.get("sl_trail_cid") and pos["sl_trail_cid"] not in open_cids) or \
-                     (pos.get("sl_cid") and pos["sl_cid"] not in open_cids):
-                    inferred_reason = "SL"
-                await self._finalize_position(pid, pos, inferred_exit_reason=inferred_reason)
+
+                # Default to MANUAL_CLOSE; upgrade to TP/SL only if we can reasonably infer it
+                inferred_reason = "MANUAL_CLOSE"
+                try:
+                    open_orders = await self._all_open_orders(symbol)
+                    open_cids = {o.get("clientOrderId") for o in (open_orders or [])}
+
+                    if any([
+                        (pos.get("tp_final_cid") and pos["tp_final_cid"] not in open_cids),
+                        (pos.get("tp2_cid")     and pos["tp2_cid"]     not in open_cids),
+                        (pos.get("tp1_cid")     and pos["tp1_cid"]     not in open_cids),
+                    ]):
+                        inferred_reason = "TP"
+                    elif any([
+                        (pos.get("sl_trail_cid") and pos["sl_trail_cid"] not in open_cids),
+                        (pos.get("sl_cid")       and pos["sl_cid"]       not in open_cids),
+                    ]):
+                        inferred_reason = "SL"
+                except Exception as e:
+                    LOG.warning("Open-orders probe failed while finalizing %s: %s", symbol, e)
+
+                try:
+                    await self._finalize_position(pid, pos, inferred_exit_reason=inferred_reason)
+                except Exception as e:
+                    LOG.exception("Finalize failed for %s pid=%s: %s", symbol, pid, e)
                 return
         except Exception as e:
             LOG.error("Could not fetch position size for %s during update: %s", symbol, e)
             return
+
 
         orders = await self._all_open_orders(symbol)
         open_cids = {o.get("clientOrderId") for o in orders}
@@ -2333,6 +2361,64 @@ class LiveTrader:
             await asyncio.sleep(3600)
 
     # ───────────────────── NEW: pid lookup + repair helpers ───────────────────
+    async def _finalize_zero_position_safe(self, pid: int, pos: dict, symbol: str):
+        """
+        Finalize a position whose exchange size is zero.
+        Try to infer exit from our SL/TP cids; else mark MANUAL_CLOSE and compute PnL via fallback.
+        Debounced via self._zero_finalize_backoff.
+        """
+        now = datetime.now(timezone.utc)
+        last_try = self._zero_finalize_backoff.get(pid)
+        if last_try and (now - last_try).total_seconds() < float(self.cfg.get("FINALIZE_BACKOFF_SEC", 120)):
+            return  # too soon; skip noisy retries
+        self._zero_finalize_backoff[pid] = now
+
+        # 1) try to detect which order closed it
+        exit_price = None
+        exit_kind  = "MANUAL_CLOSE"
+        for label, cid in (("TP", pos.get("tp_final_cid")),
+                           ("TP1", pos.get("tp1_cid")),
+                           ("SL", pos.get("sl_cid"))):
+            o = await self._fetch_by_cid(cid, symbol, silent=True)
+            if o and str(o.get("status","")).lower() == "closed":
+                exit_kind  = label
+                exit_price = o.get("average") or o.get("price")
+                try:
+                    exit_price = float(exit_price) if exit_price is not None else None
+                except Exception:
+                    exit_price = None
+                break
+
+        # 2) if still unknown, try trades around now; else use ticker last
+        if exit_price is None:
+            try:
+                since_ts = int((now - timedelta(minutes=15)).timestamp() * 1000)
+                trades = await self.exchange.fetch_my_trades(symbol, limit=100, since=since_ts)
+                # pick the most recent trade with opposite side to the position
+                side = str(pos.get("side","")).lower()
+                close_side = "sell" if side == "long" else "buy"
+                for t in reversed(trades or []):
+                    if str(t.get("side","")).lower() == close_side:
+                        exit_price = float(t.get("price"))
+                        break
+            except Exception:
+                pass
+        if exit_price is None:
+            try:
+                tk = await self.exchange.fetch_ticker(symbol)
+                exit_price = float(tk.get("last") or tk.get("mark") or tk.get("index") or pos.get("entry_price"))
+            except Exception:
+                exit_price = float(pos.get("entry_price"))
+
+        # 3) hand off to your finalize routine (uses the safe PnL fallback you added)
+        await self._finalize_position(
+            pid,
+            closing_order_type=exit_kind,
+            exit_price=exit_price,
+            closed_at=now,
+        )
+
+
     async def _find_pid_by_symbol(self, symbol: str, status: str = "CLOSED") -> Optional[int]:
         """Return most recent position id for a symbol with given status."""
         row = await self.db.pool.fetchrow(
@@ -2850,10 +2936,22 @@ class LiveTrader:
 
     # ───────────────────── Exchange order helpers ─────────────────────
 
-    async def _fetch_by_cid(self, cid: str, symbol: str):
-        return await self.exchange.fetch_order(
-            None, symbol, params={"clientOrderId": cid, "category": "linear"}
-        )
+
+
+    async def _fetch_by_cid(self, cid: Optional[str], symbol: str, silent: bool = False):
+        if not cid:
+            return None
+        try:
+            # Bybit: add acknowledged=True to avoid noisy warning
+            return await self.exchange.fetch_order(None, symbol, {
+                "clientOrderId": cid,
+                "acknowledged": True,
+            })
+        except Exception as e:
+            if not silent:
+                LOG.warning("Fetch by CID %s for %s failed (fallback to trades): %s", cid, symbol, e)
+            return None
+
 
     async def _cancel_by_cid(self, cid: str, symbol: str):
         try:

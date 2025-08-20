@@ -186,3 +186,6 @@ REGIME_ATR_MULT = 2.0        # ATR multiplier for the Keltner bands.
 ETH_BAROMETER_ENABLED = True
 UNFAVORABLE_MODE = "RESIZE" 
 UNFAVORABLE_RISK_RESIZE_FACTOR = 0.3 
+
+# Debounce finalize of manual closes
+FINALIZE_BACKOFF_SEC        = 120   # don't retry finalize more often than this
