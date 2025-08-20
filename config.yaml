@@ -3,9 +3,9 @@ STRATEGY_SPEC_PATH: "strategies/donch_pullback_long.yaml"
 
 # Sizing
 RISK_MODE: "cash"           # or "percent"
-RISK_USD: 5.0              # used if RISK_MODE="cash"
+RISK_USD: 10.0              # used if RISK_MODE="cash"
 RISK_EQUITY_PCT: 0.01       # used if RISK_MODE="percent"
-MIN_TRADE_AUTOPAD_ENABLED: true
+MIN_TRADE_AUTOPAD_ENABLED: false
 MIN_TRADE_AUTOPAD_CAP_USD: 5.0
 
 # Exits: SL/TP via ATR(1h)
@@ -27,15 +27,15 @@ WINPROB_MODEL_DIR: "results/meta_export"
 WINPROB_ARTIFACT_DIR: results/meta_export
 
 # live gate; can be tuned without re-exporting the model
-MIN_WINPROB_TO_TRADE: 0.60
+MIN_WINPROB_TO_TRADE: 0.45
 ETH_BAROMETER_ENABLED: false        # as requested for testing
 REGIME_BLOCK_WHEN_DOWN: false       # let entries through while testing
 # optional sizing-by-prob (already supported in your bot)
 WINPROB_SIZING_ENABLED: true
-WINPROB_MIN_MULTIPLIER: 0.8
-WINPROB_MAX_MULTIPLIER: 1.3
-WINPROB_PROB_FLOOR: 0.55
-WINPROB_PROB_CAP: 0.80
+WINPROB_MIN_MULTIPLIER: 0.60
+WINPROB_MAX_MULTIPLIER: 1.5
+WINPROB_PROB_FLOOR: 0.45
+WINPROB_PROB_CAP: 0.85
 
 
 UNIVERSE_CTX_REFRESH_MIN: 1440 
