@@ -54,9 +54,9 @@ WINPROB_SIZE_CAP   = 1.00
 # ── stop / targets ─────────────────────────────────────────────────────────
 SL_ATR_MULT             = 1.8
 FINAL_TP_ENABLED        = True
-FINAL_TP_ATR_MULT       = 1.0
+FINAL_TP_ATR_MULT       = 8.0
 PARTIAL_TP_ENABLED      = False
-PARTIAL_TP_PCT          = 1.0       
+PARTIAL_TP_PCT          = 8.0       
 PARTIAL_TP_ATR_MULT     = 1.0
 TRAIL_ENABLED           = False
 TRAIL_START_ATR_MULT    = 1.0
