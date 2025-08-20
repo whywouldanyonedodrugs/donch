@@ -1820,12 +1820,27 @@ class LiveTrader:
 
         if self.cfg.get("PARTIAL_TP_ENABLED", False) and not pos["trailing_active"] and pos.get("tp1_cid") not in open_cids:
             fill_price = None
+            filled_qty = 0.0
             try:
                 o = await self._fetch_by_cid(pos["tp1_cid"], symbol)
-                if o and o.get('status') == 'closed':
+                if o and str(o.get('status','')).lower() == 'closed':
                     fill_price = o.get('average') or o.get('price')
+                    filled_qty = float(o.get('filled') or o.get('amount') or 0.0)
             except Exception as e:
-                LOG.warning("Failed to fetch TP1 fill price for %s: %s", pos["tp1_cid"], e)
+                LOG.warning("Failed to fetch TP1 order %s: %s", pos["tp1_cid"], e)
+
+            # **Only** record a TP1 fill if the order actually closed with >0 qty.
+            if (filled_qty or 0.0) > 0.0 and (fill_price is not None):
+                await self.db.add_fill(
+                    pid, "TP1", float(fill_price), float(filled_qty), datetime.now(timezone.utc)
+                )
+                await self.db.update_position(pid, trailing_active=True)
+                pos["trailing_active"] = True
+                await self._activate_trailing(pid, pos)
+                await self.tg.send(f"📈 TP1 hit on {symbol}, trailing activated")
+            else:
+                LOG.info("TP1 for %s not filled (status!=closed or filled=0). Skipping phantom fill.", symbol)
+
 
             await self.db.add_fill(
                 pid, "TP1", fill_price, float(pos["size"]) * self.cfg["PARTIAL_TP_PCT"], datetime.now(timezone.utc)
@@ -1945,6 +1960,35 @@ class LiveTrader:
         LOG.info("Trail updated %s to %.6f", symbol, new_stop)
 
 
+    async def _repair_closed_position(self, pid: int):
+        """Recompute PnL for a closed position using fallback logic and update DB."""
+        pos = await self.db.pool.fetchrow("SELECT * FROM positions WHERE id=$1", pid)
+        if not pos or str(pos["status"]).upper() != "CLOSED":
+            await self.tg.send(f"Repair: position {pid} not found or not closed."); return
+
+        side = (pos["side"] or "SHORT").lower()
+        size = float(pos["size"]); entry_price = float(pos["entry_price"])
+        exit_px = None
+        try:
+            # use last trade around closed_at
+            symbol = pos["symbol"]; closed_at = pos["closed_at"]
+            since_ts = int((closed_at - timedelta(minutes=10)).timestamp() * 1000)
+            my_trades = await self.exchange.fetch_my_trades(symbol, limit=50, since=since_ts)
+            close_side = "sell" if side == "long" else "buy"
+            t = next((t for t in reversed(my_trades) if str(t.get("side","")).lower()==close_side), None)
+            if t: exit_px = float(t["price"])
+        except Exception:
+            pass
+        if exit_px is None:
+            ticker = await self.exchange.fetch_ticker(pos["symbol"])
+            exit_px = float(ticker.get("last") or entry_price)
+
+        new_pnl = (entry_price - exit_px)*size if side=="short" else (exit_px-entry_price)*size
+        new_pct = (entry_price/exit_px-1.0)*100.0 if side=="short" else (exit_px/entry_price-1.0)*100.0
+        await self.db.update_position(pid, pnl=new_pnl, pnl_pct=new_pct)
+        await self.tg.send(f"🔧 Repaired PnL for {pos['symbol']} pid={pid}: {new_pnl:.4f} USDT")
+
+
     async def _finalize_position(self, pid: int, pos: Dict[str, Any], inferred_exit_reason: str = None):
         symbol = pos["symbol"]
         opened_at = pos["opened_at"]
@@ -2011,88 +2055,77 @@ class LiveTrader:
             k  = (r["kind"] or "").upper()
             is_exit = (k.startswith("TP") or k.startswith("SL") or "TIME_EXIT" in k or "FALLBACK" in k)
             if is_exit:
-                exit_notional += px * q
-                exit_qty_sum  += q
+                if px > 0 and q > 0:
+                    exit_notional += px * q
+                    exit_qty_sum  += q
             else:
-                entry_notional += px * q
-                entry_qty      += q
+                if px > 0 and q > 0:
+                    entry_notional += px * q
+                    entry_qty      += q
 
-        if entry_qty <= 0.0:  # safety fallback
+        # If we never stored an entry fill, synthesize it from entry snapshot
+        if entry_qty <= 0.0:
             entry_notional = entry_price * size
-            entry_qty = size
-        if abs(exit_qty_sum - entry_qty) > 1e-8:
-            LOG.warning("Position %s fills mismatch: exit_qty %.6f vs entry_qty %.6f", symbol, exit_qty_sum, entry_qty)
+            entry_qty      = size
 
-        if side == "short":
-            total_pnl = entry_notional - exit_notional
-            avg_exit = (exit_notional / exit_qty_sum) if exit_qty_sum > 0 else entry_price
-            pnl_pct = (entry_price / avg_exit - 1.0) * 100.0 if avg_exit > 0 else 0.0
+        # ---- Sanity: if fills are clearly inconsistent, fall back to safe formula
+        def _pnl_linear(e_px, x_px, q, sd):
+            return (e_px - x_px) * q if sd == "short" else (x_px - e_px) * q
+
+        bad_fills = (exit_qty_sum <= 0.0) or (abs(exit_qty_sum - entry_qty) > 0.05 * entry_qty)
+        if bad_fills:
+            LOG.warning("PnL fallback on %s: exit_qty %.6f vs entry_qty %.6f. Using direct formula.",
+                        symbol, exit_qty_sum, entry_qty)
+            # Use the best exit price we have (from a bound order, a trade, or ticker)
+            safe_exit_px = float(exit_price or entry_price)
+            total_pnl = _pnl_linear(entry_price, safe_exit_px, float(size), side)
+            avg_exit = safe_exit_px
+            pnl_pct = ((entry_price / avg_exit - 1.0) * 100.0) if side == "short" else ((avg_exit / entry_price - 1.0) * 100.0)
         else:
-            total_pnl = exit_notional - entry_notional
-            avg_exit = (exit_notional / exit_qty_sum) if exit_qty_sum > 0 else entry_price
-            pnl_pct = (avg_exit / entry_price - 1.0) * 100.0 if entry_price > 0 else 0.0
+            if side == "short":
+                total_pnl = entry_notional - exit_notional
+                avg_exit = (exit_notional / exit_qty_sum) if exit_qty_sum > 0 else entry_price
+                pnl_pct = (entry_price / avg_exit - 1.0) * 100.0 if avg_exit > 0 else 0.0
+            else:
+                total_pnl = exit_notional - entry_notional
+                avg_exit = (exit_notional / exit_qty_sum) if exit_qty_sum > 0 else entry_price
+                pnl_pct = (avg_exit / entry_price - 1.0) * 100.0 if entry_price > 0 else 0.0
 
         holding_minutes = (closed_at - opened_at).total_seconds() / 60 if opened_at else 0.0
 
-        # 5) Post-trade analytics
+        # 5) Post-trade analytics + fees (sum fees from recent trades in window if available)
         mae_usd = mfe_usd = mae_over_atr = mfe_over_atr = 0.0
         realized_vol_during_trade = btc_beta_during_trade = 0.0
+        fees_paid = 0.0
         try:
-            since_ts = int(opened_at.timestamp() * 1000)
-            ohlcv = await self.exchange.fetch_ohlcv(symbol, "1m", since=since_ts)
-            if ohlcv:
-                df = pd.DataFrame(ohlcv, columns=["ts","o","h","l","c","v"])
-                df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-                df = df[df["ts"] <= closed_at]
-                if not df.empty:
-                    if side == "short":
-                        mae_usd = max(0.0, (df["h"].max() - entry_price) * entry_qty)
-                        mfe_usd = max(0.0, (entry_price - df["l"].min()) * entry_qty)
-                    else:
-                        mae_usd = max(0.0, (entry_price - df["l"].min()) * entry_qty)
-                        mfe_usd = max(0.0, (df["h"].max() - entry_price) * entry_qty)
-                    asset_rets = df["c"].pct_change().dropna()
-                    if not asset_rets.empty:
-                        realized_vol_during_trade = asset_rets.std() * (365 * 24 * 60) ** 0.5
-                    bench = self.cfg.get("REGIME_BENCHMARK_SYMBOL", "BTCUSDT")
-                    if symbol != bench:
-                        btc_ohlcv = await self.exchange.fetch_ohlcv(bench, "1m", since=since_ts)
-                        if btc_ohlcv:
-                            bdf = pd.DataFrame(btc_ohlcv, columns=["ts","o","h","l","c","v"])
-                            bdf["ts"] = pd.to_datetime(bdf["ts"], unit="ms", utc=True)
-                            bdf = bdf[bdf["ts"] <= closed_at]
-                            if not bdf.empty:
-                                comb = pd.concat([asset_rets.rename("asset"),
-                                                  bdf["c"].pct_change().rename("btc")], axis=1).dropna()
-                                if len(comb) > 5 and comb["btc"].var() > 0:
-                                    btc_beta_during_trade = comb["asset"].cov(comb["btc"]) / comb["btc"].var()
-
-            atr_at_entry = float(pos.get("atr") or 0.0)
-            if atr_at_entry > 0 and entry_qty > 0:
-                mae_over_atr = (mae_usd / entry_qty) / atr_at_entry
-                mfe_over_atr = (mfe_usd / entry_qty) / atr_at_entry
+            since_ts = int((opened_at - timedelta(minutes=5)).timestamp() * 1000)
+            until_ts = int((closed_at + timedelta(minutes=5)).timestamp() * 1000)
+            my_trades = await self.exchange.fetch_my_trades(symbol, limit=200, since=since_ts)
+            for t in my_trades:
+                ts = int(t.get("timestamp") or 0)
+                if ts and since_ts <= ts <= until_ts:
+                    f = t.get("fee") or {}
+                    fees_paid += float(f.get("cost") or 0.0)
         except Exception as e:
-            LOG.warning("Post-trade metrics failed for %s: %s", symbol, e)
-
-        # 6) Cleanup + persist
-        try:
-            await self.exchange.cancel_all_orders(symbol, params={"category": "linear"})
-        except Exception as e:
-            LOG.warning("Final cleanup for %d (%s) failed: %s", pid, symbol, e)
+            LOG.warning("Fee aggregation skipped for %s: %s", symbol, e)
 
         await self.db.update_position(
-            pid, status="CLOSED", closed_at=closed_at, pnl=total_pnl,
-            exit_reason=closing_order_type, holding_minutes=holding_minutes,
-            pnl_pct=pnl_pct, mae_usd=mae_usd, mfe_usd=mfe_usd,
-            mae_over_atr=mae_over_atr, mfe_over_atr=mfe_over_atr,
-            realized_vol_during_trade=realized_vol_during_trade,
-            btc_beta_during_trade=btc_beta_during_trade
+            pid,
+            status="CLOSED",
+            closed_at=closed_at,
+            exit_reason=closing_order_type,
+            pnl=total_pnl,
+            pnl_pct=pnl_pct,
+            holding_minutes=holding_minutes,
+            avg_exit_price=avg_exit if 'avg_exit_price' in self.db.columns_positions else None,
+            fees_paid=fees_paid
         )
 
         await self.risk.on_trade_close(total_pnl, self.tg)
         self.open_positions.pop(pid, None)
         self.last_exit[symbol] = closed_at
         await self.tg.send(f"✅ {symbol} position closed. Total PnL ≈ {total_pnl:.2f} USDT")
+
 
 
     async def _force_open_position(self, symbol: str):
