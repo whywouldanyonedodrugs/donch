@@ -2166,7 +2166,7 @@ class LiveTrader:
             pnl=total_pnl,
             pnl_pct=pnl_pct,
             holding_minutes=holding_minutes,
-            avg_exit_price=avg_exit if 'avg_exit_price' in self.db.columns_positions else None,
+            avg_exit_price=avg_exit if 'avg_exit_price' in getattr(self.db, 'columns_positions', set()) else None,
             fees_paid=fees_paid
         )
 
@@ -2992,11 +2992,22 @@ class LiveTrader:
         if not cid:
             return None
         try:
-            # Bybit: add acknowledged=True to avoid noisy warning
-            return await self.exchange.fetch_order(None, symbol, {
-                "clientOrderId": cid,
-                "acknowledged": True,
-            })
+
+            base = {"clientOrderId": cid, "acknowledged": True, "category": "linear"}
+            # 1) Try conditional pools (StopOrder / TP/SL)
+            for params in (
+                {**base, "trigger": True, "orderFilter": "StopOrder"},
+                {**base, "trigger": True, "orderFilter": "tpslOrder"},
+            ):
+                try:
+                    o = await self.exchange.fetch_order(None, symbol, params)
+                    if o:
+                        return o
+                except Exception:
+                    pass
+            # 2) Fall back to active orders
+            return await self.exchange.fetch_order(None, symbol, base)
+
         except Exception as e:
             if not silent:
                 LOG.warning("Fetch by CID %s for %s failed (fallback to trades): %s", cid, symbol, e)
