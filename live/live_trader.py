@@ -2038,133 +2038,157 @@ class LiveTrader:
         LOG.info("Trail updated %s to %.6f", symbol, new_stop)
 
 
+    # ---------------------------------------------------------------------------
+    # Position lifecycle: finalize and persist a closed position
+    # ---------------------------------------------------------------------------
+
     async def _finalize_position(self, pid: int, pos: Dict[str, Any], inferred_exit_reason: str = None):
         symbol = pos["symbol"]
-        opened_at = pos["opened_at"]
+        opened_at: datetime = pos["opened_at"]
         entry_price = float(pos["entry_price"])
         size = float(pos["size"])
         side = (pos.get("side") or "SHORT").lower()  # "long" or "short"
 
-        closed_at = datetime.now(timezone.utc)
-        exit_price, exit_qty = None, 0.0
+        # We'll compute these from real fills
         closing_order_type = inferred_exit_reason or "UNKNOWN"
+        exit_price = None
+        exit_qty_needed = abs(size)
+        close_side = "sell" if side == "long" else "buy"
 
-        # 1) Try to tie to a specific closing order (TP/SL/Trail)
+        # ------------------ 1) Try to bind to a specific closing order ------------------
         closing_order_cid = None
-        if inferred_exit_reason == "TP":
+        if inferred_exit_reason in ("TP", "TP1", "TP2"):
             closing_order_cid = pos.get("tp_final_cid") or pos.get("tp2_cid") or pos.get("tp1_cid")
-        elif inferred_exit_reason == "SL":
+        elif inferred_exit_reason in ("SL", "TRAIL"):
             closing_order_cid = pos.get("sl_trail_cid") or pos.get("sl_cid")
 
-        if closing_order_cid:
-            try:
-                order = await self._fetch_by_cid(closing_order_cid, symbol)
-                if order and (order.get("average") or order.get("price")):
-                    exit_price = float(order.get("average") or order.get("price"))
-                    exit_qty = float(order.get("filled") or 0) or 0.0
-                    closing_order_type = inferred_exit_reason
-            except Exception as e:
-                LOG.warning("Fetch by CID %s for %s failed (fallback to trades): %s", closing_order_cid, symbol, e)
-
-        # 2) Fallback to recent trades if we couldn't bind to an order
-        if not exit_price:
-            try:
-                await asyncio.sleep(1.5)
-                my_trades = await self.exchange.fetch_my_trades(symbol, limit=10)
-                close_side = "sell" if side == "long" else "buy"
-                closing_trade = next((t for t in reversed(my_trades) if str(t.get("side", "")).lower() == close_side), None)
-                if closing_trade:
-                    exit_price = float(closing_trade["price"])
-                    exit_qty = float(closing_trade.get("amount") or 0)
-                    if closing_order_type == "UNKNOWN":
-                        closing_order_type = "FALLBACK_FILL"
-                else:
-                    LOG.error("No closing trade found for %s; fallback to entry price.", symbol)
-                    exit_price, exit_qty = entry_price, size
-            except Exception as e:
-                LOG.error("fetch_my_trades fallback failed for %s: %s. Using entry price.", symbol, e)
-                exit_price, exit_qty = entry_price, size
-
-        # 3) Persist this last observed fill (won’t double-count; we aggregate below)
+        order_last_ts = None
         try:
-            await self.db.add_fill(pid, closing_order_type, float(exit_price), float(exit_qty), closed_at)
+            if closing_order_cid:
+                o = await self._fetch_by_cid(closing_order_cid, symbol)
+                if o:
+                    # prefer lastTradeTimestamp if present; orders != trades in CCXT
+                    # may be None on some venues – we’ll still use trades below.  (CCXT manual)
+                    # https://github.com/ccxt/ccxt/wiki/manual
+                    ts = o.get("lastTradeTimestamp") or o.get("timestamp") or o.get("datetime")
+                    if ts:
+                        try:
+                            order_last_ts = int(o["lastTradeTimestamp"]) if o.get("lastTradeTimestamp") else self.exchange.parse8601(ts)
+                        except Exception:
+                            order_last_ts = None
+                    if (o.get("average") or o.get("price")) and (o.get("filled") or 0) > 0:
+                        exit_price = float(o.get("average") or o.get("price"))
+                        closing_order_type = inferred_exit_reason
         except Exception as e:
-            LOG.warning("Could not persist closing fill for %s: %s", symbol, e)
+            LOG.warning("Fetch order by CID %s for %s failed: %s", closing_order_cid, symbol, e)
 
-        # 4) Aggregate PnL from ALL fills (handles TP1/TP2/trailing)
-        rows = await self.db.pool.fetch(
-            "SELECT fill_type AS kind, price, qty FROM fills WHERE position_id=$1 ORDER BY ts ASC",
-            pid
-        )
+        # ------------------ 2) Pull trades since opened_at and build exit fills ------------------
+        # IMPORTANT: use since=opened_at to avoid mixing unrelated fills. (CCXT supports since/limit)
+        # https://pypi.org/project/ccxt/
+        fills = []
+        try:
+            since_ms = max(0, int(opened_at.timestamp() * 1000) - 60_000)
+            # pull more than default to cover partial exits/TPs
+            my_trades = await self.exchange.fetch_my_trades(symbol, since=since_ms, limit=1000)
+            # sort ascending by time
+            my_trades = sorted([t for t in my_trades or [] if t.get("timestamp")], key=lambda t: int(t["timestamp"]))
+            # closing-only trades
+            closing_trades = [t for t in my_trades if str(t.get("side","")).lower() == close_side]
 
-        entry_notional = exit_notional = entry_qty = exit_qty_sum = 0.0
-        for r in rows:
-            px = float(r["price"] or 0.0)
-            q  = float(r["qty"] or 0.0)
-            k  = (r["kind"] or "").upper()
-            is_exit = (k.startswith("TP") or k.startswith("SL") or "TIME_EXIT" in k or "FALLBACK" in k)
-            if is_exit:
-                if px > 0 and q > 0:
-                    exit_notional += px * q
-                    exit_qty_sum  += q
-            else:
-                if px > 0 and q > 0:
-                    entry_notional += px * q
-                    entry_qty      += q
+            # accumulate closing qty until we cover the entire position size
+            qty_left = exit_qty_needed
+            for t in closing_trades:
+                if qty_left <= 1e-12:
+                    break
+                t_qty = float(t.get("amount") or 0.0)
+                t_px  = float(t.get("price") or 0.0)
+                if t_qty <= 0 or t_px <= 0:
+                    continue
+                use_qty = min(qty_left, t_qty)
+                fills.append((int(t["timestamp"]), t_px, use_qty, t.get("fee")))
+                qty_left -= use_qty
 
-        # If we never stored an entry fill, synthesize it from entry snapshot
-        if entry_qty <= 0.0:
-            entry_notional = entry_price * size
-            entry_qty      = size
+            # if we didn’t reach full size but have some data, we’ll still compute with what we have
+        except Exception as e:
+            LOG.error("fetch_my_trades failed for %s: %s", symbol, e)
 
-        # ---- Sanity: if fills are clearly inconsistent, fall back to safe formula
+        # ------------------ 3) Decide exit price & time from fills ------------------
+        # Prefer fills → else order timestamp/price → else ticker/entry
+        if fills:
+            exit_notional = sum(px * q for _, px, q, _ in fills)
+            exit_qty_sum  = sum(q for *_ , q, _ in fills)
+            avg_exit = (exit_notional / exit_qty_sum) if exit_qty_sum > 0 else entry_price
+            closed_at = datetime.fromtimestamp(max(ts for ts, *_ in fills) / 1000.0, tz=timezone.utc)
+            # collect fees from both entry+exit window for accuracy
+            fees_paid = 0.0
+            for _, _, q, fee in fills:
+                if isinstance(fee, dict):
+                    try:
+                        fees_paid += float(fee.get("cost") or 0.0)
+                    except Exception:
+                        pass
+        else:
+            # fallback: use order hint if present
+            closed_at = datetime.fromtimestamp(order_last_ts / 1000.0, tz=timezone.utc) if order_last_ts else datetime.now(timezone.utc)
+            if exit_price is None:
+                try:
+                    tk = await self.exchange.fetch_ticker(symbol)
+                    exit_price = float(tk.get("last") or tk.get("mark") or tk.get("index") or entry_price)
+                except Exception:
+                    exit_price = entry_price
+            avg_exit = float(exit_price)
+            exit_qty_sum = exit_qty_needed
+            fees_paid = 0.0
+
+        # ------------------ 4) Avoid creating duplicate exit fills ------------------
+        # If we already have exit-kind fills, don’t add another synthetic one.
+        has_exit_fill = False
+        try:
+            existing = await self.db.pool.fetch(
+                "SELECT fill_type, ts FROM fills WHERE position_id=$1 ORDER BY ts ASC", pid
+            )
+            for r in existing:
+                k = (r["fill_type"] or "").upper()
+                if k.startswith("TP") or k.startswith("SL") or "FALLBACK" in k or "TIME_EXIT" in k:
+                    has_exit_fill = True
+                    break
+            if (not has_exit_fill) and fills:
+                for ts, px, q, _ in fills:
+                    await self.db.add_fill(pid, closing_order_type, float(px), float(q),
+                                        datetime.fromtimestamp(ts/1000.0, tz=timezone.utc))
+            elif (not has_exit_fill) and not fills:
+                await self.db.add_fill(pid, closing_order_type, float(avg_exit), float(exit_qty_needed), closed_at)
+        except Exception as e:
+            LOG.warning("Exit fill persistence skipped for %s: %s", symbol, e)
+
+        # ------------------ 5) Compute PnL ------------------
         def _pnl_linear(e_px, x_px, q, sd):
             return (e_px - x_px) * q if sd == "short" else (x_px - e_px) * q
 
-        bad_fills = (exit_qty_sum <= 0.0) or (abs(exit_qty_sum - entry_qty) > 0.05 * entry_qty)
-        if bad_fills:
-            LOG.warning("PnL fallback on %s: exit_qty %.6f vs entry_qty %.6f. Using direct formula.",
-                        symbol, exit_qty_sum, entry_qty)
-            # Use the best exit price we have (from a bound order, a trade, or ticker)
-            safe_exit_px = float(exit_price or entry_price)
-            total_pnl = _pnl_linear(entry_price, safe_exit_px, float(size), side)
-            avg_exit = safe_exit_px
-            pnl_pct = ((entry_price / avg_exit - 1.0) * 100.0) if side == "short" else ((avg_exit / entry_price - 1.0) * 100.0)
+        entry_notional = entry_price * abs(size)
+        if side == "short":
+            total_pnl = (entry_price - avg_exit) * abs(size)
+            pnl_pct = (entry_price / avg_exit - 1.0) * 100.0 if avg_exit > 0 else 0.0
         else:
-            if side == "short":
-                total_pnl = entry_notional - exit_notional
-                avg_exit = (exit_notional / exit_qty_sum) if exit_qty_sum > 0 else entry_price
-                pnl_pct = (entry_price / avg_exit - 1.0) * 100.0 if avg_exit > 0 else 0.0
-            else:
-                total_pnl = exit_notional - entry_notional
-                avg_exit = (exit_notional / exit_qty_sum) if exit_qty_sum > 0 else entry_price
-                pnl_pct = (avg_exit / entry_price - 1.0) * 100.0 if entry_price > 0 else 0.0
+            total_pnl = (avg_exit - entry_price) * abs(size)
+            pnl_pct = (avg_exit / entry_price - 1.0) * 100.0 if entry_price > 0 else 0.0
+
+        # If our fills are clearly incomplete (<80% of size), fall back to direct formula
+        if fills and (exit_qty_sum < 0.8 * abs(size)):
+            LOG.warning("Incomplete exit fills on %s: used %.6f / %.6f. Falling back to direct formula.",
+                        symbol, exit_qty_sum, abs(size))
+            total_pnl = _pnl_linear(entry_price, avg_exit, abs(size), side)
 
         holding_minutes = (closed_at - opened_at).total_seconds() / 60 if opened_at else 0.0
 
-        # 5) Post-trade analytics + fees (sum fees from recent trades in window if available)
-        mae_usd = mfe_usd = mae_over_atr = mfe_over_atr = 0.0
-        realized_vol_during_trade = btc_beta_during_trade = 0.0
-        fees_paid = 0.0
-        try:
-            since_ts = int((opened_at - timedelta(minutes=5)).timestamp() * 1000)
-            until_ts = int((closed_at + timedelta(minutes=5)).timestamp() * 1000)
-            my_trades = await self.exchange.fetch_my_trades(symbol, limit=200, since=since_ts)
-            for t in my_trades:
-                ts = int(t.get("timestamp") or 0)
-                if ts and since_ts <= ts <= until_ts:
-                    f = t.get("fee") or {}
-                    fees_paid += float(f.get("cost") or 0.0)
-        except Exception as e:
-            LOG.warning("Fee aggregation skipped for %s: %s", symbol, e)
-
+        # ------------------ 6) Persist ------------------
         await self.db.update_position(
             pid,
             status="CLOSED",
-            closed_at=closed_at,
+            closed_at=closed_at,                    # <- real close time, not now()
             exit_reason=closing_order_type,
             pnl=total_pnl,
-            pnl_pct=pnl_pct,
+            pnl_pct=pnl_pct,                        # keep same units as before (percent)
             holding_minutes=holding_minutes,
             avg_exit_price=avg_exit if 'avg_exit_price' in getattr(self.db, 'columns_positions', set()) else None,
             fees_paid=fees_paid
@@ -2173,110 +2197,12 @@ class LiveTrader:
         await self.risk.on_trade_close(total_pnl, self.tg)
         self.open_positions.pop(pid, None)
         self.last_exit[symbol] = closed_at
-        await self.tg.send(f"✅ {symbol} position closed. Total PnL ≈ {total_pnl:.2f} USDT")
+        await self.tg.send(f"✅ {symbol} position closed @ {avg_exit:.6g} | PnL ≈ {total_pnl:.2f} USDT")
 
+    # ---------------------------------------------------------------------------
+    # (end) finalize
+    # ---------------------------------------------------------------------------
 
-
-    async def _force_open_position(self, symbol: str):
-        """
-        Manually triggers a trade for testing. Still respects veto filters.
-        """
-        await self.tg.send(f"Force-open requested for {symbol}. Building signal…")
-        LOG.info("Manual trade requested for %s", symbol)
-
-        if any(p['symbol'] == symbol for p in self.open_positions.values()):
-            msg = f"⚠️ Cannot force open {symbol}: position already open."
-            LOG.warning(msg); await self.tg.send(msg); return
-
-        try:
-            current_market_regime = await self.regime_detector.get_current_regime()
-            eth_macd_data = None
-            try:
-                eth_ohlcv = await self.exchange.fetch_ohlcv('ETHUSDT', '4h', limit=100)
-                if eth_ohlcv:
-                    df_eth = pd.DataFrame(eth_ohlcv, columns=['timestamp','open','high','low','close','volume'])
-                    macd_df = ta.macd(df_eth['close'])
-                    latest = macd_df.iloc[-1]
-                    eth_macd_data = {"macd": latest['macd'], "signal": latest['signal'], "hist": latest['hist']}
-            except Exception as e:
-                LOG.warning("ETH MACD barometer failed: %s", e)
-
-            signal = await self._scan_symbol_for_signal(symbol, current_market_regime, eth_macd_data)
-            if signal is None:
-                msg = f"❌ Force open {symbol}: no signal."
-                LOG.error(msg); await self.tg.send(msg); return
-
-            # Optional meta gate for forced opens too (set FORCE_BYPASS_META=true to ignore)
-            if not bool(self.cfg.get("FORCE_BYPASS_META", False)):
-                pstar = self.cfg.get("META_PROB_THRESHOLD", None)
-                if pstar is not None and float(signal.win_probability) < float(pstar):
-                    await self.tg.send(f"⚠️ Gated by meta: p={signal.win_probability:.3f} < p*={float(pstar):.3f}")
-                    return
-
-            equity = await self.db.latest_equity() or 0.0
-            open_positions_count = len(self.open_positions)
-            ok, vetoes = filters.evaluate(
-                signal, listing_age_days=signal.listing_age_days,
-                open_positions=open_positions_count, equity=equity
-            )
-            if not ok:
-                await self.tg.send(f"⚠️ VETOED {symbol}: {' | '.join(vetoes)}")
-                return
-
-            await self.tg.send(f"✅ Proceeding with forced entry for {symbol}.")
-            await self._open_position(signal)
-
-        except Exception as e:
-            msg = f"❌ Force open error for {symbol}: {e}"
-            LOG.error(msg, exc_info=True); await self.tg.send(msg)
-
-    async def _force_close_position(self, pid: int, pos: Dict[str, Any], tag: str):
-        symbol = pos["symbol"]
-        size = float(pos["size"])
-        entry_price = float(pos["entry_price"])
-        side = (pos.get("side") or "SHORT").upper()
-
-        try:
-            await self.exchange.cancel_all_orders(symbol, params={"category": "linear"})
-            close_side = "sell" if side == "LONG" else "buy"
-            await self.exchange.create_market_order(
-                symbol, close_side, size, params={"reduceOnly": True, "category": "linear"}
-            )
-            LOG.info("Force-closed %s (pid %d) due to: %s", symbol, pid, tag)
-        except Exception as e:
-            LOG.warning("Force-close issue on %s: %s", symbol, e)
-
-        await asyncio.sleep(2)
-
-        exit_price = None
-        try:
-            my_trades = await self.exchange.fetch_my_trades(symbol, limit=10)
-            closing_trade = next(
-                (t for t in reversed(my_trades) if str(t.get("side","")).lower() == ("sell" if side == "LONG" else "buy")),
-                None
-            )
-            if closing_trade:
-                exit_price = float(closing_trade["price"])
-                LOG.info("Confirmed force-close fill for %s at %.8f", symbol, exit_price)
-        except Exception as e:
-            LOG.error("Error fetching force-close fill for %s: %s", symbol, e)
-
-        if not exit_price:
-            exit_price = float((await self.exchange.fetch_ticker(symbol))["last"])
-
-        pnl = (entry_price - exit_price) * size if side == "SHORT" else (exit_price - entry_price) * size
-        closed_at = datetime.now(timezone.utc)
-        holding_minutes = (closed_at - pos.get("opened_at", closed_at)).total_seconds()/60.0
-
-        await self.db.update_position(
-            pid, status="CLOSED", closed_at=closed_at, pnl=pnl,
-            exit_reason=tag, holding_minutes=holding_minutes
-        )
-        await self.db.add_fill(pid, tag, exit_price, size, closed_at)
-        await self.risk.on_trade_close(pnl, self.tg)
-        self.last_exit[symbol] = closed_at
-        self.open_positions.pop(pid, None)
-        await self.tg.send(f"⏰ {symbol} closed by {tag}. PnL ≈ {pnl:.2f} USDT")
 
 
 
