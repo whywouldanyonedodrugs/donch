@@ -32,8 +32,8 @@ ETH_BAROMETER_ENABLED: false        # as requested for testing
 REGIME_BLOCK_WHEN_DOWN: false       # let entries through while testing
 # optional sizing-by-prob (already supported in your bot)
 WINPROB_SIZING_ENABLED: true
-WINPROB_MIN_MULTIPLIER: 0.60
-WINPROB_MAX_MULTIPLIER: 1.5
+WINPROB_MIN_MULTIPLIER: 0.50
+WINPROB_MAX_MULTIPLIER: 1.8
 WINPROB_PROB_FLOOR: 0.45
 WINPROB_PROB_CAP: 0.85
 
