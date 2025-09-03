@@ -140,10 +140,12 @@ class DB:
             await conn.execute(TABLES_SQL)
 
     # --- NEW: safe, idempotent migration for VWAP-stack & fees columns ---
+
     @db_retry
     async def migrate_schema(self):
         """
         Adds VWAP-stack columns and fees_paid if they don't exist.
+        Also adds avg_exit_price for finalize() to persist average exit.
         Uses 'ALTER TABLE ... ADD COLUMN IF NOT EXISTS', which is idempotent and fast.
         """
         assert self.pool is not None
@@ -153,11 +155,13 @@ class DB:
                 "ALTER TABLE positions ADD COLUMN IF NOT EXISTS vwap_stack_expansion_pct_at_entry DOUBLE PRECISION",
                 "ALTER TABLE positions ADD COLUMN IF NOT EXISTS vwap_stack_slope_pph_at_entry DOUBLE PRECISION",
                 "ALTER TABLE positions ADD COLUMN IF NOT EXISTS vwap_stack_multiplier_at_entry DOUBLE PRECISION",
-                "ALTER TABLE positions ADD COLUMN IF NOT EXISTS fees_paid DOUBLE PRECISION"
+                "ALTER TABLE positions ADD COLUMN IF NOT EXISTS fees_paid DOUBLE PRECISION",
+                "ALTER TABLE positions ADD COLUMN IF NOT EXISTS avg_exit_price DOUBLE PRECISION"
             ]
             for sql in stmts:
                 await conn.execute(sql)
                 LOG.info("Migration OK: %s", sql)
+
 
     @db_retry
     async def insert_position(self, data: Dict[str, Any]) -> int:

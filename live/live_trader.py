@@ -2418,6 +2418,8 @@ class LiveTrader:
         Debounced via self._zero_finalize_backoff.
         """
         now = datetime.now(timezone.utc)
+        if not hasattr(self, "_zero_finalize_backoff"):
+            self._zero_finalize_backoff = {}
         last_try = self._zero_finalize_backoff.get(pid)
         if last_try and (now - last_try).total_seconds() < float(self.cfg.get("FINALIZE_BACKOFF_SEC", 120)):
             return  # too soon; skip noisy retries
@@ -2426,47 +2428,48 @@ class LiveTrader:
         # 1) try to detect which order closed it
         exit_price = None
         exit_kind  = "MANUAL_CLOSE"
-        for label, cid in (("TP", pos.get("tp_final_cid")),
-                           ("TP1", pos.get("tp1_cid")),
-                           ("SL", pos.get("sl_cid"))):
-            o = await self._fetch_by_cid(cid, symbol, silent=True)
-            if o and str(o.get("status","")).lower() == "closed":
-                exit_kind  = label
-                exit_price = o.get("average") or o.get("price")
+        try:
+            for label, cid in (("TP",   pos.get("tp_final_cid")),
+                            ("TP1",  pos.get("tp1_cid")),
+                            ("SL",   pos.get("sl_cid")),
+                            ("TRAIL", pos.get("sl_trail_cid"))):
+                if not cid:
+                    continue
+                o = await self._fetch_by_cid(cid, symbol, silent=True)
+                if o and str(o.get("status","")).lower() == "closed":
+                    exit_kind  = label
+                    px = o.get("average") or o.get("price")
+                    if px is not None:
+                        try: exit_price = float(px)
+                        except Exception: exit_price = None
+                    break
+
+            # 2) if still unknown, try trades around now; else use ticker last
+            if exit_price is None:
                 try:
-                    exit_price = float(exit_price) if exit_price is not None else None
+                    since_ts = int((now - timedelta(minutes=15)).timestamp() * 1000)
+                    trades = await self.exchange.fetch_my_trades(symbol, limit=100, since=since_ts)
+                    side = str(pos.get("side","")).lower()
+                    close_side = "sell" if side == "long" else "buy"
+                    for t in reversed(trades or []):
+                        if str(t.get("side","")).lower() == close_side:
+                            exit_price = float(t.get("price"))
+                            break
                 except Exception:
                     exit_price = None
-                break
 
-        # 2) if still unknown, try trades around now; else use ticker last
-        if exit_price is None:
-            try:
-                since_ts = int((now - timedelta(minutes=15)).timestamp() * 1000)
-                trades = await self.exchange.fetch_my_trades(symbol, limit=100, since=since_ts)
-                # pick the most recent trade with opposite side to the position
-                side = str(pos.get("side","")).lower()
-                close_side = "sell" if side == "long" else "buy"
-                for t in reversed(trades or []):
-                    if str(t.get("side","")).lower() == close_side:
-                        exit_price = float(t.get("price"))
-                        break
-            except Exception:
-                pass
-        if exit_price is None:
-            try:
-                tk = await self.exchange.fetch_ticker(symbol)
-                exit_price = float(tk.get("last") or tk.get("mark") or tk.get("index") or pos.get("entry_price"))
-            except Exception:
-                exit_price = float(pos.get("entry_price"))
+            if exit_price is None:
+                try:
+                    tk = await self.exchange.fetch_ticker(symbol)
+                    exit_price = float(tk.get("last") or tk.get("mark") or tk.get("index") or pos.get("entry_price"))
+                except Exception:
+                    exit_price = float(pos.get("entry_price"))
 
-        # 3) hand off to your finalize routine (uses the safe PnL fallback you added)
-        await self._finalize_position(
-            pid,
-            closing_order_type=exit_kind,
-            exit_price=exit_price,
-            closed_at=now,
-        )
+            # 3) hand off to the real finalize routine (correct signature)
+            await self._finalize_position(pid, pos, inferred_exit_reason=exit_kind)
+        except Exception as e:
+            LOG.exception("Finalize-zero safe failed for %s pid=%s: %s", symbol, pid, e)
+
 
 
     async def _find_pid_by_symbol(self, symbol: str, status: str = "CLOSED") -> Optional[int]:
@@ -2597,12 +2600,17 @@ class LiveTrader:
             }, indent=2))
 
         elif root == "/analyze":
-            await self.tg.send("🤖 Starting analysis… needs `bybit.csv`. Will send the report here.")
+            # Usage: /analyze [6h|daily|weekly|monthly|7d|30d|90d|180d|365d|all]
+            period = (parts[1].lower() if len(parts) >= 2 else "30d")
+            await self.tg.send(f"🔎 Running in-bot deep analysis for {period}…")
             try:
-                subprocess.Popen(["/opt/livefader/src/run_weekly_report.sh"])
+                text = await self._deep_analysis_text(period)
+                await self.tg.send(text)
             except Exception as e:
-                await self.tg.send(f"❌ Failed to start analysis: {e}")
+                await self.tg.send(f"❌ Analysis failed: {e}")
             return
+
+        
         elif root == "/recent":
             # /recent                → last 10 of all symbols
             # /recent XCNUSDT 5      → last 5 for XCNUSDT
@@ -2817,6 +2825,157 @@ class LiveTrader:
         except Exception as e:
             LOG.error("Failed to generate summary report: %s", e)
             return f"Error: Could not generate {period} report. Check logs."
+
+    async def _deep_analysis_text(self, period: str = "30d") -> str:
+        """
+        Compute an in-depth performance report over a period.
+
+        period: one of: '6h','daily','weekly','monthly','7d','30d','90d','180d','365d','all'
+        Uses equity_snapshots when available (preferred for CAGR/Sharpe/MAR),
+        otherwise synthesizes an equity curve from closed trades.
+        """
+        now = datetime.now(timezone.utc)
+        window_map = {
+            '6h': timedelta(hours=6),
+            'daily': timedelta(days=1),
+            'weekly': timedelta(weeks=1),
+            'monthly': timedelta(days=30),
+            '7d': timedelta(days=7),
+            '30d': timedelta(days=30),
+            '90d': timedelta(days=90),
+            '180d': timedelta(days=180),
+            '365d': timedelta(days=365),
+        }
+        if period not in window_map and period != 'all':
+            period = '30d'
+        start_time = None if period == 'all' else now - window_map[period]
+
+        # --- fetch closed trades
+        if start_time:
+            q = """SELECT id, symbol, side, opened_at, closed_at, size, entry_price, pnl, pnl_pct, fees_paid
+                FROM positions WHERE status='CLOSED' AND closed_at >= $1 ORDER BY closed_at ASC"""
+            rows = await self.db.pool.fetch(q, start_time)
+        else:
+            q = """SELECT id, symbol, side, opened_at, closed_at, size, entry_price, pnl, pnl_pct, fees_paid
+                FROM positions WHERE status='CLOSED' ORDER BY closed_at ASC"""
+            rows = await self.db.pool.fetch(q)
+
+        trades = [dict(r) for r in rows]
+        if not trades:
+            return "No closed trades in the selected window."
+
+        # --- equity curve (prefer snapshots)
+        async def _load_equity_curve():
+            if start_time:
+                eq = await self.db.pool.fetch(
+                    "SELECT ts, equity FROM equity_snapshots WHERE ts >= $1 ORDER BY ts ASC", start_time)
+            else:
+                eq = await self.db.pool.fetch("SELECT ts, equity FROM equity_snapshots ORDER BY ts ASC")
+            eq = [(r['ts'], float(r['equity'])) for r in eq]
+            if len(eq) >= 2:
+                return eq
+
+            # fallback synthetic from trades
+            seed = None
+            if start_time:
+                seed = await self.db.pool.fetchval(
+                    "SELECT equity FROM equity_snapshots WHERE ts < $1 ORDER BY ts DESC LIMIT 1", start_time)
+            seed = float(seed) if seed is not None else float(self.cfg.get('MIN_EQUITY_USDT', 1000.0))
+            cur = seed
+            curve = []
+            for t in trades:
+                cur += float(t.get('pnl') or 0.0) - float(t.get('fees_paid') or 0.0)
+                curve.append((t['closed_at'], cur))
+            return curve
+
+        eq_curve = await _load_equity_curve()
+        if len(eq_curve) < 2:
+            return "Not enough equity points to compute CAGR/Sharpe/MAR."
+
+        # helpers
+        def _max_drawdown(equities):
+            peak = equities[0][1]; max_dd = 0.0
+            for _, v in equities:
+                peak = max(peak, v)
+                dd = (v / peak) - 1.0
+                if dd < max_dd:
+                    max_dd = dd
+            return max_dd  # negative
+
+        def _cagr(equities):
+            start_ts, start_eq = equities[0]; end_ts, end_eq = equities[-1]
+            days = max(1.0, (end_ts - start_ts).total_seconds() / 86400.0)
+            years = days / 365.0
+            if start_eq <= 0 or end_eq <= 0:
+                return 0.0
+            return (end_eq / start_eq) ** (1.0 / years) - 1.0
+
+        # daily returns → Sharpe (rf=0), annualize by sqrt(365)
+        from collections import OrderedDict
+        by_day = OrderedDict()
+        for ts, eq in eq_curve:
+            by_day[ts.date()] = eq  # last of each day
+        daily = list(by_day.items())
+        rets = []
+        for i in range(1, len(daily)):
+            prev, cur = daily[i-1][1], daily[i][1]
+            if prev > 0:
+                rets.append((cur / prev) - 1.0)
+        if len(rets) >= 2:
+            mean_r = sum(rets) / len(rets)
+            std_r  = (sum((r - mean_r) ** 2 for r in rets) / (len(rets) - 1)) ** 0.5
+            import math
+            sharpe = (mean_r / std_r) * math.sqrt(365) if std_r > 0 else 0.0
+        else:
+            sharpe = 0.0
+
+        # PF, win stats
+        wins = [float(t['pnl']) for t in trades if float(t['pnl'] or 0) > 0]
+        losses = [float(t['pnl']) for t in trades if float(t['pnl'] or 0) < 0]
+        gross_profit = sum(wins); gross_loss = -sum(losses)
+        profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else float('inf')
+        win_rate = (len(wins) / len(trades)) * 100.0
+
+        cagr  = _cagr(eq_curve)
+        maxdd = _max_drawdown(eq_curve)         # negative
+        mar   = (cagr / abs(maxdd)) if maxdd < 0 else float('inf')
+
+        # Holding time
+        hold_min = [ (t['closed_at'] - t['opened_at']).total_seconds()/60.0
+                    for t in trades if t.get('closed_at') and t.get('opened_at') ]
+        avg_hold = (sum(hold_min)/len(hold_min)) if hold_min else 0.0
+
+        # MAE/MFE (optional columns)
+        avg_mae = avg_mfe = None
+        try:
+            # only if columns exist
+            if start_time:
+                recs = await self.db.pool.fetch(
+                    "SELECT mae_usd, mfe_usd FROM positions WHERE status='CLOSED' AND closed_at >= $1", start_time)
+            else:
+                recs = await self.db.pool.fetch("SELECT mae_usd, mfe_usd FROM positions WHERE status='CLOSED'")
+            mae_vals = [float(r['mae_usd']) for r in recs if r.get('mae_usd') is not None]
+            mfe_vals = [float(r['mfe_usd']) for r in recs if r.get('mfe_usd') is not None]
+            avg_mae = (sum(mae_vals)/len(mae_vals)) if mae_vals else None
+            avg_mfe = (sum(mfe_vals)/len(mfe_vals)) if mfe_vals else None
+        except Exception:
+            pass  # table likely doesn't have these columns
+
+        lines = [
+            f"📈 *Deep Analysis ({period})*",
+            f"Trades: {len(trades)}  |  Win%: {win_rate:.2f}%  |  PF: {profit_factor:.3f}",
+            f"CAGR: {cagr*100:.2f}%  |  MaxDD: {maxdd*100:.2f}%  |  MAR: {mar:.3f}",
+            f"Sharpe (daily, rf=0): {sharpe:.3f}  |  Avg hold: {avg_hold:.1f} min",
+        ]
+        if (avg_mae is not None) or (avg_mfe is not None):
+            lines.append(f"Avg MAE: {avg_mae:+.2f} USDT  |  Avg MFE: {avg_mfe:+.2f} USDT")
+        else:
+            lines.append("MAE/MFE: not captured in DB (optional).")
+
+        return "\n".join(lines)
+
+
+
 
     def _strategy_declared_side(self) -> str | None:
         """
