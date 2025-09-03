@@ -28,7 +28,7 @@ WINPROB_ARTIFACT_DIR: results/meta_export
 
 # live gate; can be tuned without re-exporting the model
 MIN_WINPROB_TO_TRADE: 0.45
-ETH_BAROMETER_ENABLED: false        # as requested for testing
+ETH_BAROMETER_ENABLED: true        # as requested for testing
 REGIME_BLOCK_WHEN_DOWN: false       # let entries through while testing
 # optional sizing-by-prob (already supported in your bot)
 WINPROB_SIZING_ENABLED: true
