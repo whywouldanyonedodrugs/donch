@@ -1,73 +1,61 @@
 #!/usr/bin/env python3
 """
-scripts/reconcile_from_bybit_csv.py
-===================================
-Fix historical rows in `positions` from a Bybit "Closed P&L" CSV export.
+scripts/reconcile_from_bybit_csv.py  (v3 – deterministic match)
+===============================================================
 
-What it does
-------------
-- Loads CSV with columns: Market, Order Quantity, Entry Price, Exit Price, Realized P&L, Trade time
-- For each CSV row (interpreted as a *fully closed* position), finds the best-matching *open* position
-  by symbol and timing (and with size/price fuzzy match) and marks it CLOSED with exit stats.
+Purpose
+-------
+Repair historical positions using a Bybit "Closed P&L" CSV by matching on:
+  (symbol, order quantity, entry price)  ← robust even when DB closed_at is wrong.
 
-Assumptions
------------
-- CSV is from Bybit "Closed P&L" (Derivatives → Closed P&L → Export).  # verified in docs
-- CSV 'Realized P&L' is *net* of trading & funding fees → write to `positions.pnl`.  # per Bybit docs
-- Bot is long-only (Donch). If you also have shorts, pass --side-filter to restrict.
-- Timestamps treated as UTC unless you pass --tz-offset-minutes.
-
-Safety
-------
-- Dry-run by default; requires --apply to modify DB.
-- Only updates rows where status != 'CLOSED' OR closed_at IS NULL.
-- Uses information_schema to detect optional columns (avg_exit_price, pnl_pct, fees_paid).
+What it updates
+---------------
+- status='CLOSED'
+- closed_at  ← CSV trade time (UTC, with optional tz offset)
+- avg_exit_price
+- pnl
+- pnl_pct (if entry_price * size is known)
 
 Usage
 -----
 python scripts/reconcile_from_bybit_csv.py \
   --csv /path/to/bybit-donch.csv \
-  --dsn "postgresql://user:pass@localhost:5432/trading" \
+  --dsn "postgresql://USER:PASS@HOST:5432/DB" \
   --apply
 
 Options
 -------
-  --csv PATH                       CSV file (Bybit Closed P&L export)
-  --dsn DSN                        Postgres DSN (or provide env DB_* vars)
-  --host/--port/--db/--user/--pw   If not using DSN
-  --tz-offset-minutes N            If your CSV times are not UTC (default: 0)
-  --symbol SYMBOL                  Only reconcile a single symbol (optional)
-  --since YYYY-MM-DD               Only reconcile trades closed on/after date (optional)
-  --side-filter LONG|SHORT         Restrict by side of DB positions (optional)
-  --size-tol 0.2                   Allowed relative diff |csv_qty - pos.size| / pos.size (default 0.2)
-  --price-tol 0.02                 Allowed relative diff on entry price (default 2%)
-  --apply                          Actually write changes (omit for dry-run)
+--tz-offset-minutes INT   # if CSV times are local; UTC+3 → 180
+--size-tol 0.001          # relative tolerance for quantity (default 0.1%)
+--price-tol 0.001         # relative tolerance for entry price (default 0.1%)
+--since YYYY-MM-DD        # optional lower bound by CSV trade time (after tz shift)
+--symbol SYMBOL           # restrict to one symbol (optional)
+--apply                   # actually write changes (omit = dry-run)
+--verbose                 # print per-row diagnostics
 """
-from __future__ import annotations
 
-import argparse
-import asyncio
-import asyncpg
+from __future__ import annotations
+import argparse, asyncio, asyncpg, os, sys
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
-import math
-import os
-import sys
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
-# ---------- Helpers ----------
+# ---------- CSV parsing ----------
 
-def _parse_ts(s: str, tz_offset_min: int) -> datetime:
-    # Bybit CSV sample: "00:02 2025-09-03"
-    # If format drifts, try pandas.to_datetime as fallback.
-    try:
-        dt = datetime.strptime(s.strip(), "%H:%M %Y-%m-%d")
-    except Exception:
-        dt = pd.to_datetime(s, utc=False).to_pydatetime()
-    dt = dt.replace(tzinfo=timezone.utc) + timedelta(minutes=tz_offset_min)
-    return dt
+def _parse_trade_time(s: str, tz_offset_min: int) -> datetime:
+    s = str(s).strip()
+    # CSV samples seen: "00:02 2025-09-03" and "03/09/2025 00:02"
+    for fmt in ("%H:%M %Y-%m-%d", "%d/%m/%Y %H:%M", "%m/%d/%Y %H:%M"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            return dt.replace(tzinfo=timezone.utc) + timedelta(minutes=tz_offset_min)
+        except Exception:
+            pass
+    # Fallback to pandas
+    dt = pd.to_datetime(s, utc=False).to_pydatetime().replace(tzinfo=timezone.utc)
+    return dt + timedelta(minutes=tz_offset_min)
 
 @dataclass
 class CsvRow:
@@ -75,42 +63,32 @@ class CsvRow:
     qty: float
     entry_px: float
     exit_px: float
-    realized_pnl: float
+    pnl: float
     closed_at: datetime
 
-@dataclass
-class Position:
-    id: int
-    symbol: str
-    side: Optional[str]
-    size: Optional[float]
-    entry_price: Optional[float]
-    opened_at: datetime
-    status: Optional[str]
-    closed_at: Optional[datetime]
-
-# ---------- CSV ----------
-
-def load_bybit_closed_pnl_csv(path: str, tz_offset_min: int) -> List[CsvRow]:
+def load_csv(path: str, tz_offset_min: int, symbol: Optional[str], since_date: Optional[datetime.date]) -> List[CsvRow]:
     df = pd.read_csv(path)
-    required = ["Market", "Order Quantity", "Entry Price", "Exit Price", "Realized P&L", "Trade time"]
+    required = ["Market","Order Quantity","Entry Price","Exit Price","Realized P&L","Trade time"]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise SystemExit(f"CSV missing columns: {missing} (have: {list(df.columns)})")
 
+    df["__ts"] = df["Trade time"].apply(lambda x: _parse_trade_time(x, tz_offset_min))
+    if symbol:
+        df = df[df["Market"].astype(str).str.upper() == symbol.upper()]
+    if since_date:
+        df = df[df["__ts"].dt.date >= since_date]
+
     rows: List[CsvRow] = []
     for _, r in df.iterrows():
-        rows.append(
-            CsvRow(
-                symbol=str(r["Market"]).strip(),
-                qty=float(r["Order Quantity"]),
-                entry_px=float(r["Entry Price"]),
-                exit_px=float(r["Exit Price"]),
-                realized_pnl=float(r["Realized P&L"]),
-                closed_at=_parse_ts(str(r["Trade time"]), tz_offset_min),
-            )
-        )
-    # chronological
+        rows.append(CsvRow(
+            symbol=str(r["Market"]).strip(),
+            qty=float(r["Order Quantity"]),
+            entry_px=float(r["Entry Price"]),
+            exit_px=float(r["Exit Price"]),
+            pnl=float(r["Realized P&L"]),
+            closed_at=r["__ts"],
+        ))
     rows.sort(key=lambda x: x.closed_at)
     return rows
 
@@ -119,143 +97,125 @@ def load_bybit_closed_pnl_csv(path: str, tz_offset_min: int) -> List[CsvRow]:
 async def make_pool(args) -> asyncpg.Pool:
     if args.dsn:
         return await asyncpg.create_pool(dsn=args.dsn)
-    host = args.host or os.getenv("DB_HOST", "localhost")
-    port = int(args.port or os.getenv("DB_PORT", "5432"))
-    db   = args.db   or os.getenv("DB_NAME", "trading")
-    user = args.user or os.getenv("DB_USER", "postgres")
-    pw   = args.pw   or os.getenv("DB_PASSWORD", "")
-    return await asyncpg.create_pool(host=host, port=port, database=db, user=user, password=pw)
+    return await asyncpg.create_pool(
+        host=args.host or os.getenv("DB_HOST","localhost"),
+        port=int(args.port or os.getenv("DB_PORT","5432")),
+        database=args.db or os.getenv("DB_NAME","trading"),
+        user=args.user or os.getenv("DB_USER","postgres"),
+        password=args.pw or os.getenv("DB_PASSWORD",""),
+    )
 
-async def get_position_columns(conn: asyncpg.Connection) -> Dict[str, bool]:
-    rows = await conn.fetch("""
-        SELECT column_name FROM information_schema.columns
-        WHERE table_name='positions'
-    """)
-    cols = {r["column_name"] for r in rows}
-    need = ["id","symbol","opened_at","status"]  # minimal required
-    for c in need:
+async def detect_columns(conn: asyncpg.Connection) -> Dict[str,bool]:
+    cols = {r["column_name"] for r in await conn.fetch(
+        "SELECT column_name FROM information_schema.columns WHERE table_name='positions'"
+    )}
+    for c in ("id","symbol","size","entry_price","opened_at"):
         if c not in cols:
-            raise SystemExit(f"positions.{c} column missing; cannot proceed.")
+            raise SystemExit(f"positions.{c} missing; cannot reconcile.")
     return {c: (c in cols) for c in cols}
 
-async def fetch_open_positions(conn: asyncpg.Connection,
-                               symbol: Optional[str],
-                               side_filter: Optional[str]) -> List[Position]:
-    where = ["(status IS DISTINCT FROM 'CLOSED' OR closed_at IS NULL)"]
-    params: List[Any] = []
+@dataclass
+class Position:
+    id: int
+    symbol: str
+    size: float
+    entry_price: float
+    opened_at: datetime
+    status: Optional[str]
+    closed_at: Optional[datetime]
+    pnl: Optional[float]
+
+async def load_positions(conn: asyncpg.Connection, symbol: Optional[str]) -> List[Position]:
+    where = []
+    args: List[Any] = []
     if symbol:
-        where.append("symbol = $%d" % (len(params)+1))
-        params.append(symbol)
+        where.append("symbol = $1"); args.append(symbol)
     sql = f"""
-        SELECT id, symbol, side, size, entry_price, opened_at, status, closed_at
+        SELECT id, symbol, size, entry_price, opened_at, status, closed_at, pnl
         FROM positions
-        WHERE {' AND '.join(where)}
-        ORDER BY symbol ASC, opened_at ASC, id ASC
+        {"WHERE " + " AND ".join(where) if where else ""}
+        ORDER BY symbol, opened_at, id
     """
-    rows = await conn.fetch(sql, *params)
-    pos: List[Position] = []
+    rows = await conn.fetch(sql, *args)
+    out: List[Position] = []
     for r in rows:
-        pos.append(Position(
-            id=r["id"], symbol=r["symbol"], side=r.get("side"),
-            size=float(r["size"]) if r["size"] is not None else None,
-            entry_price=float(r["entry_price"]) if r["entry_price"] is not None else None,
-            opened_at=r["opened_at"], status=r["status"], closed_at=r["closed_at"]
+        out.append(Position(
+            id=r["id"], symbol=r["symbol"], size=float(r["size"] or 0.0),
+            entry_price=float(r["entry_price"] or 0.0),
+            opened_at=r["opened_at"], status=r.get("status"),
+            closed_at=r.get("closed_at"), pnl=float(r["pnl"]) if r["pnl"] is not None else None
         ))
-    # optional side_filter
-    if side_filter:
-        side_filter = side_filter.upper()
-        pos = [p for p in pos if (p.side or "").upper() == side_filter]
-    return pos
+    return out
 
-# ---------- Matching logic ----------
+# ---------- Matching (symbol + size + entry price) ----------
 
-def rel_diff(a: Optional[float], b: Optional[float]) -> float:
-    if a is None or b is None:
-        return math.inf
+def rel_diff(a: float, b: float) -> float:
     denom = max(1e-12, abs(a))
     return abs(a - b) / denom
 
-def best_match(csv: CsvRow, candidates: List[Position], size_tol: float, price_tol: float) -> Optional[Position]:
-    # pick the earliest still-open pos for the same symbol with opened_at <= csv.closed_at
-    # prefer tight match on size and entry_price; fall back to timing-only if needed
-    same_sym = [p for p in candidates if p.symbol == csv.symbol and p.opened_at <= csv.closed_at]
-    if not same_sym:
+def build_index(positions: List[Position]):
+    by_sym: Dict[str, List[Position]] = {}
+    for p in positions:
+        by_sym.setdefault(p.symbol, []).append(p)
+    return by_sym
+
+def match_row(row: CsvRow, cands: List[Position], size_tol: float, price_tol: float, used_ids: set[int]) -> Optional[Position]:
+    if not cands:
         return None
-    # rank by composite score
-    def score(p: Position) -> Tuple[int, float, float, float]:
-        szd = rel_diff(p.size, csv.qty)
-        pxd = rel_diff(p.entry_price, csv.entry_px)
-        # primary filters
-        ok = int((szd <= size_tol) and (pxd <= price_tol))
-        # tie-breakers: closer entry time to close time, then smaller diffs
-        time_gap = abs((csv.closed_at - p.opened_at).total_seconds())
-        return (-ok, time_gap, szd, pxd)
-    same_sym.sort(key=score)
-    pick = same_sym[0]
-    # allow fallback if no "ok" match
-    if score(pick)[0] != -1:
-        # loosen if nothing fits: accept timing-only
-        pass
-    return pick
+    # filter by tolerances
+    filt = []
+    for p in cands:
+        if p.id in used_ids:
+            continue
+        if rel_diff(p.size, row.qty) <= size_tol and rel_diff(p.entry_price, row.entry_px) <= price_tol:
+            filt.append(p)
+    if not filt:
+        return None
+    # choose nearest opened_at to the CSV closed time (stable tie-breaker)
+    filt.sort(key=lambda p: abs((p.opened_at - row.closed_at).total_seconds()))
+    return filt[0]
 
 # ---------- Reconcile ----------
 
 async def reconcile(args) -> int:
-    csv_rows = load_bybit_closed_pnl_csv(args.csv, args.tz_offset_minutes)
+    csv_rows = load_csv(args.csv, args.tz_offset_minutes, args.symbol, args.since)
     pool = await make_pool(args)
     updated = 0
-    unmatched = 0
+    unmatched: List[CsvRow] = []
     async with pool.acquire() as conn:
-        cols = await get_position_columns(conn)
-        pos = await fetch_open_positions(conn, args.symbol, args.side_filter)
-
-        # Group candidates by symbol for speed
-        by_sym: Dict[str, List[Position]] = {}
-        for p in pos:
-            by_sym.setdefault(p.symbol, []).append(p)
+        cols = await detect_columns(conn)
+        pos = await load_positions(conn, args.symbol)
+        idx = build_index(pos)
+        used_ids: set[int] = set()
 
         async with conn.transaction():
             for row in csv_rows:
-                if args.since and row.closed_at.date() < args.since:
-                    continue
-                cands = by_sym.get(row.symbol, [])
-                match = best_match(row, cands, args.size_tol, args.price_tol)
-                if not match:
-                    unmatched += 1
-                    print(f"[WARN] Unmatched CSV trade {row.symbol} @ {row.closed_at} qty={row.qty} entry={row.entry_px} exit={row.exit_px} pnl={row.realized_pnl:+.2f}")
-                    continue
+                cands = idx.get(row.symbol, [])
+                p = match_row(row, cands, args.size_tol, args.price_tol, used_ids)
+                if not p:
+                    unmatched.append(row); continue
 
-                # Build UPDATE set list dynamically based on available columns
-                sets = []
-                vals: List[Any] = []
-
-                if "status" in cols:           sets.append("status = 'CLOSED'")
-                if "closed_at" in cols:        sets.append(f"closed_at = ${len(vals)+1}");    vals.append(row.closed_at)
-                if "avg_exit_price" in cols:   sets.append(f"avg_exit_price = ${len(vals)+1}"); vals.append(row.exit_px)
-                if "pnl" in cols:              sets.append(f"pnl = ${len(vals)+1}");          vals.append(row.realized_pnl)
+                sets, vals = [], []
+                if "status" in cols:             sets.append("status='CLOSED'")
+                if "closed_at" in cols:          sets.append(f"closed_at = ${len(vals)+1}");     vals.append(row.closed_at)
+                if "avg_exit_price" in cols:     sets.append(f"avg_exit_price = ${len(vals)+1}"); vals.append(row.exit_px)
+                if "pnl" in cols:                sets.append(f"pnl = ${len(vals)+1}");           vals.append(row.pnl)
                 if "pnl_pct" in cols:
-                    # pnl% vs notional at entry (if we have both fields)
-                    if match.entry_price is not None and match.size is not None and abs(match.entry_price*match.size) > 0:
-                        pnl_pct = row.realized_pnl / (abs(match.entry_price) * abs(match.size))
-                    else:
-                        pnl_pct = None
-                    if pnl_pct is not None:
-                        sets.append(f"pnl_pct = ${len(vals)+1}"); vals.append(pnl_pct)
+                    denom = abs(p.entry_price) * abs(p.size)
+                    if denom > 0:
+                        sets.append(f"pnl_pct = ${len(vals)+1}"); vals.append(row.pnl / denom)
 
-                if not sets:
-                    print("[INFO] Nothing to update (no recognized columns).")
-                    continue
-
-                vals.append(match.id)
+                vals.append(p.id)
                 sql = f"UPDATE positions SET {', '.join(sets)} WHERE id = ${len(vals)}"
                 if args.apply:
                     await conn.execute(sql, *vals)
-                updated += 1
-                # Remove the matched candidate so it won't be reused
-                by_sym[row.symbol] = [p for p in cands if p.id != match.id]
+                used_ids.add(p.id); updated += 1
 
     mode = "APPLY" if args.apply else "DRY-RUN"
-    print(f"[{mode}] Updated={updated}, Unmatched CSV rows={unmatched}")
+    print(f"[{mode}] Updated={updated}, Unmatched CSV rows={len(unmatched)}")
+    if unmatched or args.verbose:
+        for u in unmatched:
+            print(f"[MISS] {u.symbol} qty={u.qty} entry={u.entry_px} exit={u.exit_px} @ {u.closed_at.isoformat()}")
     await pool.close()
     return 0
 
@@ -265,18 +225,14 @@ def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", required=True)
     ap.add_argument("--dsn")
-    ap.add_argument("--host")
-    ap.add_argument("--port")
-    ap.add_argument("--db")
-    ap.add_argument("--user")
-    ap.add_argument("--pw")
+    ap.add_argument("--host"); ap.add_argument("--port"); ap.add_argument("--db"); ap.add_argument("--user"); ap.add_argument("--pw")
     ap.add_argument("--tz-offset-minutes", type=int, default=0)
+    ap.add_argument("--size-tol", type=float, default=0.001)
+    ap.add_argument("--price-tol", type=float, default=0.001)
     ap.add_argument("--symbol")
     ap.add_argument("--since", help="YYYY-MM-DD")
-    ap.add_argument("--side-filter", choices=["LONG","SHORT"])
-    ap.add_argument("--size-tol", type=float, default=0.20)
-    ap.add_argument("--price-tol", type=float, default=0.02)
     ap.add_argument("--apply", action="store_true")
+    ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
     if args.since:
         args.since = datetime.strptime(args.since, "%Y-%m-%d").date()
