@@ -48,11 +48,11 @@ FIXED_RISK_USDT    = 10.0
 RISK_PCT           = 0.05         # 0.5 %
 SLIPPAGE_BUFFER_PCT = 0.0005
 
-WINPROB_SIZE_FLOOR = 1.00
-WINPROB_SIZE_CAP   = 1.00
+#WINPROB_SIZE_FLOOR = 1.00
+#WINPROB_SIZE_CAP   = 1.00
 
 # ── stop / targets ─────────────────────────────────────────────────────────
-SL_ATR_MULT             = 1.8
+SL_ATR_MULT             = 2.0
 FINAL_TP_ENABLED        = True
 FINAL_TP_ATR_MULT       = 8.0
 PARTIAL_TP_ENABLED      = False
@@ -185,7 +185,7 @@ REGIME_ATR_MULT = 2.0        # ATR multiplier for the Keltner bands.
 # --- ETH MACD BAROMETER FILTER (NEW) ---
 ETH_BAROMETER_ENABLED = True
 UNFAVORABLE_MODE = "RESIZE" 
-UNFAVORABLE_RISK_RESIZE_FACTOR = 0.7 
+UNFAVORABLE_RISK_RESIZE_FACTOR = 0.6 
 
 # Debounce finalize of manual closes
 FINALIZE_BACKOFF_SEC        = 120   # don't retry finalize more often than this

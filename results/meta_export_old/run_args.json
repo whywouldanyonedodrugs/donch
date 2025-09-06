@@ -1,6 +1,6 @@
 {
   "trades_csv": "results/trades.csv",
-  "signals_parquet": "signals",
+  "signals_parquet": "signals/signals.parquet",
   "target": "mfe_k",
   "r_threshold": 0.0,
   "mfe_k": 2.0,

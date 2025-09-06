@@ -27,15 +27,15 @@ WINPROB_MODEL_DIR: "results/meta_export"
 WINPROB_ARTIFACT_DIR: results/meta_export
 
 # live gate; can be tuned without re-exporting the model
-MIN_WINPROB_TO_TRADE: 0.45
+MIN_WINPROB_TO_TRADE: 0.60
 ETH_BAROMETER_ENABLED: true        # as requested for testing
 REGIME_BLOCK_WHEN_DOWN: false       # let entries through while testing
 # optional sizing-by-prob (already supported in your bot)
 WINPROB_SIZING_ENABLED: true
 WINPROB_MIN_MULTIPLIER: 0.50
-WINPROB_MAX_MULTIPLIER: 1.8
-WINPROB_PROB_FLOOR: 0.45
-WINPROB_PROB_CAP: 0.85
+WINPROB_MAX_MULTIPLIER: 2.00
+WINPROB_PROB_FLOOR: 0.60
+WINPROB_PROB_CAP: 0.90
 
 
 UNIVERSE_CTX_REFRESH_MIN: 1440 
@@ -72,3 +72,14 @@ CORR_SIZING_RHO_LO: 0.60
 CORR_SIZING_RHO_HI: 0.90
 CORR_SIZING_LO: 0.70
 CORR_SIZING_HI: 1.00
+
+
+
+
+# --- OI & Funding feature pack (meta-model parity) ---
+OI_FUNDING_FEATURES_ENABLED: true
+OI_TIMEFRAME: "5m"                 # 5m base grid
+OI_LOOKBACK_DAYS: 7                # to compute 7d z-scores
+FUNDING_LOOKBACK_DAYS: 7           # forward-filled to 5m
+FUNDING_UPSAMPLE_TO_5M: true       # keep on by default (matches training)
+META_REQUIRED: true                # (optional) fail-closed on feature mismatch

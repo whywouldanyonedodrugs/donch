@@ -81,6 +81,56 @@ class ExchangeProxy:
         setattr(self, name, wrapper)
         return wrapper
 
+    async def fetch_open_interest_history(self, symbol: str, timeframe: str = "5m",
+                                          since: int | None = None, limit: int | None = None, params: dict | None = None):
+        """
+        Unified wrapper over ccxt.fetchOpenInterestHistory.
+        - Bybit expects 'period' like '5min', '15min', '1h' in params; ccxt handles mapping for v5.
+        - We still translate common tf strings to vendor flavors for robustness.
+        Returns: list of { 'timestamp': ms, 'openInterest': float, ... }
+        """
+        ex = self._exchange
+        if not hasattr(ex, "fetchOpenInterestHistory"):
+            return []
+
+        # Map common tfs to Bybit period strings (ccxt usually handles this; keep as fallback)
+        tf_map = {"1m": "1min", "3m": "3min", "5m": "5min", "15m": "15min", "30m": "30min",
+                  "1h": "1h", "4h": "4h", "1d": "1d"}
+        period = tf_map.get(str(timeframe), timeframe)
+
+        p = dict(params or {})
+        # For Bybit v5, ccxt may expect {'interval': '5', 'unit': 'min'} or 'period': '5min'; ccxt normalizes.
+        # Provide both keys harmlessly; the API will ignore extras.
+        p.setdefault("period", period)
+        try:
+            out = await ex.fetchOpenInterestHistory(symbol, timeframe=timeframe, since=since, limit=limit, params=p)
+            # Some ccxt versions return a dict with 'data'
+            if isinstance(out, dict) and "data" in out:
+                out = out["data"]
+            return out or []
+        except Exception:
+            return []
+
+    async def fetch_funding_rate_history(self, symbol: str,
+                                         since: int | None = None, limit: int | None = None, params: dict | None = None):
+        """
+        Unified wrapper over ccxt.fetchFundingRateHistory.
+        Returns: list of { 'timestamp': ms, 'fundingRate': float, ... }
+        Note: venues typically store settlement points; we forward-fill to 5m later.
+        """
+        ex = self._exchange
+        if not hasattr(ex, "fetchFundingRateHistory"):
+            return []
+        p = dict(params or {})
+        try:
+            # fetchFundingRateHistory is often limited (e.g., ~200 rows); ExchangeProxy's callers may page externally.
+            out = await ex.fetchFundingRateHistory(symbol, since=since, limit=limit, params=p)
+            if isinstance(out, dict) and "data" in out:
+                out = out["data"]
+            return out or []
+        except Exception:
+            return []
+
     async def close(self):
         """Gracefully close the underlying exchange connection."""
         await self._exchange.close()

@@ -51,6 +51,8 @@ from pydantic import Field, ValidationError
 from pydantic_settings import BaseSettings
 from .strategy_engine import StrategyEngine
 
+from .oi_funding import fetch_series_5m, compute_oi_funding_features
+
 import logging
 logging.getLogger("watchdog").setLevel(logging.WARNING)
 logging.getLogger("watchdog.observers.inotify_buffer").setLevel(logging.WARNING)
@@ -944,6 +946,21 @@ class LiveTrader:
             rs_z = float(univ.get("rs_z", 0.0) or 0.0)
             turnover_z = float(univ.get("turnover_z", 0.0) or 0.0)
 
+            # --- NEW: OI + Funding feature pack (5m-aligned, 7d parity with training) ---
+            oi_features: Dict[str, float] = {}
+            try:
+                if bool(self.cfg.get("OI_FUNDING_FEATURES_ENABLED", True)):
+                    look_oi_days = int(self.cfg.get("OI_LOOKBACK_DAYS", 7))
+                    look_fr_days = int(self.cfg.get("FUNDING_LOOKBACK_DAYS", 7))
+                    # Pull historical series (paged via ExchangeProxy)
+                    oi_5m, fr_5m = await fetch_series_5m(
+                        self.exchange, symbol, lookback_days_oi=look_oi_days, lookback_days_funding=look_fr_days
+                    )
+                    # Align to our base df5 and compute 13 features
+                    oi_features = compute_oi_funding_features(df5, oi_5m, fr_5m)
+            except Exception as e:
+                LOG.debug("OI/Funding feature pack failed for %s: %s", symbol, e)
+                oi_features = {}
 
 
             meta_row = {
@@ -987,7 +1004,22 @@ class LiveTrader:
                 "pullback_type": str(pullback_type),
                 "regime_1d": str(regime_1d),
             }
-
+            # Merge OI+Funding features (exact names match training)
+            meta_row.update({
+                "oi_level": oi_features.get("oi_level"),
+                "oi_notional_est": oi_features.get("oi_notional_est"),
+                "oi_pct_1h": oi_features.get("oi_pct_1h"),
+                "oi_pct_4h": oi_features.get("oi_pct_4h"),
+                "oi_pct_1d": oi_features.get("oi_pct_1d"),
+                "oi_z_7d": oi_features.get("oi_z_7d"),
+                "oi_chg_norm_vol_1h": oi_features.get("oi_chg_norm_vol_1h"),
+                "oi_price_div_1h": oi_features.get("oi_price_div_1h"),
+                "funding_rate": oi_features.get("funding_rate"),
+                "funding_abs": oi_features.get("funding_abs"),
+                "funding_z_7d": oi_features.get("funding_z_7d"),
+                "funding_rollsum_3d": oi_features.get("funding_rollsum_3d"),
+                "funding_oi_div": oi_features.get("funding_oi_div"),
+            })
 
             # -------------- Score meta (even on rejects) ----------
             p = self._score_winprob_safe(symbol, meta_row)
