@@ -2237,8 +2237,54 @@ class LiveTrader:
 
 
 
+    async def _force_close_position(self, pid: int, pos: Dict[str, Any], tag: str):
+        symbol = pos["symbol"]
+        size = float(pos["size"])
+        entry_price = float(pos["entry_price"])
+        side = (pos.get("side") or "SHORT").upper()
 
+        try:
+            await self.exchange.cancel_all_orders(symbol, params={"category": "linear"})
+            close_side = "sell" if side == "LONG" else "buy"
+            await self.exchange.create_market_order(
+                symbol, close_side, size, params={"reduceOnly": True, "category": "linear"}
+            )
+            LOG.info("Force-closed %s (pid %d) due to: %s", symbol, pid, tag)
+        except Exception as e:
+            LOG.warning("Force-close issue on %s: %s", symbol, e)
 
+        await asyncio.sleep(2)
+
+        exit_price = None
+        try:
+            my_trades = await self.exchange.fetch_my_trades(symbol, limit=10)
+            closing_trade = next(
+                (t for t in reversed(my_trades)
+                 if str(t.get("side","")).lower() == ("sell" if side == "LONG" else "buy")),
+                None
+            )
+            if closing_trade:
+                exit_price = float(closing_trade["price"])
+                LOG.info("Confirmed force-close fill for %s at %.8f", symbol, exit_price)
+        except Exception as e:
+            LOG.error("Error fetching force-close fill for %s: %s", symbol, e)
+
+        if not exit_price:
+            exit_price = float((await self.exchange.fetch_ticker(symbol))["last"])
+
+        pnl = (entry_price - exit_price) * size if side == "SHORT" else (exit_price - entry_price) * size
+        closed_at = datetime.now(timezone.utc)
+        holding_minutes = (closed_at - pos.get("opened_at", closed_at)).total_seconds()/60.0
+
+        await self.db.update_position(
+            pid, status="CLOSED", closed_at=closed_at, pnl=pnl,
+            exit_reason=tag, holding_minutes=holding_minutes
+        )
+        await self.db.add_fill(pid, tag, exit_price, size, closed_at)
+        await self.risk.on_trade_close(pnl, self.tg)
+        self.last_exit[symbol] = closed_at
+        self.open_positions.pop(pid, None)
+        await self.tg.send(f"⏰ {symbol} closed by {tag}. PnL ≈ {pnl:.2f} USDT")
 
 
 
@@ -2549,6 +2595,7 @@ class LiveTrader:
             symbol = parts[1].upper()
             asyncio.create_task(self._force_open_position(symbol))
             return
+        
 
         elif root == "/status":
             await self.tg.send(json.dumps({
