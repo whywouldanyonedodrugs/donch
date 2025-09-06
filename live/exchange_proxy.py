@@ -81,55 +81,137 @@ class ExchangeProxy:
         setattr(self, name, wrapper)
         return wrapper
 
-    async def fetch_open_interest_history(self, symbol: str, timeframe: str = "5m",
-                                          since: int | None = None, limit: int | None = None, params: dict | None = None):
+    # ─────────────────────────────────────────────────────────────────────
+    # Open Interest & Funding History helpers (Bybit V5 + CCXT unified)
+    # ─────────────────────────────────────────────────────────────────────
+    async def fetch_open_interest_history_5m(self, symbol: str, *, lookback_days: int = 7) -> list[dict]:
         """
-        Unified wrapper over ccxt.fetchOpenInterestHistory.
-        - Bybit expects 'period' like '5min', '15min', '1h' in params; ccxt handles mapping for v5.
-        - We still translate common tf strings to vendor flavors for robustness.
-        Returns: list of { 'timestamp': ms, 'openInterest': float, ... }
-        """
-        ex = self._exchange
-        if not hasattr(ex, "fetchOpenInterestHistory"):
-            return []
-
-        # Map common tfs to Bybit period strings (ccxt usually handles this; keep as fallback)
-        tf_map = {"1m": "1min", "3m": "3min", "5m": "5min", "15m": "15min", "30m": "30min",
-                  "1h": "1h", "4h": "4h", "1d": "1d"}
-        period = tf_map.get(str(timeframe), timeframe)
-
-        p = dict(params or {})
-        # For Bybit v5, ccxt may expect {'interval': '5', 'unit': 'min'} or 'period': '5min'; ccxt normalizes.
-        # Provide both keys harmlessly; the API will ignore extras.
-        p.setdefault("period", period)
-        try:
-            out = await ex.fetchOpenInterestHistory(symbol, timeframe=timeframe, since=since, limit=limit, params=p)
-            # Some ccxt versions return a dict with 'data'
-            if isinstance(out, dict) and "data" in out:
-                out = out["data"]
-            return out or []
-        except Exception:
-            return []
-
-    async def fetch_funding_rate_history(self, symbol: str,
-                                         since: int | None = None, limit: int | None = None, params: dict | None = None):
-        """
-        Unified wrapper over ccxt.fetchFundingRateHistory.
-        Returns: list of { 'timestamp': ms, 'fundingRate': float, ... }
-        Note: venues typically store settlement points; we forward-fill to 5m later.
+        Return a list of dicts: [{"timestamp": ms, "openInterest": float}, ...] on a 5-minute grid,
+        newest last. Robust to both CCXT unified and direct Bybit V5 endpoints.
         """
         ex = self._exchange
-        if not hasattr(ex, "fetchFundingRateHistory"):
-            return []
-        p = dict(params or {})
-        try:
-            # fetchFundingRateHistory is often limited (e.g., ~200 rows); ExchangeProxy's callers may page externally.
-            out = await ex.fetchFundingRateHistory(symbol, since=since, limit=limit, params=p)
-            if isinstance(out, dict) and "data" in out:
-                out = out["data"]
-            return out or []
-        except Exception:
-            return []
+        interval = "5m"  # CCXT timeframe
+        intervalTime = "5min"  # Bybit V5 param
+
+        # Try CCXT unified first
+        if getattr(ex, "has", {}).get("fetchOpenInterestHistory"):
+            # CCXT returns newest-first; we normalize to newest-last
+            rows = await ex.fetchOpenInterestHistory(symbol, timeframe=interval)
+            if not rows:
+                return []
+            # rows may be list of dicts or list of [ts, oi]
+            out = []
+            if isinstance(rows[0], dict):
+                for r in rows:
+                    ts = int(r.get("timestamp") or r.get("time") or r.get("datetime") or 0)
+                    oi = r.get("openInterest") or r.get("open_interest") or r.get("value") or r.get("openInterestValue")
+                    try: oi = float(oi)
+                    except Exception: oi = None
+                    if ts and oi is not None:
+                        out.append({"timestamp": ts, "openInterest": oi})
+            else:
+                for ts, oi, *_ in rows:
+                    out.append({"timestamp": int(ts), "openInterest": float(oi)})
+            out.sort(key=lambda x: x["timestamp"])
+            return out
+
+        # Fallback: direct Bybit V5 public endpoint through CCXT (async)
+        if ex.id == "bybit" and hasattr(ex, "publicGetV5MarketOpenInterest"):
+            now_ms = ex.milliseconds()
+            start_ms = now_ms - lookback_days * 24 * 60 * 60 * 1000
+            cursor = None
+            result: list[dict] = []
+            while True:
+                params = {
+                    "category": "linear",
+                    "symbol": symbol,
+                    "intervalTime": intervalTime,
+                    "startTime": start_ms,
+                    "endTime": now_ms,
+                    "limit": 200,
+                }
+                if cursor:
+                    params["cursor"] = cursor
+                resp = await ex.publicGetV5MarketOpenInterest(params)
+                lst = (((resp or {}).get("result") or {}).get("list")) or []
+                for row in lst:
+                    ts = int(row.get("timestamp") or 0)
+                    oi = row.get("openInterest")
+                    try: oi = float(oi)
+                    except Exception: oi = None
+                    if ts and oi is not None:
+                        result.append({"timestamp": ts, "openInterest": oi})
+                cursor = (((resp or {}).get("result") or {}).get("nextPageCursor")) or ""
+                if not cursor:
+                    break
+                await asyncio.sleep(0.1)
+            result.sort(key=lambda x: x["timestamp"])
+            return result
+
+        # Unsupported exchange
+        return []
+
+    async def fetch_funding_rate_history(self, symbol: str, *, lookback_days: int = 7) -> list[dict]:
+        """
+        Return [{"timestamp": ms, "fundingRate": float}, ...], newest last.
+        """
+        ex = self._exchange
+
+        # Try CCXT unified first
+        if getattr(ex, "has", {}).get("fetchFundingRateHistory"):
+            rows = await ex.fetchFundingRateHistory(symbol)
+            if not rows:
+                return []
+            out = []
+            if isinstance(rows[0], dict):
+                for r in rows:
+                    ts = int(r.get("timestamp") or r.get("time") or 0)
+                    fr = r.get("fundingRate") or r.get("rate")
+                    try: fr = float(fr)
+                    except Exception: fr = None
+                    if ts and fr is not None:
+                        out.append({"timestamp": ts, "fundingRate": fr})
+            else:
+                for ts, rate, *_ in rows:
+                    out.append({"timestamp": int(ts), "fundingRate": float(rate)})
+            out.sort(key=lambda x: x["timestamp"])
+            return out
+
+        # Fallback: Bybit V5 public endpoint
+        if ex.id == "bybit" and hasattr(ex, "publicGetV5MarketHistoryFundRate"):
+            now_ms = ex.milliseconds()
+            start_ms = now_ms - lookback_days * 24 * 60 * 60 * 1000
+            cursor = None
+            result: list[dict] = []
+            while True:
+                params = {
+                    "category": "linear",
+                    "symbol": symbol,
+                    "startTime": start_ms,
+                    "endTime": now_ms,
+                    "limit": 200,
+                }
+                if cursor:
+                    params["cursor"] = cursor
+                resp = await ex.publicGetV5MarketHistoryFundRate(params)
+                lst = (((resp or {}).get("result") or {}).get("list")) or []
+                for row in lst:
+                    ts = int(row.get("fundingRateTimestamp") or row.get("timestamp") or 0)
+                    fr = row.get("fundingRate")
+                    try: fr = float(fr)
+                    except Exception: fr = None
+                    if ts and fr is not None:
+                        result.append({"timestamp": ts, "fundingRate": fr})
+                cursor = (((resp or {}).get("result") or {}).get("nextPageCursor")) or ""
+                if not cursor:
+                    break
+                await asyncio.sleep(0.1)
+            result.sort(key=lambda x: x["timestamp"])
+            return result
+
+        return []
+
+
 
     async def close(self):
         """Gracefully close the underlying exchange connection."""

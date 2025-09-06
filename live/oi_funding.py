@@ -1,167 +1,134 @@
-"""
-oi_funding.py  —  Async helpers to fetch/align OI & funding to a 5m grid and
-                   compute the 13 OI+Funding features used by the meta-model.
-
-- Uses ExchangeProxy wrappers (fetch_open_interest_history / fetch_funding_rate_history)
-- Reindexes to the bot’s base timeframe (5m) and forward-fills funding
-- Computes exactly the 13 numeric features listed in the training spec
-"""
-
+# live/oi_funding.py
 from __future__ import annotations
-
-from dataclasses import dataclass
-from typing import Optional, Dict, Any, Tuple
-from datetime import datetime, timedelta, timezone
-
+from typing import Dict, Tuple, Optional
 import numpy as np
 import pandas as pd
 
-
-# ---- constants for 5-minute bars (keep parity with training) ----
 WIN_1H, WIN_4H, WIN_1D, WIN_3D, WIN_7D = 12, 48, 288, 864, 2016
 
-
-def _ceil_to_5m(ts: datetime) -> datetime:
-    """Round up to next 5-minute boundary (UTC)."""
-    minute = (ts.minute // 5) * 5
-    base = ts.replace(second=0, microsecond=0, minute=minute, tzinfo=timezone.utc)
-    if base < ts:
-        base = base + timedelta(minutes=5)
-    return base
-
-
-def _mk_5m_index(start_utc: datetime, end_utc: datetime) -> pd.DatetimeIndex:
-    start_utc = start_utc.replace(second=0, microsecond=0, tzinfo=timezone.utc)
-    start_utc = _ceil_to_5m(start_utc - timedelta(minutes=5))
-    end_utc   = end_utc.replace(second=0, microsecond=0, tzinfo=timezone.utc)
-    end_utc   = end_utc.replace(minute=(end_utc.minute // 5) * 5)
-    return pd.date_range(start=start_utc, end=end_utc, freq="5min", tz="UTC")
-
-
-async def fetch_series_5m(
-    exchange, symbol: str, lookback_days_oi: int = 7, lookback_days_funding: int = 7
-) -> Tuple[pd.Series, pd.Series]:
+def _as_df(items: list[dict], ts_key: str, val_key: str) -> pd.DataFrame:
     """
-    Returns (oi_series, funding_series) reindexed to a common 5m UTC grid.
-
-    - OI: fetched directly at 5m (paged if needed) when the venue exposes it;
-          otherwise nearest-available step is upsampled with ffill.
-    - Funding: fetched from funding history (settlement / discrete records),
-               then forward-filled to the 5m grid (training parity).
+    Accepts list of dicts or list of lists; returns DataFrame with UTC ms index
+    and a single value column (float).
     """
-    now = datetime.now(timezone.utc)
-    since_oi  = now - timedelta(days=max(1, lookback_days_oi) + 1)       # pad 1 day
-    since_fr  = now - timedelta(days=max(1, lookback_days_funding) + 1)  # pad 1 day
-
-    # Build target 5m grid
-    idx5 = _mk_5m_index(since_oi, now)
-
-    # 1) Open Interest history → 5m series
-    oi_hist = await exchange.fetch_open_interest_history(
-        symbol=symbol,
-        timeframe="5m",   # ExchangeProxy handles vendor mapping
-        since=int(since_oi.timestamp() * 1000),
-        limit=None,       # paged inside ExchangeProxy
-        params=None,
-    )
-
-    if isinstance(oi_hist, list) and oi_hist:
-        # ccxt format: [{timestamp, openInterest, ...}, ...]
-        oits = pd.DataFrame(oi_hist)[["timestamp", "openInterest"]]
-        oits["timestamp"] = pd.to_datetime(oits["timestamp"], unit="ms", utc=True)
-        oi = oits.set_index("timestamp").sort_index()["openInterest"].astype("float64")
+    if not items:
+        return pd.DataFrame(columns=[val_key])
+    # list of dicts
+    if isinstance(items[0], dict):
+        df = pd.DataFrame(items)
+        # normalize possible variants of keys
+        if ts_key not in df.columns:
+            for k in ("time", "timestamp", "fundingRateTimestamp"):
+                if k in df.columns:
+                    ts_key = k; break
+        if val_key not in df.columns:
+            # open interest possible aliases
+            alt = ["open_interest", "value", "openInterestValue", "oi", "rate", "funding_rate"]
+            for k in alt:
+                if k in df.columns:
+                    val_key = k; break
+        df = df[[ts_key, val_key]].copy()
+        df[ts_key] = pd.to_numeric(df[ts_key], errors="coerce").astype("Int64")
+        df[val_key] = pd.to_numeric(df[val_key], errors="coerce")
     else:
-        oi = pd.Series(index=idx5, dtype="float64")  # empty series fallback
+        # list of lists: assume [timestamp, value, ...]
+        df = pd.DataFrame(items, columns=[ts_key, val_key])
+        df[ts_key] = pd.to_numeric(df[ts_key], errors="coerce").astype("Int64")
+        df[val_key] = pd.to_numeric(df[val_key], errors="coerce")
+    df.dropna(subset=[ts_key], inplace=True)
+    df.set_index(pd.to_datetime(df[ts_key].astype("int64"), unit="ms", utc=True), inplace=True)
+    df = df.drop(columns=[ts_key]).sort_index()
+    return df
 
-    # Reindex OI to 5m grid (ffill to avoid gaps for pct_change windows)
-    oi_5m = oi.reindex(idx5).ffill()
+async def fetch_series_5m(exchange, symbol: str, lookback_oi_days: int = 7, lookback_fr_days: int = 7) -> Tuple[pd.Series, pd.Series]:
+    """
+    Returns (oi_series_5m, funding_series_5m) aligned to 5m UTC timestamps.
+    """
+    oi_hist = await exchange.fetch_open_interest_history_5m(symbol, lookback_days=lookback_oi_days)
+    fr_hist = await exchange.fetch_funding_rate_history(symbol, lookback_days=lookback_fr_days)
 
-    # 2) Funding history → forward-fill to 5m
-    fr_hist = await exchange.fetch_funding_rate_history(
-        symbol=symbol,
-        since=int(since_fr.timestamp() * 1000),
-        limit=None,        # paged inside ExchangeProxy
-        params=None,
-    )
-    if isinstance(fr_hist, list) and fr_hist:
-        frdf = pd.DataFrame(fr_hist)[["timestamp", "fundingRate"]]
-        frdf["timestamp"] = pd.to_datetime(frdf["timestamp"], unit="ms", utc=True)
-        fr = frdf.set_index("timestamp").sort_index()["fundingRate"].astype("float64")
+    oi_df = _as_df(oi_hist, "timestamp", "openInterest")
+    fr_df = _as_df(fr_hist, "timestamp", "fundingRate")
+
+    # 5-minute grid index covering the union of inputs
+    if not oi_df.empty:
+        start = oi_df.index.min()
     else:
-        fr = pd.Series(index=idx5, dtype="float64")
+        start = pd.Timestamp.utcnow().tz_localize("UTC") - pd.Timedelta(days=lookback_oi_days)
+    end = pd.Timestamp.utcnow().tz_localize("UTC")
+    idx5 = pd.date_range(start=start.floor("5min"), end=end.floor("5min"), freq="5min", tz="UTC")
 
-    # Up-sample to 5m and forward-fill (training parity)
-    fr_5m = fr.reindex(idx5).ffill()
+    oi5 = oi_df.reindex(idx5)["openInterest"]
+    fr5 = fr_df.reindex(idx5)["fundingRate"]
 
-    return oi_5m, fr_5m
+    # Forward-fill funding to every 5m bar (as per design)
+    fr5 = fr5.ffill()
 
+    return oi5, fr5
 
-def compute_oi_funding_features(
-    df5: pd.DataFrame,
-    oi_5m: pd.Series,
-    fr_5m: pd.Series,
-) -> Dict[str, Any]:
+def compute_oi_funding_features(df5: pd.DataFrame, oi5: pd.Series, fr5: pd.Series, *, allow_nans: bool = True) -> Dict[str, float]:
     """
-    Compute the 13 OI + funding features on the aligned 5m grid.
-
-    df5 must contain columns: ['close','volume'] aligned to oi_5m / fr_5m.
-    NaNs are left as-is; LightGBM handles them.
+    Compute the 13 new OI/Funding features on a 5m grid for the **last bar** of df5.
+    If allow_nans is False, NaNs are replaced with 0.0 (to satisfy strict parity).
     """
-    # Guard: ensure aligned index
-    df = pd.DataFrame(index=df5.index.copy())
-    df["close"] = df5["close"].astype("float64")
-    df["volume"] = df5["volume"].astype("float64")
-    df["oi"] = oi_5m.reindex(df.index).astype("float64")
-    df["fr"] = fr_5m.reindex(df.index).astype("float64")
+    # align all to df5 index (5m UTC)
+    oi = oi5.reindex(df5.index)
+    fr = fr5.reindex(df5.index)
 
-    # Funding already forward-filled; keep raw level
-    # 1) OI level & notional
-    oi_level = df["oi"].iloc[-1]
-    oi_notional_est = df["oi"].iloc[-1] * df["close"].iloc[-1]
+    close = df5["close"].astype(float)
+    volume = df5.get("volume", pd.Series(index=df5.index, dtype=float)).astype(float)
 
-    # 2) Percent changes (explicit no fill_method)
-    oi_pct_1h = df["oi"].pct_change(WIN_1H)
-    oi_pct_4h = df["oi"].pct_change(WIN_4H)
-    oi_pct_1d = df["oi"].pct_change(WIN_1D)
+    # 1-2) levels
+    oi_level        = oi
+    oi_notional_est = oi * close
 
-    # 3) 7d OI z-score
-    oi_mean_7d = df["oi"].rolling(WIN_7D, min_periods=WIN_1D).mean()
-    oi_std_7d  = df["oi"].rolling(WIN_7D, min_periods=WIN_1D).std()
-    oi_z_7d    = (df["oi"] - oi_mean_7d) / (oi_std_7d + 1e-12)
+    # 3-5) pct changes
+    oi_pct_1h = oi.pct_change(WIN_1H, fill_method=None)
+    oi_pct_4h = oi.pct_change(WIN_4H, fill_method=None)
+    oi_pct_1d = oi.pct_change(WIN_1D, fill_method=None)
 
-    # 4) OI change normalized by 1h turnover (volume proxy)
-    vol_1h = df["volume"].rolling(WIN_1H).sum()
-    oi_chg_norm_vol_1h = (df["oi"] - df["oi"].shift(WIN_1H)) / (vol_1h + 1e-9)
+    # 6) OI z-score (7d)
+    oi_mean_7d = oi.rolling(WIN_7D, min_periods=WIN_1D).mean()
+    oi_std_7d  = oi.rolling(WIN_7D, min_periods=WIN_1D).std()
+    oi_z_7d    = (oi - oi_mean_7d) / (oi_std_7d + 1e-12)
 
-    # 5) OI–price interaction (sign)
-    ret_1h = df["close"].pct_change(WIN_1H)
+    # 7) ΔOI normalized by recent turnover (1h)
+    vol_1h = volume.rolling(WIN_1H).sum()
+    oi_chg_norm_vol_1h = (oi - oi.shift(WIN_1H)) / (vol_1h + 1e-9)
+
+    # 8) OI–price interaction
+    ret_1h          = close.pct_change(WIN_1H, fill_method=None)
     oi_price_div_1h = np.sign(ret_1h) * oi_pct_1h
 
-    # 6) Funding transforms (already on 5m, ffilled)
-    funding_rate = df["fr"]
-    funding_abs = funding_rate.abs()
-    fr_mean_7d = funding_rate.rolling(WIN_7D, min_periods=WIN_1D).mean()
-    fr_std_7d  = funding_rate.rolling(WIN_7D, min_periods=WIN_1D).std()
-    funding_z_7d = (funding_rate - fr_mean_7d) / (fr_std_7d + 1e-12)
-    funding_rollsum_3d = funding_rate.rolling(WIN_3D, min_periods=WIN_1D).sum()
+    # 9-12) Funding transforms
+    funding_rate       = fr
+    funding_abs        = fr.abs()
+    fr_mean_7d         = fr.rolling(WIN_7D, min_periods=WIN_1D).mean()
+    fr_std_7d          = fr.rolling(WIN_7D, min_periods=WIN_1D).std()
+    funding_z_7d       = (fr - fr_mean_7d) / (fr_std_7d + 1e-12)
+    funding_rollsum_3d = fr.rolling(WIN_3D, min_periods=WIN_1D).sum()
 
-    # 7) Funding × OI interaction
+    # 13) Interaction
     funding_oi_div = funding_z_7d * oi_z_7d
 
-    # Output: the LAST available values on the aligned grid
-    out = {
-        "oi_level": float(oi_level) if np.isfinite(oi_level) else np.nan,
-        "oi_notional_est": float(oi_notional_est) if np.isfinite(oi_notional_est) else np.nan,
-        "oi_pct_1h": float(oi_pct_1h.iloc[-1]) if np.isfinite(oi_pct_1h.iloc[-1]) else np.nan,
-        "oi_pct_4h": float(oi_pct_4h.iloc[-1]) if np.isfinite(oi_pct_4h.iloc[-1]) else np.nan,
-        "oi_pct_1d": float(oi_pct_1d.iloc[-1]) if np.isfinite(oi_pct_1d.iloc[-1]) else np.nan,
-        "oi_z_7d": float(oi_z_7d.iloc[-1]) if np.isfinite(oi_z_7d.iloc[-1]) else np.nan,
-        "oi_chg_norm_vol_1h": float(oi_chg_norm_vol_1h.iloc[-1]) if np.isfinite(oi_chg_norm_vol_1h.iloc[-1]) else np.nan,
-        "oi_price_div_1h": float(oi_price_div_1h.iloc[-1]) if np.isfinite(oi_price_div_1h.iloc[-1]) else np.nan,
-        "funding_rate": float(funding_rate.iloc[-1]) if np.isfinite(funding_rate.iloc[-1]) else np.nan,
-        "funding_abs": float(funding_abs.iloc[-1]) if np.isfinite(funding_abs.iloc[-1]) else np.nan,
-        "funding_z_7d": float(funding_z_7d.iloc[-1]) if np.isfinite(funding_z_7d.iloc[-1]) else np.nan,
-        "funding_rollsum_3d": float(funding_rollsum_3d.iloc[-1]) if np.isfinite(funding_rollsum_3d.iloc[-1]) else np.nan,
-        "funding_oi_div": float(funding_oi_div.iloc[-1]) if np.isfinite(funding_oi_div.iloc[-1]) else np.nan,
+    # last bar snapshot
+    fields = {
+        "oi_level":            oi_level.iloc[-1],
+        "oi_notional_est":     oi_notional_est.iloc[-1],
+        "oi_pct_1h":           oi_pct_1h.iloc[-1],
+        "oi_pct_4h":           oi_pct_4h.iloc[-1],
+        "oi_pct_1d":           oi_pct_1d.iloc[-1],
+        "oi_z_7d":             oi_z_7d.iloc[-1],
+        "oi_chg_norm_vol_1h":  oi_chg_norm_vol_1h.iloc[-1],
+        "oi_price_div_1h":     oi_price_div_1h.iloc[-1],
+        "funding_rate":        funding_rate.iloc[-1],
+        "funding_abs":         funding_abs.iloc[-1],
+        "funding_z_7d":        funding_z_7d.iloc[-1],
+        "funding_rollsum_3d":  funding_rollsum_3d.iloc[-1],
+        "funding_oi_div":      funding_oi_div.iloc[-1],
     }
-    return out
+    if not allow_nans:
+        for k, v in list(fields.items()):
+            if v is None or not np.isfinite(float(v)):
+                fields[k] = 0.0
+    return fields

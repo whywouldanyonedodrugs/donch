@@ -390,6 +390,23 @@ class LiveTrader:
             LOG.warning("WinProb not loaded; using wp=0.0")
 
 
+    async def _build_oi_funding_features(self, symbol: str, df5: "pd.DataFrame") -> dict:
+        """
+        Pull 5m OI & funding, align to df5, and compute the 13 features.
+        Fills NaNs to 0.0 when strict parity is enabled in the WinProbScorer.
+        """
+        try:
+            oi_days = int(self.cfg.get("OI_LOOKBACK_DAYS", 7))
+            fr_days = int(self.cfg.get("FUNDING_LOOKBACK_DAYS", 7))
+            oi5, fr5 = await fetch_series_5m(self.exchange, symbol, lookback_oi_days=oi_days, lookback_fr_days=fr_days)
+            allow_nans = not bool(getattr(self.winprob, "strict_parity", False))
+            feats = compute_oi_funding_features(df5, oi5, fr5, allow_nans=allow_nans)
+            return feats
+        except Exception as e:
+            LOG.debug("OI/Funding feature pack failed for %s: %s", symbol, e)
+            return {}
+
+
 
     def _score_winprob_safe(self, symbol: str, meta_row: dict) -> Optional[float]:
         wp = getattr(self, "winprob", None)
@@ -897,9 +914,9 @@ class LiveTrader:
             # -------------- Meta-model feature row (canonical) ----
             entry_rule = getattr(verdict, "entry_rule", None) or self.cfg.get("ENTRY_RULE", "close_above_break")
             pullback_type = getattr(verdict, "pullback_type", None) or self.cfg.get("PULLBACK_TYPE", "retest")
-            regime_1d = getattr(verdict, "regime_1d", None) or ""  # optional
+            regime_1d = getattr(verdict, "regime_1d", None) or "unknown"  # ensure categorical presence (strict parity)
 
-            # --- NEW: AVWAP (rolling VWAP) stack features on base tf ----------
+            # --- AVWAP (rolling VWAP) stack features on base tf ----------
             try:
                 vwap_lb   = int(self.cfg.get("VWAP_LOOKBACK_BARS", 12))
                 vwap_band = float(self.cfg.get("VWAP_BAND_PCT", 0.004))
@@ -907,64 +924,47 @@ class LiveTrader:
             except Exception:
                 vwap_feats = {"vwap_frac_in_band": 0.0, "vwap_expansion_pct": 0.0, "vwap_slope_pph": 0.0}
 
-            # --- NEW: perp basis (mark-index) and funding rate ----------------
+            # --- perp basis (mark-index) and current funding rate ----------
             basis_pct = 0.0
             funding_8h = 0.0
             try:
                 tk = await self.exchange.fetch_ticker(symbol)
-                # try both top-level and .info for common exchanges
-                mark  = float(tk.get("markPrice", tk.get("mark", tk.get("last", 0.0)))) if tk else 0.0
-                index = float(tk.get("indexPrice", tk.get("index", 0.0))) if tk else 0.0
+                mark  = float((tk.get("markPrice") or tk.get("mark") or tk.get("last") or 0.0)) if tk else 0.0
+                index = float((tk.get("indexPrice") or tk.get("index") or 0.0)) if tk else 0.0
                 if isinstance(tk, dict) and "info" in tk:
                     info = tk["info"] or {}
                     mark  = float(info.get("markPrice", mark))
                     index = float(info.get("indexPrice", index))
                 if index and np.isfinite(mark) and np.isfinite(index) and index > 0:
-                    basis_pct = float((mark - index) / index)
+                    basis_pct = (mark - index) / index
             except Exception:
                 pass
             try:
                 fr = await self.exchange.fetch_funding_rate(symbol)
-                # ccxt unifies as fundingRate (8h); fallback to info
                 funding_8h = float(fr.get("fundingRate", 0.0)) if isinstance(fr, dict) else 0.0
                 if not np.isfinite(funding_8h):
                     funding_8h = 0.0
             except Exception:
                 pass
 
-            # --- NEW: prior breakout quality from 1d --------------------------
-            prior_b, prior_f, prior_fail_rate = (0, 0, 0.0)
+            # --- prior breakout quality (already in your code) ----------
             try:
                 prior_b, prior_f, prior_fail_rate = self._prior_breakout_stats(
                     df1d, period=don_len, lookback_days=int(self.cfg.get("PRIOR_BRK_LOOKBACK_DAYS", 60)),
                     fallback_days=int(self.cfg.get("PRIOR_BRK_FALLBACK_DAYS", 3))
                 )
             except Exception:
-                pass
+                prior_b = prior_f = prior_fail_rate = 0.0
 
-            # --- NEW: pull RS/turnover z-scores from universe snapshot --------
+            # --- RS/turnover z-scores from universe snapshot ----------
             rs_z = float(univ.get("rs_z", 0.0) or 0.0)
             turnover_z = float(univ.get("turnover_z", 0.0) or 0.0)
 
-            # --- NEW: OI + Funding feature pack (5m-aligned, 7d parity with training) ---
-            oi_features: Dict[str, float] = {}
-            try:
-                if bool(self.cfg.get("OI_FUNDING_FEATURES_ENABLED", True)):
-                    look_oi_days = int(self.cfg.get("OI_LOOKBACK_DAYS", 7))
-                    look_fr_days = int(self.cfg.get("FUNDING_LOOKBACK_DAYS", 7))
-                    # Pull historical series (paged via ExchangeProxy)
-                    oi_5m, fr_5m = await fetch_series_5m(
-                        self.exchange, symbol, lookback_days_oi=look_oi_days, lookback_days_funding=look_fr_days
-                    )
-                    # Align to our base df5 and compute 13 features
-                    oi_features = compute_oi_funding_features(df5, oi_5m, fr_5m)
-            except Exception as e:
-                LOG.debug("OI/Funding feature pack failed for %s: %s", symbol, e)
-                oi_features = {}
-
+            # --- NEW: OI + Funding features (13) ----------
+            oi_feats = await self._build_oi_funding_features(symbol, df5)
 
             meta_row = {
-                # numerics
+                # numerics (existing)
                 "atr_1h": float(last['atr_1h']),
                 "rsi_1h": float(last['rsi_1h']),
                 "adx_1h": float(last['adx_1h']),
@@ -981,49 +981,37 @@ class LiveTrader:
                 "regime_up": float(regime_up),
                 "prior_1d_ret": float(ret_30d),
 
-                # --- NEW: AVWAP stack
+                # AVWAP stack
                 "vwap_frac_in_band": float(vwap_feats.get("vwap_frac_in_band", 0.0)),
                 "vwap_expansion_pct": float(vwap_feats.get("vwap_expansion_pct", 0.0)),
                 "vwap_slope_pph": float(vwap_feats.get("vwap_slope_pph", 0.0)),
 
-                # --- NEW: basis / funding
+                # basis / current funding
                 "basis_pct": float(basis_pct),
                 "funding_8h": float(funding_8h),
 
-                # --- NEW: prior breakout quality
+                # prior breakout stats
                 "prior_breakout_count": float(prior_b),
                 "prior_breakout_fail_count": float(prior_f),
                 "prior_breakout_fail_rate": float(prior_fail_rate),
 
-                # --- NEW: crowding proxies
+                # crowding proxies from universe
                 "rs_z": float(rs_z),
                 "turnover_z": float(turnover_z),
-
-                # categoricals
-                "entry_rule": str(entry_rule),
-                "pullback_type": str(pullback_type),
-                "regime_1d": str(regime_1d),
             }
-            # Merge OI+Funding features (exact names match training)
-            meta_row.update({
-                "oi_level": oi_features.get("oi_level"),
-                "oi_notional_est": oi_features.get("oi_notional_est"),
-                "oi_pct_1h": oi_features.get("oi_pct_1h"),
-                "oi_pct_4h": oi_features.get("oi_pct_4h"),
-                "oi_pct_1d": oi_features.get("oi_pct_1d"),
-                "oi_z_7d": oi_features.get("oi_z_7d"),
-                "oi_chg_norm_vol_1h": oi_features.get("oi_chg_norm_vol_1h"),
-                "oi_price_div_1h": oi_features.get("oi_price_div_1h"),
-                "funding_rate": oi_features.get("funding_rate"),
-                "funding_abs": oi_features.get("funding_abs"),
-                "funding_z_7d": oi_features.get("funding_z_7d"),
-                "funding_rollsum_3d": oi_features.get("funding_rollsum_3d"),
-                "funding_oi_div": oi_features.get("funding_oi_div"),
-            })
+
+            # merge in the 13 new OI/Funding features
+            meta_row.update(oi_feats)
+
+            # categoricals (bases for OHE)
+            meta_row["entry_rule"] = str(entry_rule)
+            meta_row["pullback_type"] = str(pullback_type)
+            meta_row["regime_1d"] = str(regime_1d)
 
             # -------------- Score meta (even on rejects) ----------
             p = self._score_winprob_safe(symbol, meta_row)
             pstar = float(getattr(self.winprob, "pstar", None) or self.cfg.get("META_PSTAR", 0.60))
+
 
             if p is None or not np.isfinite(p):
                 meta_ok = True  # don’t block if model unavailable
