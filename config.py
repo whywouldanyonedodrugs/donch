@@ -114,8 +114,8 @@ MIN_ATR_PCT               = 0.005 # Min ATR as a percentage of price
 
 # ── portfolio / kill‑switches ─────────────────────────────────────────────
 MAX_OPEN            = 20          # max concurrent positions
-MAX_LOSS_STREAK     = 10
-KILL_EQUITY_LEVEL   = 200.0        # USDT
+MAX_LOSS_STREAK     = 20
+KILL_EQUITY_LEVEL   = 100.0        # USDT
 MIN_EQUITY_USDT     = 100.0
 MAX_LEVERAGE        = 10
 MIN_NOTIONAL        = 0.0000001         # exchange min order size
@@ -123,9 +123,9 @@ MIN_STOP_DIST_USD   = 0.0002
 MIN_STOP_DIST_PCT   = 0.000008      # 0.08 %
 
 # draw‑down pause
-DD_PAUSE_ENABLED    = True     # set False to disable drawdown protection  # <--- ADD THIS
-DD_MAX_PCT          = 10.0     # Pause trading if equity drops 10% from peak # <--- ADD THIS
-DD_COOLDOWN_PCT     = 10.0     # % from equity peak
+DD_PAUSE_ENABLED    = False     # set False to disable drawdown protection  # <--- ADD THIS
+DD_MAX_PCT          = 90.0     # Pause trading if equity drops 10% from peak # <--- ADD THIS
+DD_COOLDOWN_PCT     = 90.0     # % from equity peak
 DD_COOLDOWN_DURATION_H = 4
 
 
