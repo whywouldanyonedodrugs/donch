@@ -124,9 +124,9 @@ MIN_STOP_DIST_PCT   = 0.000008      # 0.08 %
 
 # draw‑down pause
 DD_PAUSE_ENABLED    = True     # set False to disable drawdown protection  # <--- ADD THIS
-DD_MAX_PCT          = 50.0     # Pause trading if equity drops 10% from peak # <--- ADD THIS
-DD_COOLDOWN_PCT     = 50.0     # % from equity peak
-DD_COOLDOWN_DURATION_H = 6
+DD_MAX_PCT          = 10.0     # Pause trading if equity drops 10% from peak # <--- ADD THIS
+DD_COOLDOWN_PCT     = 10.0     # % from equity peak
+DD_COOLDOWN_DURATION_H = 4
 
 
 # ── BTC / ALT EMA trend veto ──────────────────────────────────────────────
