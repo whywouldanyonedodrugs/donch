@@ -1,6 +1,7 @@
 aiohttp
 asyncpg
 ccxt
+pandas
 pyyaml
 watchdog
 pydantic
