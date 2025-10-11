@@ -117,6 +117,275 @@ async def _load_symbol_maps(exchange):
         return None
     return heuristics
 
+# ─────────── Backfill MAE/MFE & infer exits from exchange OHLCV ───────────
+
+async def _fetch_ohlcv_range(exchange, symbol: str, timeframe: str,
+                             since: datetime, until: datetime,
+                             *, limit: int = 1000) -> pd.DataFrame:
+    """Fetch OHLCV for [since, until] inclusive, paginating by timeframe."""
+    tf_ms = int(exchange.parse_timeframe(timeframe) * 1000)
+    since_ms = int(since.timestamp() * 1000)
+    until_ms = int(until.timestamp() * 1000)
+    rows: list[list[float]] = []
+    ms = since_ms
+    while ms <= until_ms:
+        try:
+            batch = await exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=ms, limit=limit)
+        except Exception as exc:  # pragma: no cover
+            LOG.warning("fetch_ohlcv failed for %s (%s): %s", symbol, timeframe, exc)
+            break
+        if not batch:
+            break
+        rows.extend(batch)
+        last_ts = int(batch[-1][0])
+        next_ms = last_ts + tf_ms
+        if next_ms <= ms:  # safety against non-advancing servers
+            next_ms = ms + tf_ms
+        ms = next_ms
+        await asyncio.sleep(max(0.8, getattr(exchange, "rateLimit", 800) / 1000.0))
+        if last_ts >= until_ms:
+            break
+
+    if not rows:
+        return pd.DataFrame(columns=["ts","open","high","low","close","volume"]).set_index("ts")
+
+    df = pd.DataFrame(rows, columns=["ts","open","high","low","close","volume"])
+    df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+    df.set_index("ts", inplace=True)
+    return df.sort_index()
+
+
+def _atr(df: pd.DataFrame, n: int) -> pd.Series:
+    """Classic ATR on OHLCV bars (Wilder). Needs columns: open, high, low, close."""
+    if df.empty:
+        return pd.Series(dtype=float)
+    c = df["close"].shift(1)
+    tr = pd.concat([
+        (df["high"] - df["low"]).abs(),
+        (df["high"] - c).abs(),
+        (df["low"] - c).abs()
+    ], axis=1).max(axis=1)
+    # Wilder's smoothing: EMA(alpha=1/n) is a good approximation
+    return tr.ewm(alpha=1.0/n, adjust=False, min_periods=n).mean()
+
+
+def _infer_exit_reason_from_bars(row: pd.Series, bars: pd.DataFrame,
+                                 *, stop_slop_bps: float,
+                                    tp_price: Optional[float],
+                                    implied_stop_price: Optional[float]) -> str:
+    """Return one of {'SL','TL','TP','UNKNOWN'} based on bar extremes & deadlines."""
+    if bars.empty:
+        return "UNKNOWN"
+
+    # Window strictly within the position life
+    mask = (bars.index >= row["opened_at"]) & (bars.index <= row["closed_at"])
+    win = bars.loc[mask]
+    if win.empty:
+        return "UNKNOWN"
+
+    lo, hi = float(win["low"].min()), float(win["high"].max())
+    side = str(row.get("side","short")).lower()
+    entry = float(row.get("entry_price") or np.nan)
+    if not np.isfinite(entry):
+        return "UNKNOWN"
+
+    # Tolerance (bps of entry)
+    tol = entry * (stop_slop_bps / 1e4)
+
+    # Stop test (implied from risk_usd/size)
+    if implied_stop_price is not None and np.isfinite(implied_stop_price):
+        if side == "long":
+            if lo <= implied_stop_price + tol:
+                return "SL"
+        else:
+            if hi >= implied_stop_price - tol:
+                return "SL"
+
+    # Time-limit: if we have exit_deadline and close ~ deadline
+    deadline = row.get("exit_deadline")
+    closed_at = row.get("closed_at")
+    if isinstance(deadline, pd.Timestamp) and isinstance(closed_at, pd.Timestamp):
+        # within a bar worth of time is "close enough"
+        if abs((closed_at - deadline).total_seconds()) <= 60.0:
+            return "TL"
+
+    # Take-profit test (explicit or ATR proxy)
+    if tp_price is not None and np.isfinite(tp_price):
+        if side == "long":
+            if hi >= tp_price - tol:
+                return "TP"
+        else:
+            if lo <= tp_price + tol:
+                return "TP"
+
+    return "UNKNOWN"
+
+
+async def backfill_maemfe_and_infer_exits_from_ohlcv(
+    positions: pd.DataFrame,
+    fills: pd.DataFrame,
+    *,
+    timeframe: str = "1m",
+    pad_mins: int = 10,
+    tp_atr_mult: float = 8.0,
+    atr_len: int = 14,
+    stop_slop_bps: float = 5.0,
+) -> pd.DataFrame:
+    """
+    For each position:
+      - fetch symbol OHLCV once per symbol for the full min(open)→max(close) span (+pad),
+      - compute MAE/MFE USD & R from bar extremes,
+      - infer exit reason from bars using implied stop (risk_usd/size), TL, and TP proxy (ATR).
+    Returns an augmented copy of positions.
+    """
+    out = positions.copy()
+
+    # Ensure numeric basics
+    for c in ("risk_usd","size","entry_price","pnl","fees_paid"):
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+
+    # Backfill entry_price/size from fills if missing
+    if not fills.empty:
+        f = fills.copy()
+        f["ts"] = pd.to_datetime(f["ts"], utc=True, errors="coerce")
+        f["qty"] = pd.to_numeric(f["qty"], errors="coerce")
+        f["price"] = pd.to_numeric(f["price"], errors="coerce")
+
+        # entry = first side-opening fills; rough avg
+        entry_px = f.groupby("position_id").apply(
+            lambda g: (g["qty"].abs() * g["price"]).sum() / g["qty"].abs().sum()
+                      if g["qty"].abs().sum() > 0 else np.nan
+        )
+        size_abs = f.groupby("position_id")["qty"].apply(lambda s: s.abs().sum())
+        out["entry_price"] = out["entry_price"].fillna(out["id"].map(entry_px))
+        out["size"] = out["size"].fillna(out["id"].map(size_abs))
+
+    # Build one OHLCV frame per symbol to avoid N×fetch
+    sym_groups = out.groupby("symbol")
+    symbol_bars: dict[str, pd.DataFrame] = {}
+    # Use Bybit public OHLCV even without keys
+    ex = None
+    try:
+        if ccxt is None:
+            LOG.warning("ccxt not installed; skipping OHLCV backfill.")
+            return out
+        ex = ccxt.bybit({"enableRateLimit": True, "options": {"defaultType": "swap"}})
+        await ex.load_markets()
+        # Heuristic map similar to _load_symbol_maps
+        id_to_symbol = {m['id']: m['symbol'] for m in ex.markets.values()}
+        def map_symbol(db: str) -> Optional[str]:
+            db = str(db).upper().replace('/', '').replace(':','')
+            if db in id_to_symbol: return id_to_symbol[db]
+            if db.endswith("USDT"):
+                base = db[:-4]
+                for cand in (f"{base}/USDT:USDT", f"{base}/USDT", f"{base}/USDT:USD"):
+                    if cand in ex.markets: return cand
+            return None
+
+        pad = pd.Timedelta(minutes=pad_mins)
+        for sym, g in sym_groups:
+            ex_sym = map_symbol(sym)
+            if not ex_sym:
+                LOG.warning("OHLCV skip: cannot map %s on exchange", sym)
+                continue
+            s_since = pd.to_datetime(g["opened_at"].min()) - pad
+            s_until = pd.to_datetime(g["closed_at"].max()) + pad
+            df = await _fetch_ohlcv_range(ex, ex_sym, timeframe, s_since.to_pydatetime(), s_until.to_pydatetime())
+            symbol_bars[sym] = df
+            # Precompute ATR for TP proxy on full span
+            if not df.empty:
+                df["atr"] = _atr(df[["open","high","low","close"]], atr_len)
+    finally:
+        if ex is not None:
+            try:
+                await ex.close()
+            except Exception:
+                pass
+
+    # Per-position calculations
+    cols_new = ["mae_usd_bars","mfe_usd_bars","mae_r_bars","mfe_r_bars",
+                "implied_stop_price_bars","tp_price_proxy_bars","exit_inferred_bars"]
+    for c in cols_new:
+        out[c] = np.nan if c != "exit_inferred_bars" else None
+
+    for i, row in out.iterrows():
+        sym = row.get("symbol")
+        bars = symbol_bars.get(sym)
+        if bars is None or bars.empty:
+            out.at[i, "exit_inferred_bars"] = "UNKNOWN"
+            continue
+
+        opened_at = row.get("opened_at")
+        closed_at = row.get("closed_at")
+        if not isinstance(opened_at, pd.Timestamp) or not isinstance(closed_at, pd.Timestamp):
+            out.at[i, "exit_inferred_bars"] = "UNKNOWN"
+            continue
+
+        mask = (bars.index >= opened_at) & (bars.index <= closed_at)
+        win = bars.loc[mask]
+        if win.empty:
+            out.at[i, "exit_inferred_bars"] = "UNKNOWN"
+            continue
+
+        side = str(row.get("side","short")).lower()
+        entry = float(row.get("entry_price") or np.nan)
+        size  = float(row.get("size") or np.nan)
+        risk  = float(row.get("risk_usd") or np.nan)
+
+        if not (np.isfinite(entry) and np.isfinite(size) and size != 0):
+            out.at[i, "exit_inferred_bars"] = "UNKNOWN"
+            continue
+
+        # Bar extremes during the trade
+        hi = float(win["high"].max())
+        lo = float(win["low"].min())
+
+        # Price excursions
+        if side == "long":
+            mae_px = max(0.0, entry - lo)
+            mfe_px = max(0.0, hi - entry)
+        else:
+            mae_px = max(0.0, hi - entry)
+            mfe_px = max(0.0, entry - lo)
+
+        mae_usd = mae_px * abs(size)
+        mfe_usd = mfe_px * abs(size)
+        out.at[i, "mae_usd_bars"] = mae_usd
+        out.at[i, "mfe_usd_bars"] = mfe_usd
+        if np.isfinite(risk) and risk > 0:
+            out.at[i, "mae_r_bars"] = mae_usd / risk
+            out.at[i, "mfe_r_bars"] = mfe_usd / risk
+
+        # Implied stop (from risk_usd/size) if we don’t have stop_price
+        stop_delta_px = (risk / abs(size)) if (np.isfinite(risk) and abs(size) > 0) else np.nan
+        if np.isfinite(stop_delta_px):
+            stop_price = entry - stop_delta_px if side == "long" else entry + stop_delta_px
+            out.at[i, "implied_stop_price_bars"] = stop_price
+        else:
+            stop_price = None
+
+        # TP proxy: ATR on entry bar (or nearest prior)
+        tp_price = None
+        if np.isfinite(row.get("tp_price") if "tp_price" in out.columns else np.nan):
+            tp_price = float(row.get("tp_price"))
+        else:
+            # Use ATR proxy if available
+            if "atr" in bars.columns:
+                # pick the ATR on the last bar before/at entry
+                atr_at_entry = bars.loc[:opened_at]["atr"].ffill().iloc[-1] if not bars.loc[:opened_at].empty else np.nan
+                if np.isfinite(atr_at_entry):
+                    tp_price = entry + tp_atr_mult * atr_at_entry if side == "long" else entry - tp_atr_mult * atr_at_entry
+                    out.at[i, "tp_price_proxy_bars"] = tp_price
+
+        reason = _infer_exit_reason_from_bars(
+            row, bars, stop_slop_bps=stop_slop_bps,
+            tp_price=tp_price, implied_stop_price=stop_price
+        )
+        out.at[i, "exit_inferred_bars"] = reason
+
+    return out
+
 
 # ─────────────────────────────── Data classes ───────────────────────────────
 
@@ -1011,6 +1280,19 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--skip-exchange", action="store_true")
     ap.add_argument("--tolerance", type=float, default=1e-6)
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--backfill-maemfe", action="store_true",
+                    help="Fetch OHLCV and recompute MAE/MFE + inferred exit reasons from bars.")
+    ap.add_argument("--ohlcv-timeframe", default="1m",
+                    help="Timeframe for OHLCV backfill (e.g., 1m, 3m, 5m).")
+    ap.add_argument("--ohlcv-pad-mins", type=int, default=10,
+                    help="Minutes to pad before entry and after exit when fetching OHLCV.")
+    ap.add_argument("--tp-atr-mult", type=float, default=8.0,
+                    help="If no explicit TP price in DB, use ATR proxy (mult × ATR) to infer TP hit.")
+    ap.add_argument("--atr-len", type=int, default=14,
+                    help="ATR lookback for TP proxy.")
+    ap.add_argument("--stop-slop-bps", type=float, default=5.0,
+                    help="Price tolerance (basis points) when checking if stop was hit on bars.")
+
     # no error if unknown args → zero-argument friendly
     known, _ = ap.parse_known_args()
     return known
@@ -1104,6 +1386,8 @@ async def main_async():
     # Streaks
     longest_win, longest_loss = _streaks(positions_aug["net_pnl"].values)
 
+
+
     # Meta-model calibration & threshold sweep (if we find a prob column)
     prob_col = _find_winprob_column(positions_aug)
     calib_tab = None
@@ -1120,6 +1404,33 @@ async def main_async():
         cand = sweep_tab[sweep_tab["n"] >= 20]
         if not cand.empty:
             suggested_thr = float(cand.sort_values("net_pnl", ascending=False).iloc[0]["thr"])
+
+    # Optional MAE/MFE backfill from OHLCV + exit inference
+    backfilled = None
+    if args.backfill_maemfe:
+        LOG.info("Backfilling MAE/MFE and inferring exits from OHLCV…")
+        backfilled = await backfill_maemfe_and_infer_exits_from_ohlcv(
+            positions_aug, fills,
+            timeframe=args.ohlcv_timeframe,
+            pad_mins=args.ohlcv_pad_mins,
+            tp_atr_mult=args.tp_atr_mult,
+            atr_len=args.atr_len,
+            stop_slop_bps=args.stop_slop_bps,
+        )
+        # Prefer bar-based MAE/MFE if DB has gaps
+        for src, dst in (("mae_usd_bars","mae_usd"), ("mfe_usd_bars","mfe_usd")):
+            if src in backfilled.columns:
+                positions_aug[dst] = positions_aug.get(dst)
+                positions_aug[dst] = positions_aug[dst].where(positions_aug[dst].notna(), backfilled[src])
+
+        # Keep the inferred exit for reporting
+        positions_aug["exit_inferred_bars"] = backfilled["exit_inferred_bars"]
+        if "implied_stop_price_bars" in backfilled:
+            positions_aug["implied_stop_price_bars"] = backfilled["implied_stop_price_bars"]
+        if "tp_price_proxy_bars" in backfilled:
+            positions_aug["tp_price_proxy_bars"] = backfilled["tp_price_proxy_bars"]
+
+
 
     # Optional exchange reconciliation
     key, secret, testnet = _autodetect_bybit()
@@ -1153,6 +1464,9 @@ async def main_async():
             mismatches = reconcile_positions(positions_aug, fills, trade_map, tolerance_qty=args.tolerance)
         except Exception as e:
             LOG.warning("Exchange reconciliation skipped due to error: %s", e)
+
+
+
 
 
     # Build report
@@ -1217,6 +1531,46 @@ async def main_async():
     cov = audit["coverage"]
     md.append(f"_Coverage: n={cov.get('n_total',0)} | has MAE={cov.get('n_have_mae',0)} | "
               f"has MFE={cov.get('n_have_mfe',0)} | has risk/stop={cov.get('n_have_risk_or_stop',0)}_")
+
+    # Exit reasons after OHLCV backfill/inference
+    if args.backfill_maemfe and "exit_inferred_bars" in positions_aug.columns:
+        md.append("\n## Exit Reasons (after OHLCV backfill)\n")
+        # coverage
+        has_mae_bars = positions_aug["mae_usd"].notna().sum()
+        has_mfe_bars = positions_aug["mfe_usd"].notna().sum()
+        md.append(f"_Coverage (post-backfill): n={len(positions_aug)} | has MAE={has_mae_bars} | has MFE={has_mfe_bars}_\n")
+
+        # counts
+        inf_counts = positions_aug["exit_inferred_bars"].fillna("UNKNOWN").value_counts(dropna=False).to_dict()
+        md.append("\n**Inferred from OHLCV (bars):**\n")
+        md.append("\n| reason | n |\n|---|---:|")
+        for k in ("SL","TL","TP","UNKNOWN"):
+            md.append(f"| {k} | {int(inf_counts.get(k,0))} |")
+
+        # disagreement matrix (recorded vs inferred_bars)
+        rec = positions_aug.get("exit_reason", pd.Series(["UNKNOWN"]*len(positions_aug)))
+        tab = pd.crosstab(rec.fillna("UNKNOWN"), positions_aug["exit_inferred_bars"].fillna("UNKNOWN"))
+        md.append("\n\n**Recorded vs Inferred (bars)**\n")
+        md.append("| recorded \\ inferred | SL | TL | TP | UNKNOWN |")
+        md.append("|---|---|---|---|---|")
+        for rlab, rowvals in tab[["SL","TL","TP","UNKNOWN"]].reindex(columns=["SL","TL","TP","UNKNOWN"], fill_value=0).iterrows():
+            md.append(f"| {rlab} | {int(rowvals.get('SL',0))} | {int(rowvals.get('TL',0))} | {int(rowvals.get('TP',0))} | {int(rowvals.get('UNKNOWN',0))} |")
+
+        # suspicious rows: recorded TP/SL/TIME_EXIT that disagree with bars inference
+        sus = positions_aug[(positions_aug["exit_reason"].notna()) &
+                            (positions_aug["exit_inferred_bars"].notna()) &
+                            (positions_aug["exit_reason"].str.upper().ne(positions_aug["exit_inferred_bars"].str.upper()))]
+        if not sus.empty:
+            md.append("\n\n**Suspicious rows (first 25, bars-based)**\n")
+            md.append("| id | symbol | closed_at | pnl | mae | mfe | risk | rec | inf |")
+            md.append("|---:|:------|:----------|----:|----:|----:|----:|:----:|:---:|")
+            for _, r in sus.head(25).iterrows():
+                md.append(f"| {int(r['id'])} | {r['symbol']} | {r['closed_at']} | "
+                          f"{_fmt_money(r.get('pnl'))} | "
+                          f"{_fmt_money(r.get('mae_usd'))} | {_fmt_money(r.get('mfe_usd'))} | "
+                          f"{_fmt_money(r.get('risk_usd'))} | "
+                          f"{str(r.get('exit_reason') or 'UNKNOWN')} | {str(r.get('exit_inferred_bars') or 'UNKNOWN')} |")
+
 
     # Recorded distribution
     rd = audit["recorded_dist"]
