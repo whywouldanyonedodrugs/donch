@@ -380,17 +380,21 @@ def calibration_bins(
     y = (y > 0).astype(int)  # win if net_pnl > 0
     brier = float(((probs - y) ** 2).mean())
 
-    df = pd.DataFrame({"p": probs, "y": y})
-    df = df.dropna()
+    df = pd.DataFrame({"p": probs, "y": y}).dropna()
     if df.empty:
         return pd.DataFrame(), brier
+
+    # Quantile bins; duplicates='drop' keeps the bin count stable on ties
     df["bin"] = pd.qcut(df["p"], q=min(n_bins, max(2, df["p"].nunique())), duplicates="drop")
-    tab = df.groupby("bin").agg(
+
+    # Future-proof: pandas default of observed will change → set it explicitly
+    tab = df.groupby("bin", observed=True).agg(
         mean_pred=("p", "mean"),
         frac_positive=("y", "mean"),
         n=("y", "size"),
     ).reset_index(drop=True)
     return tab, brier
+
 
 def threshold_sweep(df: pd.DataFrame, prob_col: str, thresholds: Sequence[float]) -> pd.DataFrame:
     rows = []
@@ -771,33 +775,56 @@ async def main_async():
             LOG.info("Fetching exchange trades for reconciliation…")
             ex = await _init_exchange(key, secret, testnet)
             try:
-                symbols = sorted(set(positions_aug["symbol"].dropna().unique()))
+                # Load markets and keep only symbols the exchange currently knows about.
+                await ex.load_markets()
+                symbols_all = sorted(set(positions_aug["symbol"].dropna().unique()))
+                ex_markets = set(getattr(ex, "markets", {}).keys())
+                supported = [s for s in symbols_all if s in ex_markets]
+                unsupported = sorted(set(symbols_all) - set(supported))
+                if unsupported:
+                    LOG.warning(
+                        "Skipping %d symbols not present on exchange (likely delisted): %s",
+                        len(unsupported),
+                        ", ".join(unsupported[:10]) + ("…" if len(unsupported) > 10 else "")
+                    )
+
                 since = positions_aug["opened_at"].min() - timedelta(days=1) if "opened_at" in positions_aug else None
                 until = positions_aug["closed_at"].max() + timedelta(days=1) if "closed_at" in positions_aug else None
-                trade_map = await fetch_trades_for_symbols(ex, symbols, since=since, until=until)
+
+                trade_map = await fetch_trades_for_symbols(ex, supported, since=since, until=until)
             finally:
                 await ex.close()
-            LOG.info("Reconciling %d positions across %d symbols…", len(positions_aug), len(symbols))
+
+            LOG.info("Reconciling %d positions across %d supported symbols…", len(positions_aug), len(supported))
             mismatches = reconcile_positions(positions_aug, fills, trade_map, tolerance_qty=args.tolerance)
         except Exception as e:
             LOG.warning("Exchange reconciliation skipped due to error: %s", e)
+
 
     # Build report
     ts = _now_utc().strftime("%Y%m%d_%H%M%S")
     out_dir = DEFAULT_RESULTS_DIR / f"audit_{ts}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    md = []
+    md: list[str] = []
     md.append(f"# DONCH — Performance Audit ({ts} UTC)\n")
     md.append(f"**Window:** {start} → {end}\n")
     md.append("## Summary\n")
+
+    # Pre-format numbers safely
+    sharpe_txt = f"{summary.sharpe_daily:.3f}" if summary.sharpe_daily is not None else "nan"
+    ulcer_txt  = f"{summary.ulcer_index:.2f}" if summary.ulcer_index is not None else "nan"
+    mar_txt    = f"{summary.mar_ratio:.3f}" if summary.mar_ratio is not None else "nan"
+    payoff_txt = f"{summary.payoff_ratio:.2f}" if summary.payoff_ratio is not None else "nan"
+
     md.append(
         f"- Trades: **{summary.total_trades}**  |  Win%: **{summary.win_rate:.2f}%**  |  PF: **{summary.profit_factor:.3f}**\n"
-        f"- Expectancy: **{_fmt_money(summary.expectancy)}**  |  Payoff: **{summary.payoff_ratio:.2f}**\n"
+        f"- Expectancy: **{_fmt_money(summary.expectancy)}**  |  Payoff: **{payoff_txt}**\n"
         f"- Net PnL: **{_fmt_money(summary.net_pnl)}**  |  Fees: **{_fmt_money(summary.fees_paid)}**\n"
-        f"- Sharpe(d): **{summary.sharpe_daily:.3f if summary.sharpe_daily is not None else float('nan'):.3f}**  |  Max DD: **{_fmt_pct(summary.max_drawdown_pct)}**  |  Ulcer: **{summary.ulcer_index:.2f if summary.ulcer_index is not None else float('nan'):.2f}**\n"
-        f"- CAGR: **{_fmt_pct(summary.cagr)}**  |  MAR: **{summary.mar_ratio:.3f if summary.mar_ratio is not None else float('nan'):.3f}**\n"
+        f"- Sharpe(d): **{sharpe_txt}**  |  Max DD: **{_fmt_pct(summary.max_drawdown_pct)}**  |  Ulcer: **{ulcer_txt}**\n"
+        f"- CAGR: **{_fmt_pct(summary.cagr)}**  |  MAR: **{mar_txt}**\n"
     )
+
 
     if dist:
         md.append("\n## MAE / MFE\n")
