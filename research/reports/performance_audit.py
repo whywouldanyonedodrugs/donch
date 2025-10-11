@@ -99,6 +99,60 @@ def _autodetect_bybit() -> tuple[Optional[str], Optional[str], bool]:
 def _now_utc() -> datetime:
     return datetime.now(tz=timezone.utc)
 
+async def _load_symbol_maps(exchange):
+    await exchange.load_markets()
+    id_to_symbol = {m['id']: m['symbol'] for m in exchange.markets.values()}
+    # also allow DB symbols like 'ETHUSDT' or '1000PEPEUSDT' to map by ID directly
+    # and a few heuristics for spot vs linear vs coin-margined:
+    def heuristics(db):
+        db = db.upper().replace('/', '').replace(':', '')
+        if db in id_to_symbol:            # exact market id
+            return id_to_symbol[db]
+        if db.endswith('USDT'):
+            base = db[:-4]
+            for cand in (f'{base}/USDT:USDT', f'{base}/USDT', f'{base}/USDT:USD'):
+                if cand in exchange.markets:
+                    return cand
+        return None
+    return heuristics
+
+async def fetch_trades_for_symbols(exchange, symbols, *, since=None, until=None):
+    sym_lookup = await _load_symbol_maps(exchange)
+    results = {}
+    for raw in symbols:
+        sym = sym_lookup(raw)
+        if not sym:
+            LOG.warning("Skipping %s: not in Bybit markets (delisted/unsupported)", raw)
+            results[raw] = None  # mark explicitly as skipped
+            continue
+        # Bybit linear perps will be like 'ETH/USDT:USDT' and CCXT will set category accordingly
+        trades = []
+        ms = int(since.timestamp() * 1000) if since else None
+        until_ms = int(until.timestamp() * 1000) if until else None
+        while True:
+            try:
+                batch = await exchange.fetch_my_trades(sym, since=ms, limit=200)
+            except Exception as exc:
+                LOG.warning("fetch_my_trades failed for %s: %s", sym, exc)
+                trades = None  # signal fetch failure
+                break
+            if not batch:
+                break
+            batch = [t for t in batch if t.get('timestamp')]
+            batch.sort(key=lambda t: int(t['timestamp']))
+            trades.extend(batch)
+            last_ts = int(batch[-1]['timestamp'])
+            if until_ms and last_ts > until_ms:
+                trades = [t for t in trades if t['timestamp'] <= until_ms]
+                break
+            if len(batch) < 200:
+                break
+            ms = last_ts + 1
+            await asyncio.sleep(max(1.0, exchange.rateLimit / 1000.0))
+        results[raw] = trades
+    return results
+
+
 # ─────────────────────────────── Data classes ───────────────────────────────
 
 @dataclasses.dataclass
@@ -494,48 +548,49 @@ def _aggregate_trades(trades: list[dict[str, Any]], side: str, start: datetime, 
         return 0.0, None
     return total_qty, total_notional / total_qty
 
-def reconcile_positions(
-    positions: pd.DataFrame,
-    fills: pd.DataFrame,
-    trades_by_symbol: dict[str, list[dict[str, Any]]],
-    *,
-    tolerance_qty: float = 1e-6,
-) -> list[TradeMismatch]:
-    mismatches: list[TradeMismatch] = []
-    if positions.empty:
-        return mismatches
-
+def reconcile_positions(positions, fills, trades_by_symbol, *, tolerance_qty=1e-6):
+    mismatches = []
     fills = fills.copy()
     if not fills.empty:
-        fills["qty"] = pd.to_numeric(fills["qty"], errors="coerce")
-        fills["price"] = pd.to_numeric(fills["price"], errors="coerce")
+        fills['ts'] = pd.to_datetime(fills['ts'], utc=True, errors='coerce')
+        fills['qty'] = pd.to_numeric(fills['qty'], errors='coerce')
+        fills['price'] = pd.to_numeric(fills['price'], errors='coerce')
 
     for _, row in positions.iterrows():
-        pid = int(row["id"])
-        symbol = str(row["symbol"])
-        opened_at: datetime = row.get("opened_at") or row.get("created_at")
-        closed_at: datetime = row.get("closed_at") or opened_at
+        pid = int(row['id']); symbol = str(row['symbol'])
+        # skip symbols we failed or skipped
+        sym_trades = trades_by_symbol.get(symbol, None)
+        if sym_trades is None:
+            # skipped/unsupported/delisted – report elsewhere, do not count as mismatch
+            continue
+
+        opened_at = row.get('opened_at') or row.get('created_at')
+        closed_at  = row.get('closed_at') or opened_at
         if not isinstance(opened_at, pd.Timestamp):
             continue
         if not isinstance(closed_at, pd.Timestamp):
             closed_at = opened_at
 
-        entry_side = "buy" if str(row.get("side", "short")).lower() == "long" else "sell"
-        exit_side = "sell" if entry_side == "buy" else "buy"
+        # widen entry/exit windows using DB fills if present
+        ff = fills[fills['position_id'] == pid]
+        if not ff.empty:
+            entry_start = ff['ts'].min() - pd.Timedelta(minutes=5)
+            entry_end   = ff['ts'].max() + pd.Timedelta(minutes=5)
+        else:
+            entry_start = opened_at - pd.Timedelta(minutes=5)
+            entry_end   = opened_at + pd.Timedelta(minutes=30)
 
-        symbol_trades = trades_by_symbol.get(symbol, [])
-        entry_qty, entry_avg = _aggregate_trades(
-            symbol_trades,
-            entry_side,
-            opened_at - timedelta(minutes=5),
-            opened_at + timedelta(minutes=5),
-        )
-        exit_qty, exit_avg = _aggregate_trades(
-            symbol_trades,
-            exit_side,
-            opened_at,
-            closed_at + timedelta(minutes=15),
-        )
+        exit_start = opened_at
+        exit_end   = closed_at + pd.Timedelta(minutes=30)
+
+        entry_side = 'buy' if str(row.get('side','short')).lower() == 'long' else 'sell'
+        exit_side  = 'sell' if entry_side == 'buy' else 'buy'
+
+        eqty, eavg = _aggregate_trades(sym_trades or [], entry_side, entry_start, entry_end)
+        xqty, xavg = _aggregate_trades(sym_trades or [], exit_side,  exit_start,  exit_end)
+
+        # ... (unchanged: compare against DB quantities; append mismatches if beyond tolerance)
+
 
         db_size = float(row.get("size") or 0.0)
         if abs(abs(entry_qty) - abs(db_size)) > tolerance_qty:
