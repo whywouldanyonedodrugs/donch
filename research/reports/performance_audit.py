@@ -522,6 +522,198 @@ def segment_performance(df: pd.DataFrame, column: str, min_trades: int = 10) -> 
     stats.sort(key=lambda x: x[1])  # ascending by expectancy
     return stats
 
+# ───────────── Exit reason inference & audit (robust) ─────────────
+
+def _safe_float(x):
+    try:
+        return float(x)
+    except Exception:
+        return np.nan
+
+def _infer_stop_usd(row: pd.Series) -> float:
+    """
+    Compute initial stop distance in USD. Prefer risk_usd; else derive from prices*size.
+    Returns NaN if not computable.
+    """
+    r = _safe_float(row.get("risk_usd"))
+    if r == r and r > 0:
+        return r
+
+    entry = _safe_float(row.get("entry_price"))
+    stop  = _safe_float(row.get("stop_price"))
+    size  = _safe_float(row.get("size"))
+    if all(x == x for x in (entry, stop, size)) and abs(size) > 0 and entry > 0 and stop > 0:
+        return abs(entry - stop) * abs(size)
+
+    return float("nan")
+
+def _infer_tp_usd(row: pd.Series) -> float:
+    """
+    Try to compute TP distance in USD if a static take-profit price was used.
+    Returns NaN if not computable.
+    """
+    tp    = _safe_float(row.get("tp_price"))
+    entry = _safe_float(row.get("entry_price"))
+    size  = _safe_float(row.get("size"))
+    if all(x == x for x in (tp, entry, size)) and abs(size) > 0 and tp > 0 and entry > 0:
+        return abs(tp - entry) * abs(size)
+    return float("nan")
+
+def _near(a: float, b: float, rel_tol: float = 0.15, abs_tol: float = 5e-3) -> bool:
+    """is a ≈ b with relative/absolute tolerance (handles small-dollar alts)."""
+    if not (a == a and b == b):
+        return False
+    if abs(a - b) <= abs_tol:
+        return True
+    denom = max(abs(a), abs(b), abs_tol)
+    return abs(a - b) / denom <= rel_tol
+
+def _infer_reason(row: pd.Series, *, rel_tol=0.15, abs_tol=5e-3, deadline_tol_min=3.0) -> str:
+    """
+    Infer exit reason using MAE/MFE, stop/tp distances, and exit_deadline proximity.
+
+    Returns: "SL" | "TP" | "TL" | "MANUAL" | "UNKNOWN"
+    """
+    pnl      = _safe_float(row.get("net_pnl", row.get("pnl")))
+    mae      = _safe_float(row.get("mae_usd"))
+    mfe      = _safe_float(row.get("mfe_usd"))
+    stop_usd = _infer_stop_usd(row)
+    tp_usd   = _infer_tp_usd(row)
+
+    closed_at     = row.get("closed_at")
+    exit_deadline = row.get("exit_deadline")
+
+    # 1) Time-limit (deadline) proximity
+    if isinstance(closed_at, pd.Timestamp) and isinstance(exit_deadline, pd.Timestamp):
+        dt_min = abs((closed_at - exit_deadline).total_seconds()) / 60.0
+        if dt_min <= deadline_tol_min:
+            return "TL"
+
+    # 2) Stop-loss (for losers) — loser MAE ≈ stop distance, or |pnl| ≈ stop_usd
+    if pnl == pnl and pnl <= 0:
+        if stop_usd == stop_usd:
+            if (mae == mae and _near(mae, stop_usd, rel_tol=rel_tol, abs_tol=abs_tol)) or \
+               _near(abs(pnl), stop_usd, rel_tol=rel_tol, abs_tol=abs_tol):
+                return "SL"
+
+    # 3) Take-profit (for winners) — MFE or PnL near TP distance if known, else strong harvest
+    if pnl == pnl and pnl > 0:
+        if tp_usd == tp_usd:
+            if (mfe == mfe and _near(mfe, tp_usd, rel_tol=rel_tol, abs_tol=abs_tol)) or \
+               _near(pnl, tp_usd * 0.9, rel_tol=rel_tol, abs_tol=abs_tol):
+                return "TP"
+        # If we don't know TP distance but harvest is very high (e.g., captured > 70% of MFE)
+        if mfe == mfe and mfe > 0:
+            harvest = pnl / mfe
+            if harvest >= 0.7:
+                return "TP"
+
+    # 4) Manual / Unknown fallback
+    # If neither SL/TP/TL criteria match, but pnl ≈ 0 (flat near break-even), treat as MANUAL flatten
+    if pnl == pnl and abs(pnl) <= abs_tol:
+        return "MANUAL"
+
+    return "UNKNOWN"
+
+def audit_exit_reasons(
+    df: pd.DataFrame,
+    *,
+    rel_tol: float = 0.15,
+    abs_tol: float = 5e-3,
+    deadline_tol_min: float = 3.0,
+    max_rows: int = 25,
+) -> dict[str, Any]:
+    """
+    Build recorded distribution, inferred distribution, confusion (recorded vs inferred),
+    suspicious rows where they disagree or inference is UNKNOWN, and coverage counters.
+    """
+    if df.empty:
+        return {
+            "recorded_dist": pd.Series(dtype=int),
+            "inferred_dist": pd.Series(dtype=int),
+            "confusion": pd.DataFrame(),
+            "suspicious": pd.DataFrame(),
+            "coverage": {},
+        }
+
+    work = df.copy()
+    # Prepare required numeric fields
+    for col in ("pnl", "net_pnl", "mae_usd", "mfe_usd", "risk_usd", "entry_price", "stop_price", "tp_price", "size"):
+        if col in work.columns:
+            work[col] = pd.to_numeric(work[col], errors="coerce")
+
+    # Inference
+    work["exit_reason_inferred"] = work.apply(
+        lambda r: _infer_reason(r, rel_tol=rel_tol, abs_tol=abs_tol, deadline_tol_min=deadline_tol_min), axis=1
+    )
+
+    # Recorded reason (if present)
+    recorded_col = None
+    for c in work.columns:
+        if c.lower() in {"exit_reason", "reason", "close_reason"}:
+            recorded_col = c
+            break
+    if recorded_col is None:
+        work["exit_reason_recorded"] = pd.Series(["(missing)"] * len(work), index=work.index)
+    else:
+        work["exit_reason_recorded"] = work[recorded_col].astype(str).fillna("(missing)").str.upper()
+
+    # Distributions
+    recorded_dist = work["exit_reason_recorded"].value_counts(dropna=False).sort_index()
+    inferred_dist = work["exit_reason_inferred"].value_counts(dropna=False).sort_index()
+
+    # Confusion matrix
+    confusion = (
+        work.pivot_table(
+            index="exit_reason_recorded",
+            columns="exit_reason_inferred",
+            values="id" if "id" in work.columns else "symbol",
+            aggfunc="count",
+            fill_value=0,
+        )
+        .sort_index()
+        .sort_index(axis=1)
+    )
+
+    # Suspicious rows
+    sus = work[
+        (work["exit_reason_recorded"] != "(missing)") &
+        (work["exit_reason_recorded"] != work["exit_reason_inferred"])
+        | (work["exit_reason_inferred"].isin(["UNKNOWN"]))
+    ].copy()
+
+    keep_cols = [
+        c for c in [
+            "id", "symbol", "opened_at", "closed_at",
+            "net_pnl", "mae_usd", "mfe_usd", "risk_usd",
+            "entry_price", "stop_price", "tp_price", "size",
+            "exit_deadline",
+            "exit_reason_recorded", "exit_reason_inferred",
+        ] if c in work.columns
+    ]
+    suspicious = sus[keep_cols].head(max_rows)
+
+    # Coverage counters for diagnostics sections
+    cov = {
+        "n_total": int(len(work)),
+        "n_have_mae": int(work["mae_usd"].notna().sum()) if "mae_usd" in work else 0,
+        "n_have_mfe": int(work["mfe_usd"].notna().sum()) if "mfe_usd" in work else 0,
+        "n_have_risk_or_stop": int(
+            ((work["risk_usd"].notna() & (work["risk_usd"] > 0)) |
+             (work[["entry_price","stop_price","size"]].notna().all(axis=1) if set(["entry_price","stop_price","size"]).issubset(work.columns) else False)
+            ).sum()
+        ) if "risk_usd" in work.columns else 0,
+    }
+
+    return {
+        "recorded_dist": recorded_dist,
+        "inferred_dist": inferred_dist,
+        "confusion": confusion,
+        "suspicious": suspicious,
+        "coverage": cov,
+    }
+
+
 # ───────────────────────── Meta-model diagnostics ─────────────────────────
 
 def _find_winprob_column(df: pd.DataFrame) -> Optional[str]:
@@ -1016,6 +1208,67 @@ async def main_async():
                         f"| {row['reason_recorded']} "
                         f"| {row['reason_inferred']} "
                         f"| {row['flag']} |")
+
+
+    # Exit-reason audit block
+    audit = audit_exit_reasons(positions_aug, rel_tol=0.15, abs_tol=5e-3, deadline_tol_min=3.0, max_rows=25)
+
+    md.append("\n## Exit Reasons\n")
+    cov = audit["coverage"]
+    md.append(f"_Coverage: n={cov.get('n_total',0)} | has MAE={cov.get('n_have_mae',0)} | "
+              f"has MFE={cov.get('n_have_mfe',0)} | has risk/stop={cov.get('n_have_risk_or_stop',0)}_")
+
+    # Recorded distribution
+    rd = audit["recorded_dist"]
+    if rd is not None and len(rd) > 0:
+        md.append("\n**Recorded (from DB):**")
+        md.append("\n| reason | n |")
+        md.append("|---|---:|")
+        for k, v in rd.sort_index().items():
+            md.append(f"| {k} | {int(v)} |")
+    else:
+        md.append("\n_No recorded exit_reason column found._")
+
+    # Inferred distribution
+    infd = audit["inferred_dist"]
+    if infd is not None and len(infd) > 0:
+        md.append("\n\n**Inferred (from MAE/MFE/stop/TP/deadline):**")
+        md.append("\n| reason | n |")
+        md.append("|---|---:|")
+        for k, v in infd.sort_index().items():
+            md.append(f"| {k} | {int(v)} |")
+
+    # Confusion table
+    conf = audit["confusion"]
+    if conf is not None and not conf.empty:
+        md.append("\n\n**Recorded vs Inferred (counts):**")
+        cols = list(conf.columns)
+        md.append("| recorded \\ inferred | " + " | ".join(cols) + " |")
+        md.append("|---" + "|---" * len(cols) + "|")
+        for idx, row in conf.iterrows():
+            md.append("| " + str(idx) + " | " + " | ".join(str(int(row[c])) for c in cols) + " |")
+
+    # Suspicious examples
+    sus = audit["suspicious"]
+    if sus is not None and not sus.empty:
+        md.append("\n\n**Suspicious rows (first 25):**")
+        # keep it compact
+        md.append("| id | symbol | closed_at | pnl | mae | mfe | risk | rec | inf |")
+        md.append("|---:|:------|:----------|----:|----:|----:|----:|:----:|:---:|")
+        for _, r in sus.iterrows():
+            md.append(
+                f"| {int(r['id']) if 'id' in r and pd.notna(r['id']) else ''} "
+                f"| {r.get('symbol','')} "
+                f"| {str(r.get('closed_at',''))[:19]} "
+                f"| {(_safe_float(r.get('net_pnl', r.get('pnl')))):+.2f} "
+                f"| {(_safe_float(r.get('mae_usd'))):+.2f} "
+                f"| {(_safe_float(r.get('mfe_usd'))):+.2f} "
+                f"| {(_safe_float(r.get('risk_usd'))):+.2f} "
+                f"| {r.get('exit_reason_recorded','')} "
+                f"| {r.get('exit_reason_inferred','')} |"
+            )
+    else:
+        md.append("\n\n_No suspicious exit reason rows detected (good!)._")
 
 
     if "r_multiple" in positions_aug.columns:
