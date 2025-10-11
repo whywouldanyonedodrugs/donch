@@ -35,6 +35,7 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
+from research.reports.perf_extras import build_extras_markdown
 
 import asyncpg
 import pandas as pd
@@ -115,42 +116,6 @@ async def _load_symbol_maps(exchange):
                     return cand
         return None
     return heuristics
-
-async def fetch_trades_for_symbols(exchange, symbols, *, since=None, until=None):
-    sym_lookup = await _load_symbol_maps(exchange)
-    results = {}
-    for raw in symbols:
-        sym = sym_lookup(raw)
-        if not sym:
-            LOG.warning("Skipping %s: not in Bybit markets (delisted/unsupported)", raw)
-            results[raw] = None  # mark explicitly as skipped
-            continue
-        # Bybit linear perps will be like 'ETH/USDT:USDT' and CCXT will set category accordingly
-        trades = []
-        ms = int(since.timestamp() * 1000) if since else None
-        until_ms = int(until.timestamp() * 1000) if until else None
-        while True:
-            try:
-                batch = await exchange.fetch_my_trades(sym, since=ms, limit=200)
-            except Exception as exc:
-                LOG.warning("fetch_my_trades failed for %s: %s", sym, exc)
-                trades = None  # signal fetch failure
-                break
-            if not batch:
-                break
-            batch = [t for t in batch if t.get('timestamp')]
-            batch.sort(key=lambda t: int(t['timestamp']))
-            trades.extend(batch)
-            last_ts = int(batch[-1]['timestamp'])
-            if until_ms and last_ts > until_ms:
-                trades = [t for t in trades if t['timestamp'] <= until_ms]
-                break
-            if len(batch) < 200:
-                break
-            ms = last_ts + 1
-            await asyncio.sleep(max(1.0, exchange.rateLimit / 1000.0))
-        results[raw] = trades
-    return results
 
 
 # ─────────────────────────────── Data classes ───────────────────────────────
@@ -587,26 +552,24 @@ def reconcile_positions(positions, fills, trades_by_symbol, *, tolerance_qty=1e-
         exit_side  = 'sell' if entry_side == 'buy' else 'buy'
 
         eqty, eavg = _aggregate_trades(sym_trades or [], entry_side, entry_start, entry_end)
-        xqty, xavg = _aggregate_trades(sym_trades or [], exit_side,  exit_start,  exit_end)
-
-        # ... (unchanged: compare against DB quantities; append mismatches if beyond tolerance)
-
+        xqty,  xavg = _aggregate_trades(sym_trades or [], exit_side,  exit_start,  exit_end)
 
         db_size = float(row.get("size") or 0.0)
-        if abs(abs(entry_qty) - abs(db_size)) > tolerance_qty:
+        if abs(abs(eqty) - abs(db_size)) > tolerance_qty:
             mismatches.append(
                 TradeMismatch(
                     position_id=pid,
                     symbol=symbol,
                     reason="ENTRY_SIZE_MISMATCH",
                     db_qty=db_size,
-                    exchange_qty=entry_qty,
+                    exchange_qty=eqty,
                     db_avg_price=float(row.get("entry_price") or 0.0),
-                    exchange_avg_price=entry_avg,
+                    exchange_avg_price=eavg,
                     opened_at=opened_at.to_pydatetime(),
                     closed_at=closed_at.to_pydatetime() if isinstance(closed_at, pd.Timestamp) else None,
                 )
             )
+
 
         exit_fills = fills[fills["position_id"] == pid]
         db_exit_qty = exit_fills["qty"].abs().sum() if not exit_fills.empty else abs(db_size)
@@ -616,16 +579,16 @@ def reconcile_positions(positions, fills, trades_by_symbol, *, tolerance_qty=1e-
             else None
         )
 
-        if abs(exit_qty - db_exit_qty) > tolerance_qty:
+        if abs(xqty - db_exit_qty) > tolerance_qty:
             mismatches.append(
                 TradeMismatch(
                     position_id=pid,
                     symbol=symbol,
                     reason="EXIT_SIZE_MISMATCH",
                     db_qty=db_exit_qty,
-                    exchange_qty=exit_qty,
+                    exchange_qty=xqty,
                     db_avg_price=db_exit_avg,
-                    exchange_avg_price=exit_avg,
+                    exchange_avg_price=xavg,
                     opened_at=opened_at.to_pydatetime(),
                     closed_at=closed_at.to_pydatetime() if isinstance(closed_at, pd.Timestamp) else None,
                 )
@@ -934,6 +897,19 @@ async def main_async():
             )
     elif key and secret:
         md.append("\n_Exchange reconciliation passed – no quantity mismatches detected._")
+
+    # ── Advanced analytics (vol-targeted equity, SQN/E-ratio, risk-of-ruin, stops/TP, rolling calibration, TWR)
+    extras_md = build_extras_markdown(
+        positions=positions_aug,
+        equity=equity,
+        prob_col=prob_col,
+        rolling_window=500,
+        starting_equity=starting_equity,
+        vol_target_annual=0.10,  # 10% annualized target for the shadow curve (tweakable)
+    )
+    if extras_md:
+        md.append("\n---\n")
+        md.append(extras_md)
 
     # Save report & optional charts
     charts = _maybe_make_plots(out_dir, eq_curve, dd_curve, calib_tab, sweep_tab)
