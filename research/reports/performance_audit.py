@@ -367,6 +367,148 @@ def mae_mfe_distribution(df: pd.DataFrame) -> dict[str, Any]:
             out["mfe"] = {"mean": float(mfe.mean()), "median": float(mfe.median()), "p95": float(mfe.quantile(0.95))}
     return out
 
+# ───────────────── Stop/TP consistency (robust, MAE/MFE/R-based) ─────────────────
+
+def _num(s: pd.Series, default=np.nan) -> pd.Series:
+    return pd.to_numeric(s, errors="coerce").fillna(default)
+
+def _approx_eq(a: pd.Series, b: pd.Series, rel=0.12) -> pd.Series:
+    """Vectorized ~relative equality: |a-b| <= rel * max(1, |b|)."""
+    return (a - b).abs() <= rel * (b.abs().clip(lower=1.0))
+
+def exit_consistency_audit(
+    df: pd.DataFrame,
+    *,
+    tp_r_guess: float = 8.0,       # your current TP ≈ +8R
+    stop_r_guess: float = -1.0,    # stop at -1R
+    rel_tol: float = 0.20          # tolerance for noisy MAE/MFE, fees, slippage
+) -> dict[str, Any]:
+    """
+    Cross-check recorded exit reasons against what MAE/MFE/R imply.
+    Requires: net_pnl, mae_usd, mfe_usd, risk_usd (or r_multiple), optionally exit_reason.
+    Never assumes intra-trade resizing.
+    """
+
+    if df.empty:
+        return {"summary": {}, "mismatches": pd.DataFrame()}
+
+    x = df.copy()
+    # Coerce numerics
+    for c in ("net_pnl", "mae_usd", "mfe_usd", "risk_usd", "r_multiple"):
+        if c in x.columns:
+            x[c] = _num(x[c])
+
+    # Prefer r_multiple if present; else compute from risk_usd
+    if "r_multiple" in x and x["r_multiple"].notna().any():
+        r = x["r_multiple"]
+    else:
+        if "risk_usd" in x and x["risk_usd"].abs().gt(0).any():
+            r = x["net_pnl"] / x["risk_usd"].abs().replace(0, np.nan)
+        else:
+            r = pd.Series(np.nan, index=x.index)
+
+    # If we have usable risk_usd, treat it as the *initial stop distance in USD*
+    has_risk = "risk_usd" in x and x["risk_usd"].abs().gt(0).any()
+    stop_usd = x["risk_usd"].abs() if has_risk else pd.Series(np.nan, index=x.index)
+
+    # Recorded reason (normalize)
+    reason_raw = x.get("exit_reason", pd.Series("", index=x.index)).astype(str).str.upper().str.strip()
+    reason_rec = reason_raw.replace({
+        "STOP": "STOP", "SL": "STOP", "STOP_LOSS": "STOP",
+        "TP": "TP", "TAKE_PROFIT": "TP",
+        "TIME": "TIME", "TL": "TIME", "TIME_LIMIT": "TIME"
+    })
+
+    # Inferred reason by R
+    infer_by_r = pd.Series("OTHER", index=x.index)
+    infer_by_r = np.where(r <= stop_r_guess * (1 - rel_tol), "STOP", infer_by_r)
+    infer_by_r = np.where(r >= tp_r_guess   * (1 - rel_tol), "TP",   infer_by_r)
+    infer_by_r = pd.Series(infer_by_r, index=x.index)
+
+    # Inferred “stop proximity” by MAE vs initial stop distance
+    # If a loser and MAE ~ stop_usd → likely STOP. If loser and MAE << stop_usd → suspect TIME/other.
+    loser = x["net_pnl"] < 0
+    near_stop = pd.Series(False, index=x.index)
+    far_from_stop = pd.Series(False, index=x.index)
+    if has_risk and "mae_usd" in x:
+        near_stop = loser & _approx_eq(x["mae_usd"].abs(), stop_usd, rel=max(rel_tol, 0.15))
+        far_from_stop = loser & (x["mae_usd"].abs() < 0.5 * stop_usd)
+
+    # Final inferred reason combining signals
+    reason_inf = pd.Series("OTHER", index=x.index)
+    reason_inf = np.where(infer_by_r == "STOP", "STOP", reason_inf)
+    reason_inf = np.where(infer_by_r == "TP", "TP", reason_inf)
+    reason_inf = np.where((infer_by_r == "OTHER") & near_stop, "STOP", reason_inf)
+    reason_inf = np.where((infer_by_r == "OTHER") & (loser & far_from_stop), "TIME", reason_inf)
+    reason_inf = pd.Series(reason_inf, index=x.index)
+
+    # Metrics akin to your diagnostics (guarded)
+    winners = x["net_pnl"] > 0
+    losers  = loser
+
+    stop_adequacy = np.nan
+    stop_waste    = np.nan
+    tp_harvest    = np.nan
+    mae_p80_win   = np.nan
+    mfe_p50_win   = np.nan
+    mfe_p70_win   = np.nan
+
+    if has_risk and "mae_usd" in x and winners.any():
+        # Share of winners whose MAE would have *exceeded* the initial stop distance (bad, should be ~0)
+        stop_adequacy = float((winners & (x["mae_usd"].abs() >= 1.0 * stop_usd * (1 - rel_tol))).sum() / winners.sum() * 100)
+
+    if has_risk and "mae_usd" in x and losers.any():
+        # Share of losers with MAE < 0.5×stop (likely not a true stop-out if reason says STOP)
+        stop_waste = float((losers & (x["mae_usd"].abs() < 0.5 * stop_usd * (1 + rel_tol))).sum() / losers.sum() * 100)
+
+    if "mfe_usd" in x and winners.any():
+        with np.errstate(divide='ignore', invalid='ignore'):
+            capture = x.loc[winners, "net_pnl"] / x.loc[winners, "mfe_usd"].replace(0, np.nan).abs()
+        tp_harvest  = float(np.nanmedian(capture.dropna())) * 100 if capture.notna().any() else np.nan
+
+    if "mae_usd" in x and winners.any():
+        mae_p80_win = float(x.loc[winners, "mae_usd"].abs().quantile(0.80))
+    if "mfe_usd" in x and winners.any():
+        mfe_p50_win = float(x.loc[winners, "mfe_usd"].abs().quantile(0.50))
+        mfe_p70_win = float(x.loc[winners, "mfe_usd"].abs().quantile(0.70))
+
+    # Mismatch table
+    mismatch = pd.DataFrame({
+        "id": x.get("id"),
+        "symbol": x.get("symbol"),
+        "r_multiple": r,
+        "risk_usd": stop_usd if has_risk else np.nan,
+        "mae_usd": x.get("mae_usd"),
+        "mfe_usd": x.get("mfe_usd"),
+        "net_pnl": x.get("net_pnl"),
+        "reason_recorded": reason_rec,
+        "reason_inferred": reason_inf,
+    })
+
+    # Flag “improbable STOP” (recorded STOP but far from stop), and “improbable TIME” (recorded TIME but near stop)
+    improbable_stop = (mismatch["reason_recorded"] == "STOP") & far_from_stop
+    improbable_time = (mismatch["reason_recorded"] == "TIME") & near_stop
+    probable_tp_but_not = (mismatch["reason_recorded"] != "TP") & (r >= tp_r_guess * (1 - rel_tol))
+
+    mismatch["flag"] = ""
+    mismatch.loc[improbable_stop, "flag"] = "REC=STOP but MAE << stop (suspect)"
+    mismatch.loc[improbable_time, "flag"] = "REC=TIME but MAE ~ stop (likely STOP)"
+    mismatch.loc[probable_tp_but_not, "flag"] = "R >> TP threshold; REC not TP (check)"
+
+    mismatches = mismatch[mismatch["flag"] != ""].copy().sort_values("id").reset_index(drop=True)
+
+    return {
+        "summary": {
+            "stop_adequacy_pct": stop_adequacy,     # winners that would have tripped initial stop (want ~0%)
+            "stop_waste_pct": stop_waste,           # losers that never got close to stop (should be low if most are SL)
+            "tp_harvest_pct": tp_harvest,           # median share of MFE captured on winners
+            "mae_p80_winners": mae_p80_win,
+            "mfe_p50_winners": mfe_p50_win,
+            "mfe_p70_winners": mfe_p70_win,
+        },
+        "mismatches": mismatches,
+    }
+
 def segment_performance(df: pd.DataFrame, column: str, min_trades: int = 10) -> list[tuple[str, float, float, int]]:
     if column not in df.columns:
         return []
@@ -754,6 +896,8 @@ async def main_async():
     starting_equity = float(os.getenv("STARTING_EQUITY", "1000")) if args.starting_equity is None else args.starting_equity
     summary = compute_performance_summary(positions_aug, equity, starting_equity=starting_equity)
     dist = mae_mfe_distribution(positions_aug)
+    exit_audit = exit_consistency_audit(positions_aug, tp_r_guess=8.0, stop_r_guess=-1.0, rel_tol=0.20)
+    
     session_segs = segment_performance(positions_aug, "session_tag_at_entry")
     dow_segs = segment_performance(positions_aug, "day_of_week_at_entry")
     # Hour-of-day from opened_at if not present
@@ -845,9 +989,34 @@ async def main_async():
 
 
     if dist:
-        md.append("\n## MAE / MFE\n")
-        for k, s in dist.items():
-            md.append(f"- {k.upper()}: mean **{s['mean']:+.2f}**, median **{s['median']:+.2f}**, p95 **{s['p95']:+.2f}**")
+        md.append("\n## Stop / Take-Profit Diagnostics (audited)\n")
+        ea = exit_audit["summary"]
+        def _p(x): return "n/a" if x != x else f"{x:.1f}%"
+        md.append(f"- Stop adequacy (winners with MAE > stop): **{_p(ea.get('stop_adequacy_pct', float('nan')))}**")
+        md.append(f"- Stop waste (losers with MAE < 0.5×stop): **{_p(ea.get('stop_waste_pct', float('nan')))}**")
+        md.append(f"- TP harvest (median pnl/MFE on winners): **{_p(ea.get('tp_harvest_pct', float('nan')))}**")
+        if np.isfinite(ea.get('mae_p80_winners', float('nan'))):
+            md.append(f"- Quantiles (winners): MAE p80 ≈ **{ea['mae_p80_winners']:+.2f}**, "
+                    f"MFE p50 ≈ **{ea['mfe_p50_winners']:+.2f}**, p70 ≈ **{ea['mfe_p70_winners']:+.2f}**")
+
+        # Optional: list suspicious trades (first 25) so you can eyeball logs
+        mm = exit_audit["mismatches"]
+        if not mm.empty:
+            md.append("\n### Exit Consistency Audit — Anomalies (first 25)")
+            md.append("| id | symbol | r | risk_usd | mae | mfe | net | recorded | inferred | note |")
+            md.append("|---:|:------|---:|---:|---:|---:|---:|:---|:---|:---|")
+            for _, row in mm.head(25).iterrows():
+                md.append(f"| {int(row['id']) if pd.notna(row['id']) else ''} "
+                        f"| {str(row['symbol'])} "
+                        f"| {row['r_multiple']:+.2f} "
+                        f"| {row['risk_usd']:+.2f} "
+                        f"| {row['mae_usd']:+.2f} "
+                        f"| {row['mfe_usd']:+.2f} "
+                        f"| {row['net_pnl']:+.2f} "
+                        f"| {row['reason_recorded']} "
+                        f"| {row['reason_inferred']} "
+                        f"| {row['flag']} |")
+
 
     if "r_multiple" in positions_aug.columns:
         r = positions_aug["r_multiple"].dropna()
