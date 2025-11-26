@@ -3,7 +3,7 @@ STRATEGY_SPEC_PATH: "strategies/donch_pullback_long.yaml"
 
 # Sizing
 RISK_MODE: "cash"           # or "percent"
-RISK_USD: 40.0              # used if RISK_MODE="cash"
+RISK_USD: 20.0              # used if RISK_MODE="cash"
 RISK_EQUITY_PCT: 0.01       # used if RISK_MODE="percent"
 MIN_TRADE_AUTOPAD_ENABLED: false
 MIN_TRADE_AUTOPAD_CAP_USD: 5.0
@@ -32,8 +32,8 @@ ETH_BAROMETER_ENABLED: true        # as requested for testing
 REGIME_BLOCK_WHEN_DOWN: false       # let entries through while testing
 # optional sizing-by-prob (already supported in your bot)
 WINPROB_SIZING_ENABLED: true
-WINPROB_MIN_MULTIPLIER: 0.50
-WINPROB_MAX_MULTIPLIER: 2.00
+WINPROB_MIN_MULTIPLIER: 0.80
+WINPROB_MAX_MULTIPLIER: 1.60
 WINPROB_PROB_FLOOR: 0.60
 WINPROB_PROB_CAP: 0.90
 
