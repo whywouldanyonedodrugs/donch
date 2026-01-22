@@ -112,7 +112,16 @@ def _parse_manifest(manifest_obj: Any) -> List[FeatureSpec]:
 
     if isinstance(manifest_obj, dict):
         if "features" in manifest_obj and isinstance(manifest_obj["features"], dict):
-            items = list(manifest_obj["features"].items())
+            inner = manifest_obj["features"]
+
+            # If "features" is actually a schema container (your current export), parse it via the primary path.
+            if (("cat_cols" in inner) or ("num_cols" in inner)) or (
+                isinstance(inner.get("schema"), dict) and (("cat_cols" in inner["schema"]) or ("num_cols" in inner["schema"]))
+            ):
+                return _parse_manifest(inner)
+
+            # Otherwise treat as old format: feature_name -> {spec...}
+            items = list(inner.items())
         else:
             # IMPORTANT: skip schema/meta keys so we never treat cat_cols as a feature
             meta_keys = {
@@ -121,6 +130,7 @@ def _parse_manifest(manifest_obj: Any) -> List[FeatureSpec]:
                 "version", "created_at", "notes", "schema",
             }
             items = [(k, v) for k, v in manifest_obj.items() if isinstance(k, str) and k not in meta_keys]
+
 
     elif isinstance(manifest_obj, list):
         for i, it in enumerate(manifest_obj):
