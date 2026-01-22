@@ -32,13 +32,104 @@ def _is_nan(x: Any) -> bool:
 
 
 def _parse_manifest(manifest_obj: Any) -> List[FeatureSpec]:
+    """
+    Supports multiple manifest formats.
+
+    Format A (schema container; your current):
+      {
+        "cat_cols": [...],
+        "num_cols": [...],
+        "dtypes": { "feat": "float64", ... },              (optional)
+        "categories": { "feat": [...], ... },             (optional)
+        "codes": { "feat": { "A": 0, ... }, ... }         (optional)
+      }
+
+    Format B (features dict):
+      { "features": { "feat": {"dtype": "...", ...}, ... } }
+
+    Format C (flat dict mapping feat->spec):
+      { "feat": {"dtype": "...", ...}, ... }
+
+    Format D (list of dicts):
+      [ {"name": "...", "dtype": "...", ...}, ... ]
+    """
+    # -------- Format A: schema container with cat_cols/num_cols ----------
+    if isinstance(manifest_obj, dict) and ("cat_cols" in manifest_obj or "num_cols" in manifest_obj):
+        cat_cols = manifest_obj.get("cat_cols") or []
+        num_cols = manifest_obj.get("num_cols") or []
+
+        if not isinstance(cat_cols, list) or not all(isinstance(x, str) for x in cat_cols):
+            raise BundleError(f"feature_manifest: cat_cols must be a list[str], got: {type(cat_cols)}")
+        if not isinstance(num_cols, list) or not all(isinstance(x, str) for x in num_cols):
+            raise BundleError(f"feature_manifest: num_cols must be a list[str], got: {type(num_cols)}")
+
+        # Optional helpers
+        dtypes = (
+            manifest_obj.get("dtypes")
+            or manifest_obj.get("dtype_map")
+            or manifest_obj.get("raw_dtypes")
+            or {}
+        )
+        if dtypes is None:
+            dtypes = {}
+        if not isinstance(dtypes, dict):
+            raise BundleError(f"feature_manifest: dtypes must be a dict, got: {type(dtypes)}")
+
+        categories_map = manifest_obj.get("categories") or manifest_obj.get("cats") or {}
+        if categories_map is None:
+            categories_map = {}
+        if not isinstance(categories_map, dict):
+            raise BundleError(f"feature_manifest: categories must be a dict, got: {type(categories_map)}")
+
+        codes_map = manifest_obj.get("codes") or manifest_obj.get("codebook") or manifest_obj.get("codebooks") or {}
+        if codes_map is None:
+            codes_map = {}
+        if not isinstance(codes_map, dict):
+            raise BundleError(f"feature_manifest: codes must be a dict, got: {type(codes_map)}")
+
+        specs: List[FeatureSpec] = []
+
+        for name in cat_cols:
+            dt = str(dtypes.get(name, "category"))
+            cats = categories_map.get(name)
+            codes = codes_map.get(name)
+            specs.append(
+                FeatureSpec(
+                    name=name,
+                    kind="categorical",
+                    dtype=dt,
+                    categories=list(cats) if isinstance(cats, (list, tuple)) else None,
+                    codes=dict(codes) if isinstance(codes, dict) else None,
+                )
+            )
+
+        for name in num_cols:
+            dt = str(dtypes.get(name, "float64"))
+            specs.append(FeatureSpec(name=name, kind="numeric", dtype=dt))
+
+        names = [s.name for s in specs]
+        if len(names) != len(set(names)):
+            dup = sorted({n for n in names if names.count(n) > 1})
+            raise BundleError(f"feature_manifest has duplicate feature names: {dup}")
+
+        return specs
+
+    # -------- Format B/C: dict of features ----------
     items: List[Tuple[str, Any]] = []
 
     if isinstance(manifest_obj, dict):
         if "features" in manifest_obj and isinstance(manifest_obj["features"], dict):
             items = list(manifest_obj["features"].items())
         else:
-            items = [(k, v) for k, v in manifest_obj.items() if isinstance(k, str)]
+            # Skip known meta-keys if present in other formats
+            meta_keys = {
+                "cat_cols", "num_cols", "dtypes", "dtype_map", "raw_dtypes",
+                "categories", "cats", "codes", "codebook", "codebooks",
+                "version", "created_at", "notes", "schema",
+            }
+            items = [(k, v) for k, v in manifest_obj.items() if isinstance(k, str) and k not in meta_keys]
+
+    # -------- Format D: list of dicts ----------
     elif isinstance(manifest_obj, list):
         for i, it in enumerate(manifest_obj):
             if isinstance(it, dict) and "name" in it:
@@ -94,7 +185,6 @@ def _parse_manifest(manifest_obj: Any) -> List[FeatureSpec]:
         raise BundleError(f"feature_manifest has duplicate feature names: {dup}")
 
     return specs
-
 
 class WinProbScorer:
     """
