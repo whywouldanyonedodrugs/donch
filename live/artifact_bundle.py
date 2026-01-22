@@ -4,9 +4,10 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import joblib
 
@@ -14,11 +15,29 @@ LOG = logging.getLogger("bundle")
 
 
 class BundleError(RuntimeError):
-    """Fatal artifact-bundle error: missing files, invalid format, load failure."""
+    pass
 
 
-class SchemaError(ValueError):
-    """Strict schema mismatch for raw features."""
+@dataclass(frozen=True)
+class ArtifactBundle:
+    meta_dir: Path
+    bundle_id: str
+    model_kind: str  # "sklearn_pipeline" or "legacy_lgbm"
+    feature_manifest: dict
+
+    # Artifacts
+    model: Any
+    calibrator: Optional[Any]
+    calibrator_path: Optional[Path]
+    pstar: Optional[float]
+
+    # optional extras (used by other live components)
+    thresholds: Optional[dict]
+    sizing_curve_path: Optional[Path]
+    deployment_config: Optional[dict]
+
+    # verification info
+    file_hashes: Dict[str, str]
 
 
 def sha256_file(path: Path, chunk_bytes: int = 1024 * 1024) -> str:
@@ -33,261 +52,277 @@ def sha256_file(path: Path, chunk_bytes: int = 1024 * 1024) -> str:
 
 
 def bundle_id_from_hashes(file_hashes: Dict[str, str]) -> str:
+    """
+    Stable bundle id from (filename, sha256) pairs.
+    """
+    items = sorted((k, v) for k, v in file_hashes.items())
     h = hashlib.sha256()
-    for name in sorted(file_hashes.keys()):
+    for name, digest in items:
         h.update(name.encode("utf-8"))
-        h.update(b":")
-        h.update(file_hashes[name].encode("utf-8"))
-        h.update(b"\n")
-    return h.hexdigest()
+        h.update(b"\x00")
+        h.update(digest.encode("utf-8"))
+        h.update(b"\x00")
+    return h.hexdigest()[:16]
 
 
 def _read_json(path: Path) -> Any:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception as e:
-        raise BundleError(f"Failed to parse JSON: {path} ({e})") from e
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _first_existing(meta_dir: Path, candidates: List[str]) -> Optional[Path]:
-    for n in candidates:
+def _first_existing(meta_dir: Path, names: Iterable[str]) -> Optional[Path]:
+    for n in names:
         p = meta_dir / n
         if p.exists():
             return p
     return None
 
 
-def _require(meta_dir: Path, path: Optional[Path], label: str) -> Path:
-    if path is None or (not path.exists()):
-        present = sorted([p.name for p in meta_dir.glob("*") if p.is_file()])
-        raise BundleError(f"Missing required {label} in {meta_dir}. Present files: {present}")
-    return path
+def _load_checksums_map(obj: Any) -> Dict[str, str]:
+    """
+    Accepts common shapes:
+      - {"file": "sha", ...}
+      - {"files": {"file": "sha", ...}}
+      - {"sha256": {"file": "sha", ...}}
+    """
+    if isinstance(obj, dict):
+        if isinstance(obj.get("files"), dict):
+            obj = obj["files"]
+        elif isinstance(obj.get("sha256"), dict):
+            obj = obj["sha256"]
+
+    if not isinstance(obj, dict):
+        raise BundleError(f"checksums_sha256.json must be dict-like, got {type(obj)}")
+
+    out: Dict[str, str] = {}
+    for k, v in obj.items():
+        if isinstance(k, str) and isinstance(v, str):
+            out[k] = v
+
+    if not out:
+        raise BundleError("checksums_sha256.json had no usable {filename: sha256} entries")
+
+    return out
 
 
-def _is_sklearn_pipeline(obj: Any) -> bool:
-    # Heuristic: sklearn Pipeline exposes "steps" / "named_steps"
-    return hasattr(obj, "steps") or hasattr(obj, "named_steps")
+def _validate_checksums(*, meta_dir: Path, computed: Dict[str, str], strict: bool) -> None:
+    """
+    Validate computed sha256 for the files in 'computed' against checksums_sha256.json.
+
+    If strict=True:
+      - checksums_sha256.json must exist
+      - all computed filenames must exist in the checksums map
+      - all sha must match
+    """
+    chk_path = meta_dir / "checksums_sha256.json"
+    if not chk_path.exists():
+        if strict:
+            raise BundleError(f"Missing required checksums_sha256.json in {meta_dir}")
+        LOG.warning("checksums_sha256.json missing in %s (non-strict).", meta_dir)
+        return
+
+    try:
+        expected_map = _load_checksums_map(_read_json(chk_path))
+    except Exception as e:
+        raise BundleError(f"Failed to read/parse checksums_sha256.json: {e}") from e
+
+    missing = []
+    mismatched = []
+    for name, got in computed.items():
+        exp = expected_map.get(name)
+        if exp is None:
+            missing.append(name)
+        elif str(exp).lower() != str(got).lower():
+            mismatched.append((name, exp, got))
+
+    if mismatched:
+        msg = "; ".join(
+            [f"{n}: expected={e[:12]}.. got={g[:12]}.." for (n, e, g) in mismatched[:10]]
+        )
+        raise BundleError(f"Bundle checksum mismatch for {len(mismatched)} file(s): {msg}")
+
+    if strict and missing:
+        raise BundleError(
+            f"checksums_sha256.json missing entries for required files: {missing[:20]}"
+            + (" ..." if len(missing) > 20 else "")
+        )
 
 
-@dataclass(frozen=True)
-class ArtifactBundle:
-    meta_dir: Path
-    file_hashes: Dict[str, str]
-    bundle_id: str
+def _joblib_load_guarded(path: Path, *, strict_versions: bool) -> Any:
+    """
+    Load joblib artifact and (optionally) hard-fail on sklearn InconsistentVersionWarning.
+    """
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        obj = joblib.load(path)
 
-    feature_manifest: Any
+    bad = [wi for wi in w if getattr(wi.category, "__name__", "") == "InconsistentVersionWarning"]
+    if bad:
+        msg = "; ".join([str(wi.message) for wi in bad[:3]])
+        if strict_versions:
+            raise BundleError(f"Inconsistent sklearn version while loading {path.name}: {msg}")
+        LOG.warning("Inconsistent sklearn version while loading %s: %s", path.name, msg)
 
-    # One of:
-    # - external_ohe mode: feature_names + ohe + model (txt or joblib)
-    # - pipeline_raw mode: model.joblib pipeline handles preprocessing internally
-    feature_names: List[str]
-    ohe: Optional[Any]
-
-    model: Any
-    model_kind: str  # "lgb_booster" | "lgbm_sklearn" | "pipeline_joblib"
-
-    calibrator: Optional[Any]
-    pstar: Optional[float]
+    return obj
 
 
 def load_bundle(
-    meta_dir: str | Path,
-    *,
-    required_extra_files: Optional[Iterable[str]] = None,
+    meta_dir: Union[str, Path],
     strict: bool = True,
+    required_extra_files: Optional[List[str]] = None,
 ) -> ArtifactBundle:
     """
-    Load and validate exported meta-model artifacts.
+    Load and validate the deployment bundle.
 
-    Supported export layouts:
-
-    A) External-OHE layout (older):
+    Canonical contract (Option A / pipeline bundle):
+      - model.joblib
       - feature_manifest.json
-      - feature_names.json
-      - ohe.joblib
-      - model.txt (preferred) OR donch_meta_lgbm.joblib
+      - deployment_config.json
+      - checksums_sha256.json
+      - thresholds.json
+      - sizing_curve.csv
+      - calibrator: one of {isotonic.joblib, calibration.json, calibrator.json, calibrator.joblib}
 
-    B) Pipeline layout (current in your folder):
+    Legacy contract (only if model.joblib absent):
+      - model.txt + ohe.joblib + feature_names.json
       - feature_manifest.json
-      - model.joblib (sklearn pipeline that includes preprocessing/OHE)
-      - optional calibrators: isotonic.joblib and/or calibration.json
+      - (optional) calibration
 
-    Calibrator accepted names:
-      - calibration.json OR calibrator.json
-      - isotonic.joblib OR calibrator.joblib
-
-    strict=True means: hard-fail if required artifacts for the detected layout are missing.
+    If strict=True:
+      - required files must exist
+      - checksums must match
+      - sklearn InconsistentVersionWarning becomes a hard error
     """
     meta_dir_p = Path(meta_dir).expanduser().resolve()
-    if not meta_dir_p.exists():
-        raise BundleError(f"META_EXPORT_DIR does not exist: {meta_dir_p}")
+    if not meta_dir_p.exists() or not meta_dir_p.is_dir():
+        raise BundleError(f"Bundle directory does not exist: {meta_dir_p}")
 
-    # Always required
-    manifest_path = _require(meta_dir_p, _first_existing(meta_dir_p, ["feature_manifest.json"]), "feature_manifest.json")
-    feature_manifest = _read_json(manifest_path)
+    required_extra_files = required_extra_files or []
 
-    # Detect model format
-    model_txt = _first_existing(meta_dir_p, ["model.txt"])
-    model_legacy = _first_existing(meta_dir_p, ["donch_meta_lgbm.joblib"])
-    model_joblib = _first_existing(meta_dir_p, ["model.joblib"])  # current export
+    # Decide contract by presence of model.joblib (this matches your exporter outputs)
+    model_joblib = meta_dir_p / "model.joblib"
+    is_pipeline = model_joblib.exists()
 
-    model_kind: Optional[str] = None
-    model_path: Optional[Path] = None
+    # Common required
+    required: List[str] = ["feature_manifest.json"]
 
-    if model_txt is not None:
-        model_kind, model_path = "lgb_booster", model_txt
-    elif model_legacy is not None:
-        model_kind, model_path = "lgbm_sklearn", model_legacy
-        if strict:
-            LOG.warning("Using legacy model joblib (%s). Prefer model.txt or a full pipeline model.joblib.", model_legacy)
-    elif model_joblib is not None:
-        model_kind, model_path = "pipeline_joblib", model_joblib
-    else:
-        present = sorted([p.name for p in meta_dir_p.glob("*") if p.is_file()])
-        raise BundleError(f"No model artifact found in {meta_dir_p}. Present files: {present}")
-
-    # Calibrator (optional)
-    cal_json_path = _first_existing(meta_dir_p, ["calibrator.json", "calibration.json"])
-    cal_joblib_path = _first_existing(meta_dir_p, ["calibrator.joblib", "isotonic.joblib"])
-
-    calibrator: Optional[Any] = None
-    if cal_joblib_path is not None:
-        try:
-            calibrator = joblib.load(cal_joblib_path)
-        except Exception as e:
-            raise BundleError(f"Failed to load calibrator joblib {cal_joblib_path}: {e}") from e
-    elif cal_json_path is not None:
-        calibrator = _read_json(cal_json_path)
-
-    # p* (optional, best-effort from deployment_config.json or thresholds.json)
-    pstar: Optional[float] = None
-    dep_cfg_path = _first_existing(meta_dir_p, ["deployment_config.json"])
-    thr_path = _first_existing(meta_dir_p, ["thresholds.json"])
-    for p in [dep_cfg_path, thr_path]:
-        if p and p.exists():
-            try:
-                obj = _read_json(p)
-                if isinstance(obj, dict):
-                    for k in ("pstar", "p_star", "p*"):
-                        if k in obj:
-                            pstar = float(obj[k])
-                            break
-                if pstar is not None:
-                    break
-            except Exception:
-                pass
-
-    # Load model
-    if model_kind == "lgb_booster":
-        try:
-            import lightgbm as lgb  # type: ignore
-        except Exception as e:
-            raise BundleError("lightgbm is required to load model.txt but is not installed.") from e
-        try:
-            model = lgb.Booster(model_file=str(model_path))
-        except Exception as e:
-            raise BundleError(f"Failed to load LightGBM Booster from {model_path}: {e}") from e
-    else:
-        try:
-            model = joblib.load(model_path)  # lgbm_sklearn or pipeline_joblib
-        except Exception as e:
-            raise BundleError(f"Failed to load joblib model from {model_path}: {e}") from e
-
-    # External-OHE requirements (only for those layouts)
-    feature_names: List[str] = []
-    ohe = None
-
-    if model_kind in ("lgb_booster", "lgbm_sklearn"):
-        fn_path = _first_existing(meta_dir_p, ["feature_names.json"])
-        ohe_path = _first_existing(meta_dir_p, ["ohe.joblib"])
-        fn_path = _require(meta_dir_p, fn_path, "feature_names.json")
-        ohe_path = _require(meta_dir_p, ohe_path, "ohe.joblib")
-
-        fn_obj = _read_json(fn_path)
-        if not isinstance(fn_obj, list) or not all(isinstance(x, str) for x in fn_obj):
-            raise BundleError("feature_names.json must be a JSON list of strings.")
-        feature_names = list(fn_obj)
-
-        try:
-            ohe = joblib.load(ohe_path)
-        except Exception as e:
-            raise BundleError(f"Failed to load ohe.joblib: {e}") from e
-
-    elif model_kind == "pipeline_joblib":
-        # Pipeline layout: feature_names/ohe are not required.
-        # If the object exposes feature_names_in_, we can use it for diagnostics.
-        try:
-            fni = getattr(model, "feature_names_in_", None)
-            if fni is not None:
-                feature_names = [str(x) for x in list(fni)]
-        except Exception:
-            feature_names = []
-
-        # Strong safety check: pipeline must accept DataFrame with raw columns.
-        # If it is not a Pipeline, we still support it if it has feature_names_in_ (above).
-        if (not _is_sklearn_pipeline(model)) and (not feature_names):
-            if strict:
-                raise BundleError(
-                    "model.joblib is not a sklearn Pipeline and does not expose feature_names_in_. "
-                    "Cannot safely construct inputs. Export a pipeline model.joblib or provide feature_names.json + ohe.joblib."
-                )
-            LOG.warning(
-                "model.joblib not a Pipeline and lacks feature_names_in_. Scoring may be disabled in non-strict mode."
-            )
-
-    # Extra required files (regime/sizing artifacts, etc.)
-    if required_extra_files:
-        missing_extra = []
-        for n in required_extra_files:
-            if not (meta_dir_p / n).exists():
-                missing_extra.append(n)
-        if missing_extra:
-            raise BundleError(f"Missing required extra files in {meta_dir_p}: {missing_extra}")
-
-    # Build bundle_id from a curated set + whatever is present that matters
-    include_candidates = [
-        "feature_manifest.json",
-        "feature_names.json",
-        "ohe.joblib",
-        "model.txt",
-        "donch_meta_lgbm.joblib",
-        "model.joblib",
-        "calibrator.json",
-        "calibration.json",
-        "calibrator.joblib",
-        "isotonic.joblib",
-        "thresholds.json",
-        "sizing_curve.csv",
-        "ev_thresholds.csv",
-        "regimes_report.json",
+    # Pipeline required (Option A)
+    pipeline_required: List[str] = [
         "deployment_config.json",
         "checksums_sha256.json",
-        "bundle.tar.gz",
+        "thresholds.json",
+        "sizing_curve.csv",
+        "model.joblib",
     ]
-    file_hashes: Dict[str, str] = {}
-    for name in include_candidates:
-        p = meta_dir_p / name
-        if p.exists():
-            file_hashes[name] = sha256_file(p)
 
-    # Also include required extras in hash set
-    if required_extra_files:
-        for n in required_extra_files:
-            p = meta_dir_p / n
-            if p.exists():
-                file_hashes[n] = sha256_file(p)
+    # Legacy required (Option B)
+    legacy_required: List[str] = [
+        "model.txt",
+        "ohe.joblib",
+        "feature_names.json",
+    ]
+
+    if is_pipeline:
+        required += pipeline_required
+    else:
+        required += legacy_required
+
+    # Add any caller-required extras
+    required += list(required_extra_files)
+
+    # Calibrator: accept any of these names (your export uses calibration.json + isotonic.joblib)
+    calib_joblib = _first_existing(meta_dir_p, ["isotonic.joblib", "calibrator.joblib"])
+    calib_json = _first_existing(meta_dir_p, ["calibration.json", "calibrator.json"])
+
+    if strict and (calib_joblib is None and calib_json is None):
+        raise BundleError(
+            "Missing calibrator artifact: expected one of "
+            "{isotonic.joblib, calibrator.joblib, calibration.json, calibrator.json}"
+        )
+
+    # Resolve required paths
+    missing = [n for n in required if not (meta_dir_p / n).exists()]
+    if missing:
+        raise BundleError(f"Missing required bundle files in {meta_dir_p}: {missing}")
+
+    required_paths: Dict[str, Path] = {n: (meta_dir_p / n) for n in required}
+
+    # Compute hashes for required set (+ calibrators if present) for validation and bundle id
+    to_hash: Dict[str, Path] = dict(required_paths)
+    if calib_joblib is not None:
+        to_hash[calib_joblib.name] = calib_joblib
+    if calib_json is not None:
+        to_hash[calib_json.name] = calib_json
+
+    file_hashes: Dict[str, str] = {}
+    for name, path in sorted(to_hash.items()):
+        file_hashes[name] = sha256_file(path)
+
+    # Validate checksums against required+calibration set
+    _validate_checksums(meta_dir=meta_dir_p, computed=file_hashes, strict=strict)
 
     bid = bundle_id_from_hashes(file_hashes)
 
+    # Load manifest
+    feature_manifest = _read_json(required_paths["feature_manifest.json"])
+    deployment_config = _read_json(required_paths["deployment_config.json"]) if is_pipeline else None
+    thresholds = _read_json(required_paths["thresholds.json"]) if (meta_dir_p / "thresholds.json").exists() else None
+    sizing_curve_path = (meta_dir_p / "sizing_curve.csv") if (meta_dir_p / "sizing_curve.csv").exists() else None
+
+    # Load model/calibrator
+    pstar: Optional[float] = None
+    calibrator: Optional[Any] = None
+    calibrator_path: Optional[Path] = None
+
+    if is_pipeline:
+        model = _joblib_load_guarded(model_joblib, strict_versions=strict)
+        model_kind = "sklearn_pipeline"
+    else:
+        # legacy: keep returning raw text paths; live code can handle it if still used
+        model = (meta_dir_p / "model.txt").read_text(encoding="utf-8")
+        model_kind = "legacy_lgbm"
+
+    # Prefer joblib calibrator if present (isotonic.joblib)
+    if calib_joblib is not None:
+        calibrator_path = calib_joblib
+        calibrator = _joblib_load_guarded(calib_joblib, strict_versions=strict)
+
+    # Load calibration.json if present (even if isotonic exists) to read pstar metadata
+    if calib_json is not None:
+        try:
+            cal_obj = _read_json(calib_json)
+            # If no joblib calibrator was loaded, use json calibrator as calibrator object
+            if calibrator is None:
+                calibrator_path = calib_json
+                calibrator = cal_obj
+            # Extract pstar if present
+            for k in ("pstar", "p_star", "p*", "pStar"):
+                if isinstance(cal_obj, dict) and k in cal_obj:
+                    try:
+                        pstar = float(cal_obj[k])
+                    except Exception:
+                        pstar = None
+                    break
+        except Exception as e:
+            if strict:
+                raise BundleError(f"Failed to load/parse {calib_json.name}: {e}") from e
+            LOG.warning("Could not parse %s: %s", calib_json.name, e)
+
+    # Log what we validated (useful in systemd logs)
+    LOG.info("Loaded bundle: dir=%s id=%s kind=%s", str(meta_dir_p), bid, model_kind)
+    for name in sorted(file_hashes.keys()):
+        LOG.info("Bundle sha256 %s=%s", name, file_hashes[name])
+
     return ArtifactBundle(
         meta_dir=meta_dir_p,
-        file_hashes=file_hashes,
         bundle_id=bid,
-        feature_manifest=feature_manifest,
-        feature_names=feature_names,
-        ohe=ohe,
-        model=model,
         model_kind=model_kind,
+        feature_manifest=feature_manifest,
+        model=model,
         calibrator=calibrator,
+        calibrator_path=calibrator_path,
         pstar=pstar,
+        thresholds=thresholds,
+        sizing_curve_path=sizing_curve_path,
+        deployment_config=deployment_config,
+        file_hashes=file_hashes,
     )

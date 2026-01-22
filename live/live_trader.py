@@ -94,12 +94,27 @@ LISTING_PATH = Path("listing_dates.json")
 # 0 ▸ LOGGING #################################################################
 ###############################################################################
 
+_BUNDLE_ID = "no_bundle"
+
+class _BundleIdFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not hasattr(record, "bundle_id"):
+            record.bundle_id = _BUNDLE_ID
+        return True
+
+def _set_bundle_id_for_logs(bid: str | None) -> None:
+    global _BUNDLE_ID
+    _BUNDLE_ID = bid or "no_bundle"
+
+
 LOG = logging.getLogger("live_trader")
 logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    level=LOG_LEVEL,
+    format="%(asctime)s [%(levelname)s] bundle=%(bundle_id)s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+logging.getLogger().addFilter(_BundleIdFilter())
+
 logging.getLogger("ccxt").setLevel(logging.WARNING)
 logging.getLogger("aiohttp").setLevel(logging.WARNING)
 
@@ -371,6 +386,7 @@ class LiveTrader:
                 required_extra_files=required_extra,
                 strict=strict_bundle,
             )
+            _set_bundle_id_for_logs(self.meta_bundle.bundle_id)
             self.bundle_id = self.meta_bundle.bundle_id
             self.winprob = WinProbScorer(bundle=self.meta_bundle, strict_schema=True)
         except Exception as e:
