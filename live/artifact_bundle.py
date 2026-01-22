@@ -17,6 +17,13 @@ LOG = logging.getLogger("bundle")
 class BundleError(RuntimeError):
     pass
 
+class SchemaError(BundleError):
+    """
+    Raised when a raw feature row does not match the required manifest schema.
+    Kept as a distinct type because winprob_loader imports it explicitly.
+    """
+    pass
+
 
 @dataclass(frozen=True)
 class ArtifactBundle:
