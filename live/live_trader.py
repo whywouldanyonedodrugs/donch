@@ -113,7 +113,10 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] bundle=%(bundle_id)s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-logging.getLogger().addFilter(_BundleIdFilter())
+
+_root = logging.getLogger()
+for h in _root.handlers:
+    h.addFilter(_BundleIdFilter())
 
 logging.getLogger("ccxt").setLevel(logging.WARNING)
 logging.getLogger("aiohttp").setLevel(logging.WARNING)
