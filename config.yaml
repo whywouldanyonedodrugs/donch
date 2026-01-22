@@ -3,7 +3,7 @@ STRATEGY_SPEC_PATH: "strategies/donch_pullback_long.yaml"
 
 # Sizing
 RISK_MODE: "cash"           # or "percent"
-RISK_USD: 20.0              # used if RISK_MODE="cash"
+RISK_USD: 1.0              # used if RISK_MODE="cash"
 RISK_EQUITY_PCT: 0.01       # used if RISK_MODE="percent"
 MIN_TRADE_AUTOPAD_ENABLED: false
 MIN_TRADE_AUTOPAD_CAP_USD: 5.0
@@ -49,7 +49,7 @@ UNIVERSE_CACHE_REQUIRE_SYMBOLS_MATCH: true
 
 DEBUG_SIGNAL_DIAG: true
 DEBUG_SCORE_META_ON_REJECT: true
-s
+
 
 RS_MIN_PERCENTILE: 70
 LIQ_MIN_24H_USD: 500000
