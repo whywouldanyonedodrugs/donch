@@ -260,18 +260,28 @@ def load_bundle(
     if calib_json is not None:
         to_hash[calib_json.name] = calib_json
 
-    # IMPORTANT: do not validate (or include in bundle_id) the checksum file against itself.
-    # checksums_sha256.json cannot stably contain its own sha256 without a fixed-point scheme.
-    to_hash.pop("checksums_sha256.json", None)
+    # Compute hashes for required set (+ calibrators if present) for validation and bundle id.
+    # IMPORTANT: do NOT hash checksums_sha256.json itself (self-referential).
+    to_hash: Dict[str, Path] = {}
+    for name, path in required_paths.items():
+        if name == "checksums_sha256.json":
+            continue
+        to_hash[name] = path
+
+    if calib_joblib is not None:
+        to_hash[calib_joblib.name] = calib_joblib
+    if calib_json is not None:
+        to_hash[calib_json.name] = calib_json
 
     file_hashes: Dict[str, str] = {}
     for name, path in sorted(to_hash.items()):
         file_hashes[name] = sha256_file(path)
 
-    # Validate checksums against required+calibration set (excluding checksums_sha256.json itself)
+    # Validate checksums against computed set (excluding the checksums file itself).
     _validate_checksums(meta_dir=meta_dir_p, computed=file_hashes, strict=strict)
 
     bid = bundle_id_from_hashes(file_hashes)
+
 
 
     # Load manifest

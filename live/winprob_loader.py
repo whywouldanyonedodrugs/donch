@@ -15,6 +15,35 @@ from .artifact_bundle import ArtifactBundle, BundleError, SchemaError, load_bund
 LOG = logging.getLogger("winprob")
 
 
+def _infer_model_input_features(model: Any) -> Optional[List[str]]:
+    """
+    Best-effort: for sklearn estimators/pipelines, prefer feature_names_in_ captured at fit time.
+    Returns list[str] or None.
+    """
+    names = getattr(model, "feature_names_in_", None)
+    if names is not None:
+        try:
+            return [str(x) for x in list(names)]
+        except Exception:
+            pass
+
+    # Try pipeline steps (some pipelines attach feature_names_in_ to the final estimator or a step)
+    try:
+        steps = getattr(model, "named_steps", None)
+        if isinstance(steps, dict):
+            for step in steps.values():
+                names = getattr(step, "feature_names_in_", None)
+                if names is not None:
+                    try:
+                        return [str(x) for x in list(names)]
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+
+    return None
+
+
 @dataclass(frozen=True)
 class FeatureSpec:
     name: str
@@ -204,16 +233,37 @@ class WinProbScorer:
         self.pstar = bundle.pstar
         self.strict_schema = bool(strict_schema)
 
+        # Parse manifest → raw feature specs
         self._raw_specs = _parse_manifest(bundle.feature_manifest)
         self._raw_spec_by_name = {s.name: s for s in self._raw_specs}
         self.raw_features = [s.name for s in self._raw_specs]
-
         self.raw_cat_cols = [s.name for s in self._raw_specs if s.kind == "categorical"]
         self.raw_num_cols = [s.name for s in self._raw_specs if s.kind == "numeric"]
+
+        # Infer model input feature names (Option A: sklearn pipeline uses DataFrame column names).
+        inferred = _infer_model_input_features(self.model)
+        if inferred:
+            self.model_features = inferred
+        else:
+            # Fallback: assume model was trained with the manifest ordering.
+            self.model_features = list(self.raw_features)
+
+        # Safety: enforce that manifest == model expected inputs (set equality).
+        # If you ever intentionally allow model to consume a strict subset, relax this explicitly.
+        raw_set = set(self.raw_features)
+        model_set = set(self.model_features)
+        if raw_set != model_set:
+            missing_in_raw = sorted(model_set - raw_set)
+            extra_in_raw = sorted(raw_set - model_set)
+            raise BundleError(
+                "Model/manifest feature mismatch. "
+                f"missing_in_manifest={missing_in_raw} extra_in_manifest={extra_in_raw}"
+            )
 
         self._diag_once = False
         self._last_hash = None
         self._same_vec_count = 0
+
 
     def score(self, raw_row: Dict[str, Any]) -> float:
         p_raw, p_cal = self.score_with_details(raw_row)
@@ -271,17 +321,19 @@ class WinProbScorer:
     def _build_df(self, raw_row: Dict[str, Any]) -> Tuple[pd.DataFrame, str]:
         self._validate_raw_schema(raw_row)
 
-        data = {}
-        for s in self._raw_specs:
-            v = raw_row[s.name]
+        data: Dict[str, Any] = {}
+        for name in self.model_features:
+            s = self._raw_spec_by_name[name]
+            v = raw_row[name]
             if s.kind == "numeric":
-                data[s.name] = float(v)
+                data[name] = float(v)
             else:
-                data[s.name] = str(v)
+                data[name] = str(v)
 
-        df = pd.DataFrame([data], columns=[s.name for s in self._raw_specs])
+        df = pd.DataFrame([data], columns=list(self.model_features))
         vec_hash = hashlib.md5(pd.util.hash_pandas_object(df, index=True).values.tobytes()).hexdigest()
         return df, vec_hash
+
 
     def _predict_proba(self, df: pd.DataFrame) -> float:
         try:
