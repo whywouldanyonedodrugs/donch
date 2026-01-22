@@ -33,30 +33,26 @@ def _is_nan(x: Any) -> bool:
 
 def _parse_manifest(manifest_obj: Any) -> List[FeatureSpec]:
     """
-    Supports multiple manifest formats.
+    Supports schema-container exporter format:
 
-    Primary supported format (your current export):
       {
         "cat_cols": [...],
         "num_cols": [...],
-        "dtypes": { "feat": "float64", ... },              (optional)
-        "categories": { "feat": [...], ... },             (optional)
-        "codes": { "feat": { "A": 0, ... }, ... }         (optional)
+        "dtypes": {...} (optional),
+        "categories": {...} (optional),
+        "codes": {...} (optional)
       }
 
-    Also supports:
-      {"features": { "feat": {"dtype": "...", ...}, ... } }
-      {"feat": {"dtype": "...", ...}, ...}
-      [ {"name": "...", "dtype": "...", ...}, ... ]
+    Also supports {"schema": {...}} wrapper and older feature-spec formats.
     """
 
-    # Some exporters nest this under a "schema" key. Support that too.
+    # Allow wrapper: {"schema": {...}}
     if isinstance(manifest_obj, dict) and isinstance(manifest_obj.get("schema"), dict):
-        schema = manifest_obj["schema"]
-        if ("cat_cols" in schema) or ("num_cols" in schema):
-            manifest_obj = schema
+        inner = manifest_obj["schema"]
+        if ("cat_cols" in inner) or ("num_cols" in inner):
+            manifest_obj = inner
 
-    # -------- Format: cat_cols/num_cols container --------
+    # --- Primary format: cat_cols/num_cols container ---
     if isinstance(manifest_obj, dict) and (("cat_cols" in manifest_obj) or ("num_cols" in manifest_obj)):
         cat_cols = manifest_obj.get("cat_cols") or []
         num_cols = manifest_obj.get("num_cols") or []
@@ -111,19 +107,21 @@ def _parse_manifest(manifest_obj: Any) -> List[FeatureSpec]:
 
         return specs
 
-    # -------- Other formats --------
+    # --- Fallback formats (older exports) ---
     items: List[Tuple[str, Any]] = []
 
     if isinstance(manifest_obj, dict):
         if "features" in manifest_obj and isinstance(manifest_obj["features"], dict):
             items = list(manifest_obj["features"].items())
         else:
+            # IMPORTANT: skip schema/meta keys so we never treat cat_cols as a feature
             meta_keys = {
                 "cat_cols", "num_cols", "dtypes", "dtype_map", "raw_dtypes",
                 "categories", "cats", "codes", "codebook", "codebooks",
                 "version", "created_at", "notes", "schema",
             }
             items = [(k, v) for k, v in manifest_obj.items() if isinstance(k, str) and k not in meta_keys]
+
     elif isinstance(manifest_obj, list):
         for i, it in enumerate(manifest_obj):
             if isinstance(it, dict) and "name" in it:
@@ -139,13 +137,6 @@ def _parse_manifest(manifest_obj: Any) -> List[FeatureSpec]:
     for name, desc in items:
         if not isinstance(name, str) or not name:
             continue
-
-        if isinstance(desc, str):
-            dtype = desc
-            kind = "categorical" if ("cat" in dtype or "str" in dtype or "object" in dtype) else "numeric"
-            specs.append(FeatureSpec(name=name, kind=kind, dtype=dtype))
-            continue
-
         if not isinstance(desc, dict):
             raise BundleError(f"Invalid feature spec for {name}: {desc}")
 
@@ -155,13 +146,9 @@ def _parse_manifest(manifest_obj: Any) -> List[FeatureSpec]:
         codes = desc.get("codes", desc.get("codebook", None))
 
         if raw_kind is None:
-            if cats is not None or "category" in dtype or dtype in ("object", "str", "string"):
-                kind = "categorical"
-            else:
-                kind = "numeric"
+            kind = "categorical" if (cats is not None or "category" in dtype or dtype in ("object", "str", "string")) else "numeric"
         else:
-            rk = str(raw_kind).lower()
-            kind = "categorical" if rk in ("cat", "categorical", "category") else "numeric"
+            kind = "categorical" if str(raw_kind).lower() in ("cat", "categorical", "category") else "numeric"
 
         specs.append(
             FeatureSpec(
@@ -179,7 +166,6 @@ def _parse_manifest(manifest_obj: Any) -> List[FeatureSpec]:
         raise BundleError(f"feature_manifest has duplicate feature names: {dup}")
 
     return specs
-
 
 class WinProbScorer:
     """
