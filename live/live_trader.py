@@ -106,7 +106,7 @@ def _set_bundle_id_for_logs(bid: str | None) -> None:
     global _BUNDLE_ID
     _BUNDLE_ID = bid or "no_bundle"
 
-
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 LOG = logging.getLogger("live_trader")
 logging.basicConfig(
     level=LOG_LEVEL,
