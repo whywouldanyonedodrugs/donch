@@ -47,8 +47,6 @@ from .database import DB
 from .telegram import TelegramBot
 from .winprob_loader import WinProbScorer
 
-from .artifact_bundle import load_bundle, BundleError, SchemaError
-
 from pydantic import Field, ValidationError
 from pydantic_settings import BaseSettings
 from .strategy_engine import StrategyEngine
@@ -359,39 +357,37 @@ class LiveTrader:
         self.api_semaphore = asyncio.Semaphore(10)
         self.symbol_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
-        # Meta / win-prob scorer (strict-parity artifact bundle)
-        meta_dir = (self.cfg.get("META_EXPORT_DIR")
-                    or self.cfg.get("WINPROB_ARTIFACT_DIR", "results/meta_export"))
-        strict_bundle = bool(self.cfg.get("STRICT_META_BUNDLE", True))
-        required_extra = self.cfg.get("META_REQUIRED_EXTRA_FILES", []) or []
+        # Meta / win-prob scorer
+        from live.winprob_loader import WinProbScorer
+        self.winprob = WinProbScorer(os.getenv("DONCH_WINPROB_DIR", "results/meta_export"))
+
+        art_dir = self.cfg.get("WINPROB_ARTIFACT_DIR", "results/meta_export")
+        self.winprob = WinProbScorer(art_dir)
 
         try:
-            self.meta_bundle = load_bundle(
-                meta_dir,
-                required_extra_files=required_extra,
-                strict=strict_bundle,
-            )
-            self.bundle_id = self.meta_bundle.bundle_id
-            self.winprob = WinProbScorer(bundle=self.meta_bundle, strict_schema=True)
-        except Exception as e:
-            if strict_bundle:
-                raise
-            LOG.error("Meta bundle load failed (%s). Meta scoring disabled.", e)
-            self.meta_bundle = None
-            self.bundle_id = None
-            self.winprob = None
-        else:
-            LOG.info("Meta bundle loaded: dir=%s id=%s", self.meta_bundle.meta_dir, self.bundle_id)
-            pstar = getattr(self.winprob, "pstar", None)
-            pstar_s = f"{float(pstar):.4f}" if isinstance(pstar, (int, float)) else "None"
-            LOG.info(
-                "WinProb ready (bundle=%s, raw_feats=%d, model_cols=%d, p*=%s)",
-                self.bundle_id,
-                len(getattr(self.winprob, "raw_features", [])),
-                len(getattr(self.winprob, "feature_names", [])),
-                pstar_s,
-            )
+            self.winprob.strict_parity = bool(self.cfg.get("META_REQUIRED", False))
+        except Exception:
+            pass
 
+        if self.winprob.is_loaded:
+            # Be robust to older WinProbScorer without .kind or .expected_features
+            kind = getattr(self.winprob, "kind", "lgbm+ohe")
+            feats = getattr(self.winprob, "feature_order", None)
+
+        if self.winprob.is_loaded:
+            # Be robust to older WinProbScorer without .kind or .expected_features
+            kind = getattr(self.winprob, "kind", "lgbm+ohe")
+            feats = (getattr(self.winprob, "feature_order", None)
+                    or getattr(self.winprob, "expected_features", None)
+                    or [])
+            nfeats = len(feats) if feats is not None else 0
+            pstar = getattr(self.winprob, "pstar", None)
+            if isinstance(pstar, (int, float)):
+                LOG.info("WinProb ready (kind=%s, features=%d, p*=%.2f)", kind, nfeats, float(pstar))
+            else:
+                LOG.info("WinProb ready (kind=%s, features=%d)", kind, nfeats)
+        else:
+            LOG.warning("WinProb not loaded; using wp=0.0")
 
 
     async def _build_oi_funding_features(self, symbol: str, df5: "pd.DataFrame") -> dict:
@@ -413,21 +409,15 @@ class LiveTrader:
 
 
     def _score_winprob_safe(self, symbol: str, meta_row: dict) -> Optional[float]:
-        """Strict-parity winprob scoring. Returns calibrated p in [0,1] or None (no-trade)."""
-        if not getattr(self, "winprob", None):
+        wp = getattr(self, "winprob", None)
+        if not wp or not getattr(wp, "is_loaded", False):
             return None
         try:
-            p = float(self.winprob.score(meta_row))
-            if 0.0 <= p <= 1.0:
-                return p
-            return None
-        except SchemaError as e:
-            LOG.info("Meta no-trade %s: schema_mismatch: %s", symbol, e)
-            return None
+            p = float(wp.score(meta_row))
+            return p if np.isfinite(p) and 0.0 <= p <= 1.0 else None
         except Exception as e:
-            LOG.exception("Meta scoring failed for %s: %s", symbol, e)
+            LOG.debug("WinProb error for %s: %s", symbol, e)
             return None
-
 
 
 
@@ -1854,15 +1844,15 @@ class LiveTrader:
 
     async def _update_single_position(self, pid: int, pos: Dict[str, Any]):
         symbol = pos["symbol"]
-        bundle = getattr(self, "bundle_id", None) or "no_bundle"
 
         # Safety net: check true position size
         try:
             positions = await self.exchange.fetch_positions(symbols=[symbol])
             position_size = 0.0
             if positions and positions[0]:
-                position_size = float(positions[0].get("info", {}).get("size", 0))
+                position_size = float(positions[0].get('info', {}).get('size', 0))
 
+                
             if position_size == 0:
                 # 1) Sweep & cancel stale reduce-only/children (throttled)
                 if not hasattr(self, "_cancel_cleanup_backoff"):
@@ -1875,77 +1865,100 @@ class LiveTrader:
                     finally:
                         self._cancel_cleanup_backoff[symbol] = _now
 
-                # 2) Single finalize path for zero-size positions
-                LOG.info("bundle=%s Position size for %s is 0. Finalizing via _finalize_zero_position_safe…", bundle, symbol)
-                try:
-                    await self._finalize_zero_position_safe(pid, pos, symbol)
-                except Exception as e:
-                    LOG.exception("bundle=%s Finalize-zero failed for %s pid=%s: %s", bundle, symbol, pid, e)
-                return
+                # 2) Debounce finalize to avoid log spam during transient API hiccups
+                if not hasattr(self, "_zero_finalize_backoff"):
+                    self._zero_finalize_backoff = {}
+                _last_fin = self._zero_finalize_backoff.get(pid)
+                if _last_fin and (_now - _last_fin).total_seconds() < float(self.cfg.get("FINALIZE_BACKOFF_SEC", 120)):
+                    LOG.info("Position size is 0 for %s; finalize debounced.", symbol)
+                    return
+                self._zero_finalize_backoff[pid] = _now
 
+                LOG.info("Position size for %s is 0. Inferring exit reason and finalizing…", symbol)
+
+                # 3) Infer exit type conservatively; MANUAL_CLOSE by default
+                inferred_reason = "MANUAL_CLOSE"
+                try:
+                    open_orders = await self._all_open_orders(symbol)
+                    open_cids = {o.get("clientOrderId") for o in (open_orders or [])}
+                    if any([
+                        (pos.get("tp_final_cid") and pos["tp_final_cid"] not in open_cids),
+                        (pos.get("tp2_cid")     and pos["tp2_cid"]     not in open_cids),
+                        (pos.get("tp1_cid")     and pos["tp1_cid"]     not in open_cids),
+                    ]):
+                        inferred_reason = "TP"
+                    elif any([
+                        (pos.get("sl_trail_cid") and pos["sl_trail_cid"] not in open_cids),
+                        (pos.get("sl_cid")       and pos["sl_cid"]       not in open_cids),
+                    ]):
+                        inferred_reason = "SL"
+                except Exception as e:
+                    LOG.warning("Open-orders probe failed while finalizing %s: %s", symbol, e)
+
+                try:
+                    await self._finalize_position(pid, pos, inferred_exit_reason=inferred_reason)
+                except Exception as e:
+                    LOG.exception("Finalize failed for %s pid=%s: %s", symbol, pid, e)
+                return
         except Exception as e:
-            LOG.error("bundle=%s Could not fetch position size for %s during update: %s", bundle, symbol, e)
+            LOG.error("Could not fetch position size for %s during update: %s", symbol, e)
             return
 
+
+
         orders = await self._all_open_orders(symbol)
-        open_cids = {o.get("clientOrderId") for o in (orders or [])}
+        open_cids = {o.get("clientOrderId") for o in orders}
 
         if self.cfg.get("TIME_EXIT_ENABLED", cfg.TIME_EXIT_ENABLED):
             ddl = pos.get("exit_deadline")
             if ddl and datetime.now(timezone.utc) >= ddl:
-                LOG.info("bundle=%s Time-exit firing on %s (pid %d)", bundle, symbol, pid)
+                LOG.info("Time-exit firing on %s (pid %d)", symbol, pid)
                 await self._force_close_position(pid, pos, tag="TIME_EXIT")
                 return
 
-        trailing_active = bool(pos.get("trailing_active", False))
-
-        # --- TP1 handling (corrected: no phantom/duplicate fill) ---
-        if (
-            self.cfg.get("PARTIAL_TP_ENABLED", False)
-            and not trailing_active
-            and pos.get("tp1_cid")
-            and pos.get("tp1_cid") not in open_cids
-        ):
+        if self.cfg.get("PARTIAL_TP_ENABLED", False) and not pos["trailing_active"] and pos.get("tp1_cid") not in open_cids:
             fill_price = None
             filled_qty = 0.0
             try:
                 o = await self._fetch_by_cid(pos["tp1_cid"], symbol)
-                if o and str(o.get("status", "")).lower() == "closed":
-                    fill_price = o.get("average") or o.get("price")
-                    filled_qty = float(o.get("filled") or o.get("amount") or 0.0)
+                if o and str(o.get('status','')).lower() == 'closed':
+                    fill_price = o.get('average') or o.get('price')
+                    filled_qty = float(o.get('filled') or o.get('amount') or 0.0)
             except Exception as e:
-                LOG.warning("bundle=%s Failed to fetch TP1 order %s for %s: %s", bundle, pos["tp1_cid"], symbol, e)
+                LOG.warning("Failed to fetch TP1 order %s: %s", pos["tp1_cid"], e)
 
+            # **Only** record a TP1 fill if the order actually closed with >0 qty.
             if (filled_qty or 0.0) > 0.0 and (fill_price is not None):
-                await self.db.add_fill(pid, "TP1", float(fill_price), float(filled_qty), datetime.now(timezone.utc))
+                await self.db.add_fill(
+                    pid, "TP1", float(fill_price), float(filled_qty), datetime.now(timezone.utc)
+                )
                 await self.db.update_position(pid, trailing_active=True)
                 pos["trailing_active"] = True
-                trailing_active = True
                 await self._activate_trailing(pid, pos)
                 await self.tg.send(f"📈 TP1 hit on {symbol}, trailing activated")
-                LOG.info("bundle=%s TP1 recorded %s qty=%.8f px=%.8f -> trailing on", bundle, symbol, filled_qty, float(fill_price))
             else:
-                LOG.info("bundle=%s TP1 not filled for %s (status!=closed or filled=0). Skipping.", bundle, symbol)
+                LOG.info("TP1 for %s not filled (status!=closed or filled=0). Skipping phantom fill.", symbol)
 
-        if trailing_active:
+
+            await self.db.add_fill(
+                pid, "TP1", fill_price, float(pos["size"]) * self.cfg["PARTIAL_TP_PCT"], datetime.now(timezone.utc)
+            )
+            await self.db.update_position(pid, trailing_active=True)
+            pos["trailing_active"] = True
+            await self._activate_trailing(pid, pos)
+            await self.tg.send(f"📈 TP1 hit on {symbol}, trailing activated")
+
+        if pos["trailing_active"]:
             await self._trail_stop(pid, pos)
 
-        active_stop_cid = pos.get("sl_trail_cid") if trailing_active else pos.get("sl_cid")
-
-        # Only treat as "closed" if we actually have a stop CID to track.
-        is_closed = False
-        if active_stop_cid:
-            is_closed = active_stop_cid not in open_cids
-
-        # Optional: final TP2 closure check (only if tp2_cid exists)
-        if (not is_closed) and trailing_active and self.cfg.get("FINAL_TP_ENABLED", False):
-            tp2_cid = pos.get("tp2_cid")
-            if tp2_cid and (tp2_cid not in open_cids):
+        active_stop_cid = pos.get("sl_trail_cid") if pos["trailing_active"] else pos.get("sl_cid")
+        is_closed = active_stop_cid not in open_cids
+        if not is_closed and pos["trailing_active"] and self.cfg.get("FINAL_TP_ENABLED", False):
+            if pos.get("tp2_cid") not in open_cids:
                 is_closed = True
 
         if is_closed:
             await self._finalize_position(pid, pos)
-
 
     async def _activate_trailing(self, pid: int, pos: Dict[str, Any]):
         symbol = pos["symbol"]
@@ -2051,13 +2064,12 @@ class LiveTrader:
 
     async def _finalize_position(self, pid: int, pos: Dict[str, Any], inferred_exit_reason: str = None):
         symbol = pos["symbol"]
-        bundle = getattr(self, "bundle_id", None) or "no_bundle"
-
         opened_at: datetime = pos["opened_at"]
         entry_price = float(pos["entry_price"])
         size = float(pos["size"])
-        side = (pos.get("side") or "LONG").lower()  # long-only default for safety
+        side = (pos.get("side") or "SHORT").lower()  # "long" or "short"
 
+        # We'll compute these from real fills
         closing_order_type = inferred_exit_reason or "UNKNOWN"
         exit_price = None
         exit_qty_needed = abs(size)
@@ -2075,6 +2087,9 @@ class LiveTrader:
             if closing_order_cid:
                 o = await self._fetch_by_cid(closing_order_cid, symbol)
                 if o:
+                    # prefer lastTradeTimestamp if present; orders != trades in CCXT
+                    # may be None on some venues – we’ll still use trades below.  (CCXT manual)
+                    # https://github.com/ccxt/ccxt/wiki/manual
                     ts = o.get("lastTradeTimestamp") or o.get("timestamp") or o.get("datetime")
                     if ts:
                         try:
@@ -2085,45 +2100,55 @@ class LiveTrader:
                         exit_price = float(o.get("average") or o.get("price"))
                         closing_order_type = inferred_exit_reason
         except Exception as e:
-            LOG.warning("bundle=%s Fetch order by CID %s for %s failed: %s", bundle, closing_order_cid, symbol, e)
+            LOG.warning("Fetch order by CID %s for %s failed: %s", closing_order_cid, symbol, e)
 
         # ------------------ 2) Pull trades since opened_at and build exit fills ------------------
+        # IMPORTANT: use since=opened_at to avoid mixing unrelated fills. (CCXT supports since/limit)
+        # https://pypi.org/project/ccxt/
         fills = []
-        fees_paid = 0.0
         try:
             since_ms = max(0, int(opened_at.timestamp() * 1000) - 60_000)
+            # pull more than default to cover partial exits/TPs
             my_trades = await self.exchange.fetch_my_trades(symbol, since=since_ms, limit=1000)
+            # sort ascending by time
             my_trades = sorted([t for t in my_trades or [] if t.get("timestamp")], key=lambda t: int(t["timestamp"]))
-            closing_trades = [t for t in my_trades if str(t.get("side", "")).lower() == close_side]
+            # closing-only trades
+            closing_trades = [t for t in my_trades if str(t.get("side","")).lower() == close_side]
 
+            # accumulate closing qty until we cover the entire position size
             qty_left = exit_qty_needed
             for t in closing_trades:
                 if qty_left <= 1e-12:
                     break
                 t_qty = float(t.get("amount") or 0.0)
-                t_px = float(t.get("price") or 0.0)
+                t_px  = float(t.get("price") or 0.0)
                 if t_qty <= 0 or t_px <= 0:
                     continue
                 use_qty = min(qty_left, t_qty)
                 fills.append((int(t["timestamp"]), t_px, use_qty, t.get("fee")))
                 qty_left -= use_qty
 
-            for _, _, _, fee in fills:
+            # if we didn’t reach full size but have some data, we’ll still compute with what we have
+        except Exception as e:
+            LOG.error("fetch_my_trades failed for %s: %s", symbol, e)
+
+        # ------------------ 3) Decide exit price & time from fills ------------------
+        # Prefer fills → else order timestamp/price → else ticker/entry
+        if fills:
+            exit_notional = sum(px * q for _, px, q, _ in fills)
+            exit_qty_sum  = sum(q for *_ , q, _ in fills)
+            avg_exit = (exit_notional / exit_qty_sum) if exit_qty_sum > 0 else entry_price
+            closed_at = datetime.fromtimestamp(max(ts for ts, *_ in fills) / 1000.0, tz=timezone.utc)
+            # collect fees from both entry+exit window for accuracy
+            fees_paid = 0.0
+            for _, _, q, fee in fills:
                 if isinstance(fee, dict):
                     try:
                         fees_paid += float(fee.get("cost") or 0.0)
                     except Exception:
                         pass
-        except Exception as e:
-            LOG.error("bundle=%s fetch_my_trades failed for %s: %s", bundle, symbol, e)
-
-        # ------------------ 3) Decide exit price & time from fills ------------------
-        if fills:
-            exit_notional = sum(px * q for _, px, q, _ in fills)
-            exit_qty_sum = sum(q for _, _, q, _ in fills)
-            avg_exit = (exit_notional / exit_qty_sum) if exit_qty_sum > 0 else entry_price
-            closed_at = datetime.fromtimestamp(max(ts for ts, *_ in fills) / 1000.0, tz=timezone.utc)
         else:
+            # fallback: use order hint if present
             closed_at = datetime.fromtimestamp(order_last_ts / 1000.0, tz=timezone.utc) if order_last_ts else datetime.now(timezone.utc)
             if exit_price is None:
                 try:
@@ -2133,29 +2158,34 @@ class LiveTrader:
                     exit_price = entry_price
             avg_exit = float(exit_price)
             exit_qty_sum = exit_qty_needed
+            fees_paid = 0.0
 
         # ------------------ 4) Avoid creating duplicate exit fills ------------------
+        # If we already have exit-kind fills, don’t add another synthetic one.
         has_exit_fill = False
         try:
-            existing = await self.db.pool.fetch("SELECT fill_type, ts FROM fills WHERE position_id=$1 ORDER BY ts ASC", pid)
+            existing = await self.db.pool.fetch(
+                "SELECT fill_type, ts FROM fills WHERE position_id=$1 ORDER BY ts ASC", pid
+            )
             for r in existing:
                 k = (r["fill_type"] or "").upper()
-                if k.startswith("TP") or k.startswith("SL") or "FALLBACK" in k or "TIME_EXIT" in k or "MANUAL_CLOSE" in k:
+                if k.startswith("TP") or k.startswith("SL") or "FALLBACK" in k or "TIME_EXIT" in k:
                     has_exit_fill = True
                     break
-
             if (not has_exit_fill) and fills:
                 for ts, px, q, _ in fills:
-                    await self.db.add_fill(pid, closing_order_type, float(px), float(q), datetime.fromtimestamp(ts / 1000.0, tz=timezone.utc))
+                    await self.db.add_fill(pid, closing_order_type, float(px), float(q),
+                                        datetime.fromtimestamp(ts/1000.0, tz=timezone.utc))
             elif (not has_exit_fill) and not fills:
                 await self.db.add_fill(pid, closing_order_type, float(avg_exit), float(exit_qty_needed), closed_at)
         except Exception as e:
-            LOG.warning("bundle=%s Exit fill persistence skipped for %s: %s", bundle, symbol, e)
+            LOG.warning("Exit fill persistence skipped for %s: %s", symbol, e)
 
         # ------------------ 5) Compute PnL ------------------
         def _pnl_linear(e_px, x_px, q, sd):
             return (e_px - x_px) * q if sd == "short" else (x_px - e_px) * q
 
+        entry_notional = entry_price * abs(size)
         if side == "short":
             total_pnl = (entry_price - avg_exit) * abs(size)
             pnl_pct = (entry_price / avg_exit - 1.0) * 100.0 if avg_exit > 0 else 0.0
@@ -2163,11 +2193,10 @@ class LiveTrader:
             total_pnl = (avg_exit - entry_price) * abs(size)
             pnl_pct = (avg_exit / entry_price - 1.0) * 100.0 if entry_price > 0 else 0.0
 
+        # If our fills are clearly incomplete (<80% of size), fall back to direct formula
         if fills and (exit_qty_sum < 0.8 * abs(size)):
-            LOG.warning(
-                "bundle=%s Incomplete exit fills on %s: used %.6f / %.6f. Falling back to direct formula.",
-                bundle, symbol, exit_qty_sum, abs(size)
-            )
+            LOG.warning("Incomplete exit fills on %s: used %.6f / %.6f. Falling back to direct formula.",
+                        symbol, exit_qty_sum, abs(size))
             total_pnl = _pnl_linear(entry_price, avg_exit, abs(size), side)
 
         holding_minutes = (closed_at - opened_at).total_seconds() / 60 if opened_at else 0.0
@@ -2176,24 +2205,24 @@ class LiveTrader:
         await self.db.update_position(
             pid,
             status="CLOSED",
-            closed_at=closed_at,
+            closed_at=closed_at,                    # <- real close time, not now()
             exit_reason=closing_order_type,
             pnl=total_pnl,
-            pnl_pct=pnl_pct,
+            pnl_pct=pnl_pct,                        # keep same units as before (percent)
             holding_minutes=holding_minutes,
-            avg_exit_price=avg_exit if "avg_exit_price" in getattr(self.db, "columns_positions", set()) else None,
-            fees_paid=fees_paid,
-        )
-
-        LOG.info(
-            "bundle=%s Closed %s pid=%d reason=%s avg_exit=%.8f pnl=%.4f pnl_pct=%.4f hold_min=%.2f",
-            bundle, symbol, pid, closing_order_type, float(avg_exit), float(total_pnl), float(pnl_pct), float(holding_minutes)
+            avg_exit_price=avg_exit if 'avg_exit_price' in getattr(self.db, 'columns_positions', set()) else None,
+            fees_paid=fees_paid
         )
 
         await self.risk.on_trade_close(total_pnl, self.tg)
         self.open_positions.pop(pid, None)
         self.last_exit[symbol] = closed_at
         await self.tg.send(f"✅ {symbol} position closed @ {avg_exit:.6g} | PnL ≈ {total_pnl:.2f} USDT")
+
+    # ---------------------------------------------------------------------------
+    # (end) finalize
+    # ---------------------------------------------------------------------------
+
 
 
     async def _force_close_position(self, pid: int, pos: Dict[str, Any], tag: str):
@@ -2377,48 +2406,62 @@ class LiveTrader:
     async def _finalize_zero_position_safe(self, pid: int, pos: dict, symbol: str):
         """
         Finalize a position whose exchange size is zero.
-        Single source of truth for zero-size finalization to avoid divergent code paths.
+        Try to infer exit from our SL/TP cids; else mark MANUAL_CLOSE and compute PnL via fallback.
+        Debounced via self._zero_finalize_backoff.
         """
-        bundle = getattr(self, "bundle_id", None) or "no_bundle"
         now = datetime.now(timezone.utc)
-
-        # Debounce finalize attempts
         if not hasattr(self, "_zero_finalize_backoff"):
             self._zero_finalize_backoff = {}
         last_try = self._zero_finalize_backoff.get(pid)
         if last_try and (now - last_try).total_seconds() < float(self.cfg.get("FINALIZE_BACKOFF_SEC", 120)):
-            LOG.info("bundle=%s Position size is 0 for %s; finalize debounced.", bundle, symbol)
-            return
+            return  # too soon; skip noisy retries
         self._zero_finalize_backoff[pid] = now
 
-        # Infer exit reason by checking our known clientOrderIds
-        exit_kind = "MANUAL_CLOSE"
-        candidates = [
-            ("TP",    pos.get("tp_final_cid")),
-            ("TP2",   pos.get("tp2_cid")),
-            ("TP1",   pos.get("tp1_cid")),
-            ("TRAIL", pos.get("sl_trail_cid")),
-            ("SL",    pos.get("sl_cid")),
-        ]
-
-        for label, cid in candidates:
-            if not cid:
-                continue
-            try:
-                o = await self._fetch_by_cid(cid, symbol)
-                if not o:
+        # 1) try to detect which order closed it
+        exit_price = None
+        exit_kind  = "MANUAL_CLOSE"
+        try:
+            for label, cid in (("TP",   pos.get("tp_final_cid")),
+                            ("TP1",  pos.get("tp1_cid")),
+                            ("SL",   pos.get("sl_cid")),
+                            ("TRAIL", pos.get("sl_trail_cid"))):
+                if not cid:
                     continue
-                st = str(o.get("status", "")).lower()
-                filled = float(o.get("filled") or o.get("amount") or 0.0)
-                if st == "closed" and filled > 0.0:
-                    exit_kind = label
+                o = await self._fetch_by_cid(cid, symbol, silent=True)
+                if o and str(o.get("status","")).lower() == "closed":
+                    exit_kind  = label
+                    px = o.get("average") or o.get("price")
+                    if px is not None:
+                        try: exit_price = float(px)
+                        except Exception: exit_price = None
                     break
-            except Exception as e:
-                LOG.warning("bundle=%s fetch_by_cid failed while inferring exit for %s cid=%s: %s", bundle, symbol, cid, e)
 
-        LOG.info("bundle=%s Finalizing zero-size %s pid=%d inferred_reason=%s", bundle, symbol, pid, exit_kind)
+            # 2) if still unknown, try trades around now; else use ticker last
+            if exit_price is None:
+                try:
+                    since_ts = int((now - timedelta(minutes=15)).timestamp() * 1000)
+                    trades = await self.exchange.fetch_my_trades(symbol, limit=100, since=since_ts)
+                    side = str(pos.get("side","")).lower()
+                    close_side = "sell" if side == "long" else "buy"
+                    for t in reversed(trades or []):
+                        if str(t.get("side","")).lower() == close_side:
+                            exit_price = float(t.get("price"))
+                            break
+                except Exception:
+                    exit_price = None
 
-        await self._finalize_position(pid, pos, inferred_exit_reason=exit_kind)
+            if exit_price is None:
+                try:
+                    tk = await self.exchange.fetch_ticker(symbol)
+                    exit_price = float(tk.get("last") or tk.get("mark") or tk.get("index") or pos.get("entry_price"))
+                except Exception:
+                    exit_price = float(pos.get("entry_price"))
+
+            # 3) hand off to the real finalize routine (correct signature)
+            await self._finalize_position(pid, pos, inferred_exit_reason=exit_kind)
+        except Exception as e:
+            LOG.exception("Finalize-zero safe failed for %s pid=%s: %s", symbol, pid, e)
+
 
 
     async def _find_pid_by_symbol(self, symbol: str, status: str = "CLOSED") -> Optional[int]:

@@ -1,0 +1,11 @@
+{
+  "calibration.json": "4bd6aad9e32feb3c7407d837303a9491e6b8544ef51859fd991d7daedb929c94",
+  "checksums_sha256.json": "16ebff50a0fec007e7f035681cfda69742843eaee50c065be0ea5451feaffdbe",
+  "deployment_config.json": "884c5caa30f2821420213a7e54f11ea4d8a343482d0243026ab625c35eccaad8",
+  "ev_thresholds.csv": "df532ca496b01640b8819a0cc82e99a70cb86601e879d0907e83825281b1f307",
+  "feature_manifest.json": "00ab1c9ecd679edc5d9be0f8a77664cc250d5c458b1a733141ae4ae14f060bc8",
+  "isotonic.joblib": "61c1223981163a33c207d30226dd10be73848067165a3ee2728bfef86d6e0a50",
+  "model.joblib": "e83c400052fce4974e52c94fc00a946074a232fd44c7849f131e25d709629914",
+  "sizing_curve.csv": "45073cf670cb522c1ae4b7434746776aa972beec47f303e4d1d2cc69029f9412",
+  "thresholds.json": "67f72cea5838b17d1a3e3e73e166ba3eba4099f4e077465d95e20667d1aa2a44"
+}

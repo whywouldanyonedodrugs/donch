@@ -193,5 +193,15 @@ FINALIZE_BACKOFF_SEC        = 120   # don't retry finalize more often than this
 CANCEL_CLEANUP_BACKOFF_SEC  = 180
 
 
+# --- Strict-parity meta bundle (live) ---
+# Directory containing exported artifacts: feature_manifest.json, feature_names.json, ohe.joblib, model.txt, etc.
+META_EXPORT_DIR: str = str(RESULTS_DIR / "meta_export")
+
+# If True: refuse to start if bundle missing/invalid; never fall back to wp=0.0.
+STRICT_META_BUNDLE: bool = True
+
+# Optional: list of additional artifact filenames that must be present in META_EXPORT_DIR
+# (e.g., ["thresholds.json", "sizing_curve.csv", "regime_sets.yaml"]).
+META_REQUIRED_EXTRA_FILES: list[str] = []
 
 

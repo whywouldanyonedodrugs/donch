@@ -1,0 +1,76 @@
+{
+  "columns_missing_from_pass2_candidates": [
+    "trend_regime_1d",
+    "vol_regime_1d"
+  ],
+  "columns_used_pass2": [
+    "trade_id",
+    "symbol",
+    "entry_ts",
+    "regime_code_1d",
+    "vol_prob_low_1d",
+    "markov_state_4h",
+    "regime_up",
+    "funding_rate",
+    "oi_z_7d",
+    "oi_pct_1d",
+    "crowd_side",
+    "btc_trend_slope",
+    "btc_vol_regime_level",
+    "days_since_prev_break",
+    "consolidation_range_atr",
+    "vol_mult"
+  ],
+  "cutpoints_raw": {
+    "btc_vol_regime_level": {
+      "q50": 0.689618945121765,
+      "q66": 0.753777980804443,
+      "q80": 0.823371052742004
+    },
+    "consolidation_range_atr": {
+      "q33": 0.7650227677519229,
+      "q66": 1.1220698642017197
+    },
+    "days_since_prev_break": {
+      "q33": 0.00347222222222222,
+      "q66": 0.00347222222222222
+    },
+    "funding_rate": {
+      "q10": -0.000295767,
+      "q50": 0.0001,
+      "q90": 0.00045016200000000015
+    },
+    "funding_rate_abs": {
+      "q20": 7.908000000000004e-05,
+      "q50": 0.0001,
+      "q80": 0.00042603
+    },
+    "oi_pct_1d": {
+      "q33": 0.010867511453106916,
+      "q66": 0.13241271704435342
+    },
+    "oi_z_7d": {
+      "q33": 0.534149823784828,
+      "q66": 1.9565849494934076
+    },
+    "vol_mult": {
+      "q33": 4.29686228752136,
+      "q66": 13.478648166656484
+    }
+  },
+  "infile": "results/trades.clean.csv",
+  "outfile": "regimes.parquet",
+  "thresholds": {
+    "btc_vol_hi": 0.753777980804443,
+    "compression_q33": 0.7650227677519229,
+    "compression_q66": 1.1220698642017197,
+    "fresh_q33": 0.00347222222222222,
+    "fresh_q66": 0.00347222222222222,
+    "funding_neutral_eps": 7.908000000000004e-05,
+    "oi_q33": 0.534149823784828,
+    "oi_q66": 1.9565849494934076,
+    "oi_source": "oi_z_7d",
+    "vol_mult_q33": 4.29686228752136,
+    "vol_mult_q66": 13.478648166656484
+  }
+}

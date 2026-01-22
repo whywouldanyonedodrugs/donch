@@ -1,0 +1,10 @@
+{
+  "artifact": "isotonic.joblib",
+  "chosen_method": "isotonic",
+  "fit_scope": "RISK_ON_1",
+  "formula": "p_cal = isotonic(clip(p_raw))",
+  "model_col": "p_lgbm",
+  "params": {
+    "eps": 1e-12
+  }
+}

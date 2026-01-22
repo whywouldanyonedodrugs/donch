@@ -1,324 +1,356 @@
-# live/winprob_loader.py  — WinProbScorer patch (drop-in)
+# live/winprob_loader.py
 from __future__ import annotations
-import json, os, re, hashlib, logging
+
+import hashlib
+import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-import joblib, numpy as np, pandas as pd
+
+import numpy as np
+import pandas as pd
+
+from .artifact_bundle import ArtifactBundle, BundleError, SchemaError, load_bundle
 
 LOG = logging.getLogger("winprob")
 
-def _load_json(p: Path) -> Any:
-    with p.open("r", encoding="utf-8") as f:
-        return json.load(f)
 
-def _find(dir_: Path, names: List[str]) -> Optional[Path]:
-    for n in names:
-        p = dir_ / n
-        if p.exists():
-            return p
-    return None
+@dataclass(frozen=True)
+class FeatureSpec:
+    name: str
+    kind: str  # "numeric" | "categorical"
+    dtype: str
+    categories: Optional[List[Any]] = None
+    codes: Optional[Dict[str, Any]] = None
+
+
+def _is_nan(x: Any) -> bool:
+    try:
+        return bool(np.isnan(x))
+    except Exception:
+        return False
+
+
+def _parse_manifest(manifest_obj: Any) -> List[FeatureSpec]:
+    """
+    Supported manifest formats (best-effort):
+
+    1) {"features": {"f1": {"dtype": "float64", "kind": "numeric", ...}, ...}}
+    2) {"f1": {"dtype": "float64", ...}, "f2": {...}, ...}
+    3) [{"name": "f1", "dtype": "float64", ...}, ...]
+    """
+    items: List[Tuple[str, Any]] = []
+
+    if isinstance(manifest_obj, dict):
+        if "features" in manifest_obj and isinstance(manifest_obj["features"], dict):
+            items = list(manifest_obj["features"].items())
+        else:
+            items = [(k, v) for k, v in manifest_obj.items() if isinstance(k, str)]
+    elif isinstance(manifest_obj, list):
+        for i, it in enumerate(manifest_obj):
+            if isinstance(it, dict) and "name" in it:
+                items.append((str(it["name"]), it))
+            elif isinstance(it, dict) and "feature" in it:
+                items.append((str(it["feature"]), it))
+            else:
+                raise BundleError(f"Unsupported manifest entry at idx={i}: {it}")
+    else:
+        raise BundleError(f"Unsupported feature_manifest.json format: {type(manifest_obj)}")
+
+    specs: List[FeatureSpec] = []
+    for name, desc in items:
+        if not isinstance(name, str) or not name:
+            continue
+
+        if isinstance(desc, str):
+            dtype = desc
+            kind = "categorical" if ("cat" in dtype or "str" in dtype or "object" in dtype) else "numeric"
+            specs.append(FeatureSpec(name=name, kind=kind, dtype=dtype))
+            continue
+
+        if not isinstance(desc, dict):
+            raise BundleError(f"Invalid feature spec for {name}: {desc}")
+
+        dtype = str(desc.get("dtype", desc.get("type", "float64")))
+        raw_kind = desc.get("kind", desc.get("role", None))
+        cats = desc.get("categories", desc.get("cats", None))
+        codes = desc.get("codes", desc.get("codebook", None))
+
+        if raw_kind is None:
+            if cats is not None or "category" in dtype or dtype in ("object", "str", "string"):
+                kind = "categorical"
+            else:
+                kind = "numeric"
+        else:
+            rk = str(raw_kind).lower()
+            kind = "categorical" if rk in ("cat", "categorical", "category") else "numeric"
+
+        specs.append(
+            FeatureSpec(
+                name=name,
+                kind=kind,
+                dtype=dtype,
+                categories=list(cats) if isinstance(cats, (list, tuple)) else None,
+                codes=dict(codes) if isinstance(codes, dict) else None,
+            )
+        )
+
+    names = [s.name for s in specs]
+    if len(names) != len(set(names)):
+        dup = sorted({n for n in names if names.count(n) > 1})
+        raise BundleError(f"feature_manifest has duplicate feature names: {dup}")
+
+    return specs
+
 
 class WinProbScorer:
-    """
-    Loads win-probability artifacts and scores a single meta-row (dict).
-    """
+    """Strict, deterministic scorer for the exported meta-model bundle."""
 
-    # key normalization (lower-cased)
-    KEY_ALIASES = {
-        "symbol": "sym", "pair": "sym", "ticker": "sym", "market": "sym", "instrument": "sym",
-    }
+    def __init__(
+        self,
+        artifact_dir: str | Path | None = None,
+        *,
+        bundle: ArtifactBundle | None = None,
+        strict_schema: bool = True,
+    ):
+        if bundle is None:
+            if artifact_dir is None:
+                artifact_dir = "results/meta_export"
+            bundle = load_bundle(artifact_dir, strict=True)
 
-    # categorical groups that were one-hot encoded at train time
-    GROUP_PREFIXES = ("pullback_type_", "entry_rule_", "regime_1d_")  # e.g., pullback_type_retest
+        self.bundle = bundle
+        self.dir = bundle.meta_dir
+        self.bundle_id = bundle.bundle_id
+        self.model = bundle.model
+        self.model_kind = bundle.model_kind
+        self.ohe = bundle.ohe
+        self.calibrator = bundle.calibrator
+        self.pstar = bundle.pstar
+        self.feature_names: List[str] = list(bundle.feature_names)
 
-    # live->train numeric aliases (all lower-case)
-    NUMERIC_ALIASES: Dict[str, List[str]] = {
-        "rsi_1h": ["rsi1h", "rsi_1h"],
-        "adx_1h": ["adx1h", "adx_1h"],
-        "eth_macd_hist_4h": [
-            "eth_macd_hist_4h", "eth_macd_hist4h", "eth_macd4h_hist",
-            "eth_macd_hist", "eth macd4h hist", "eth macd(4h) hist"
-        ],
-        "vol_mult": ["vol_mult", "vol mult (median 30d)", "vol_mult_median_30d"],
-        "don_break_level": ["don_break_level"],
-        "don_break_len": ["don_break_len"],
-        "don_dist_atr": ["don_dist_atr", "dist_atr"],
-        "atr_pct": ["atr_pct", "atr%"],
-        "atr_1h": ["atr_1h"],
-        "atr": ["atr"],
-        "entry": ["entry", "price"],  # your live “Price” is entry at signal time
-        "rs_pct": ["rs_pct", "rs pct"],
-        "hour_sin": ["hour_sin"], "hour_cos": ["hour_cos"], "dow": ["dow"],
-        "vol_spike_i": ["vol_spike_i", "vol_spike"],
-    }
+        self.strict_schema = bool(strict_schema)
 
-    def __init__(self, artifacts_dir: Optional[str | Path] = None) -> None:
-        self.dir: Optional[Path] = None
-        self.model = None
-        self.calibrator = None
-        self.ohe = None
-        self.expected_features: List[str] = []
-        self.pstar: Optional[float] = None
-        # NEW: strict parity check (set by live_trader based on META_REQUIRED)
-        self.strict_parity: bool = False
+        # Raw schema
+        self._raw_specs = _parse_manifest(bundle.feature_manifest)
+        self._raw_spec_by_name = {s.name: s for s in self._raw_specs}
+        self.raw_features: List[str] = [s.name for s in self._raw_specs]
 
+        # Cat columns as used during training (order matters)
+        try:
+            self.raw_cat_cols: List[str] = list(getattr(self.ohe, "feature_names_in_", []))
+        except Exception:
+            self.raw_cat_cols = []
+
+        raw_cat_set = set(self.raw_cat_cols)
+        self.raw_num_cols: List[str] = []
+        for s in self._raw_specs:
+            if s.kind == "categorical" or s.name in raw_cat_set:
+                continue
+            self.raw_num_cols.append(s.name)
+
+        self.is_loaded = True
+
+        # Diag / identical-vector detection
         self._diag_once = False
         self._last_hash = None
         self._same_vec_count = 0
 
-        self._ohe_cols: List[str] = []
-        self._num_cols: List[str] = []
+        self._validate_bundle_consistency()
 
+    def score(self, raw_row: Dict[str, Any]) -> float:
+        """Return calibrated win-probability in [0,1]. Raises SchemaError on invalid raw_row."""
+        p_raw, p_cal = self.score_with_details(raw_row)
+        return p_cal
 
+    def score_with_details(self, raw_row: Dict[str, Any]) -> Tuple[float, float]:
+        X, vec_hash = self._build_X(raw_row)
+        p_raw = self._predict_proba(X)
+        p_cal = self._calibrate(p_raw)
+        self._diag(vec_hash)
+        return p_raw, p_cal
 
-        if artifacts_dir is None:
-            env_dir = os.getenv("DONCH_WINPROB_DIR") or os.getenv("WINPROB_DIR")
-            if env_dir:
-                artifacts_dir = Path(env_dir)
-            else:
-                for cand in ("results/meta_export", "results/meta", "results/meta-model"):
-                    if Path(cand).exists():
-                        artifacts_dir = Path(cand)
-                        break
-        if artifacts_dir is not None:
-            self.load(artifacts_dir)
+    def _validate_bundle_consistency(self) -> None:
+        n = len(self.feature_names)
+        if n <= 0:
+            raise BundleError("feature_names.json is empty")
 
-    @property
-    def is_loaded(self) -> bool:
-        return self.model is not None and bool(self.expected_features)
-
-    def load(self, artifacts_dir: str | Path) -> None:
-        self.dir = Path(artifacts_dir)
         try:
-            model_path = _find(self.dir, [
-                "donch_meta_lgbm.joblib", "model.joblib", "model.pkl", "clf.pkl", "estimator.pkl"
-            ])
-            if model_path is None:
-                raise FileNotFoundError("model artifact not found (donch_meta_lgbm.joblib/model.pkl)")
-            self.model = joblib.load(model_path)
-
-            ef_path = _find(self.dir, [
-                "feature_names.json", "expected_features.json", "feature_order.json", "columns.json"
-            ])
-            if ef_path is not None:
-                self.expected_features = list(_load_json(ef_path))
-            elif hasattr(self.model, "feature_names_in_"):
-                self.expected_features = list(self.model.feature_names_in_)
+            if self.model_kind == "lgb_booster":
+                model_names = list(getattr(self.model, "feature_name", lambda: [])())
+                if model_names and len(model_names) != n:
+                    raise BundleError(f"model.txt feature count {len(model_names)} != feature_names.json {n}")
             else:
-                raise FileNotFoundError("feature_names.json / expected_features.json not found")
-
-            ohe_path = _find(self.dir, ["ohe.joblib", "ohe.pkl", "onehot.joblib"])
-            self.ohe = joblib.load(ohe_path) if ohe_path else None
-
-            calib_path = _find(self.dir, ["calibrator.joblib", "calibrator.pkl", "calib.pkl", "calibration.pkl"])
-            self.calibrator = joblib.load(calib_path) if calib_path else None
-
-            pstar_path = self.dir / "pstar.txt"
-            if pstar_path.exists():
-                try: self.pstar = float(pstar_path.read_text().strip())
-                except Exception: self.pstar = None
-
-            self._infer_schema_from_expected()
-
-            LOG.info("[WINPROB] loaded dir=%s model=%s features=%d ohe=%s calibrator=%s p*=%s",
-                     str(self.dir), model_path.name, len(self.expected_features),
-                     getattr(ohe_path, "name", "none") if ohe_path else "none",
-                     getattr(calib_path, "name", "none") if calib_path else "none",
-                     f"{self.pstar:.2f}" if isinstance(self.pstar, float) else "none")
-        except Exception as e:
-            LOG.exception("[WinProbScorer] load failed from %s: %s", self.dir, e)
-            self.model = None; self.expected_features = []; self.ohe = None; self.calibrator = None
-
-    def _infer_schema_from_expected(self) -> None:
-        ohe_cols, num_cols = [], []
-        for col in self.expected_features:
-            if (
-                "=" in col or col.startswith(("cat__", "ohe__")) or
-                any(col.startswith(pref) for pref in self.GROUP_PREFIXES)
-            ):
-                ohe_cols.append(col)
-            else:
-                num_cols.append(col)
-        self._ohe_cols = ohe_cols
-        self._num_cols = num_cols
-
-    # ----- helpers -----
-    def _norm_key(self, k: str) -> str:
-        k2 = self.KEY_ALIASES.get(str(k).lower(), str(k).lower())
-        k2 = k2.replace("%", "pct")
-        k2 = re.sub(r"[^\w]+", "_", k2).strip("_")
-        return k2
-
-    def _normalize_keys(self, row: Dict[str, Any]) -> Dict[str, Any]:
-        return { self._norm_key(k): v for k, v in row.items() }
-
-    def _lookup_num(self, row: Dict[str, Any], col: str) -> float:
-        # exact
-        if col in row: return row[col]
-        # aliases
-        for al in self.NUMERIC_ALIASES.get(col, []):
-            if al in row: return row[al]
-        # derived fallbacks
-        if col == "atr_pct" and "atr" in row and "entry" in row and row["entry"]:
-            try: return float(row["atr"]) / float(row["entry"])
-            except Exception: return 0.0
-        if col == "don_dist_atr" and "entry" in row and "don_break_level" in row:
-            atr_scale = row.get("atr_1h") or row.get("atr") or 0.0
-            try:
-                if float(atr_scale) != 0.0:
-                    return (float(row["entry"]) - float(row["don_break_level"])) / float(atr_scale)
-            except Exception:
-                return 0.0
-        return 0.0
-
-    def _has_num(self, row: Dict[str, Any], col: str) -> bool:
-        try:
-            v = self._lookup_num(row, col)
-            return v is not None and np.isfinite(float(v))
-        except Exception:
-            return False
-
-    def _manual_ohe(self, row: Dict[str, Any]) -> pd.DataFrame:
-        """Produce columns in self._ohe_cols, including group-style one-hots like 'pullback_type_retest'."""
-        data: Dict[str, float] = {}
-        for col in self._ohe_cols:
-            v = 0.0
-            # group-style: prefix_value
-            for pref in self.GROUP_PREFIXES:
-                if col.startswith(pref):
-                    base = pref[:-1] if pref.endswith("_") else pref  # e.g., 'pullback_type'
-                    want = col[len(pref):]
-                    have = str(row.get(base, "")).strip()
-                    v = 1.0 if have == want else 0.0
-                    break
-            data[col] = float(v)
-        return pd.DataFrame([data], columns=self._ohe_cols) if self._ohe_cols else pd.DataFrame([{}])
-
-    def _ohe_transform(self, row_norm: Dict[str, Any]) -> pd.DataFrame:
-        # If an sklearn OneHotEncoder was exported, use it; otherwise do manual OHE.
-        # (sklearn naming via get_feature_names_out is the train-time source of columns). :contentReference[oaicite:1]{index=1}
-        if self.ohe is None:
-            return self._manual_ohe(row_norm)
-
-        cat_in = list(getattr(self.ohe, "feature_names_in_", []))
-        if not cat_in:
-            return self._manual_ohe(row_norm)
-
-        raw = {k: row_norm.get(k) for k in cat_in}
-        try:
-            Xc = self.ohe.transform(pd.DataFrame([raw], columns=cat_in))
-            Xc = Xc.toarray() if hasattr(Xc, "toarray") else np.asarray(Xc)
-            names = list(self.ohe.get_feature_names_out(cat_in)) if hasattr(self.ohe, "get_feature_names_out") else []
-            df = pd.DataFrame(Xc, columns=names) if names else pd.DataFrame(Xc)
-        except Exception:
-            df = self._manual_ohe(row_norm)
-
-        # align to expected OHE outputs
-        for c in self._ohe_cols:
-            if c not in df.columns: df[c] = 0.0
-        drop = [c for c in df.columns if c not in self._ohe_cols]
-        if drop: df.drop(columns=drop, inplace=True)
-        return df[self._ohe_cols] if self._ohe_cols else pd.DataFrame([{}])
-
-    def _build_X(self, row: Dict[str, Any]) -> pd.DataFrame:
-        if not self.expected_features:
-            raise RuntimeError("WinProbScorer not loaded")
-        r = self._normalize_keys(row)
-
-        # --- NEW: strict parity (fail closed if live features set mismatches) -
-        if self.strict_parity:
-            # numeric presence
-            num_req = len(self._num_cols)
-            num_have = sum(1 for c in self._num_cols if self._has_num(r, c))
-            # categorical presence (use OHE bases if available; otherwise group prefixes)
-            if self.ohe is not None and hasattr(self.ohe, "feature_names_in_"):
-                cat_bases = list(getattr(self.ohe, "feature_names_in_", []))
-                cat_req = len(cat_bases)
-                cat_have = sum(1 for b in cat_bases if (b in r) and str(r.get(b, "")).strip() != "")
-            else:
-                gp = []
-                for pref in self.GROUP_PREFIXES:
-                    if any(col.startswith(pref) for col in self._ohe_cols):
-                        base = pref[:-1] if pref.endswith("_") else pref
-                        gp.append(base)
-                cat_bases = sorted(set(gp))
-                cat_req = len(cat_bases)
-                cat_have = sum(1 for b in cat_bases if str(r.get(b, "")).strip() != "")
-            if (num_have != num_req) or (cat_have != cat_req):
-                raise RuntimeError(f"feature_parity_mismatch: num {num_have}/{num_req}, cat {cat_have}/{cat_req}")
-
-        # categorical block (group OHE + optional sklearn OHE)
-        df_cat = self._ohe_transform(r)
-
-        # numeric block with alias lookup
-        num_vals = { c: float(self._lookup_num(r, c)) if self._lookup_num(r, c) is not None and np.isfinite(self._lookup_num(r, c)) else 0.0
-                     for c in self._num_cols }
-        df_num = pd.DataFrame([num_vals], columns=self._num_cols) if self._num_cols else pd.DataFrame([{}])
-
-        X = pd.concat([df_cat, df_num], axis=1)
-        for c in self.expected_features:
-            if c not in X.columns: X[c] = 0.0
-        X = X[self.expected_features].astype(float)
-
-        if not self._diag_once:
-            nz = int((np.abs(X.to_numpy()) > 0).sum())
-            first_nz = [c for c, v in zip(X.columns, X.to_numpy()[0]) if v != 0][:15]
-            LOG.info("[WINPROB DIAG] features=%d  nonzero=%d  first_nonzero=%s", len(self.expected_features), nz, first_nz)
-            self._diag_once = True
-        return X
-
-    def _calibrate(self, p_raw: float) -> float:
-        if self.calibrator is None:
-            return float(np.clip(p_raw, 0.0, 1.0))
-        try:
-            if hasattr(self.calibrator, "predict") and not hasattr(self.calibrator, "predict_proba"):
-                out = self.calibrator.predict(np.array([[p_raw]]))
-                return float(np.clip(out[0], 0.0, 1.0))
-            if hasattr(self.calibrator, "predict_proba"):
-                out = self.calibrator.predict_proba(np.array([[p_raw]]))[:, 1]
-                return float(np.clip(out[0], 0.0, 1.0))
-        except Exception as e:
-            LOG.debug("[WINPROB] calibrator failed: %s", e)
-        return float(np.clip(p_raw, 0.0, 1.0))
-
-    def score(self, row: Dict[str, Any]) -> float:
-        if not self.is_loaded: return 0.0
-        X = self._build_X(row)
-        p_raw = float(self.model.predict_proba(X)[:, 1][0])
-        p = self._calibrate(p_raw)
-
-        # identical-vector guardrail
-        try:
-            h = hashlib.md5(X.to_numpy().tobytes()).hexdigest()
-            if self._last_hash == h:
-                self._same_vec_count += 1
-                if self._same_vec_count in (2, 5, 25, 100):
-                    LOG.warning("[WINPROB DIAG] %d identical feature vectors in a row (hash=%s).", self._same_vec_count, h)
-            else:
-                self._last_hash, self._same_vec_count = h, 0
+                n_model = int(getattr(self.model, "n_features_in_", n))
+                if n_model != n:
+                    raise BundleError(f"joblib model expects {n_model} features != feature_names.json {n}")
+        except BundleError:
+            raise
         except Exception:
             pass
 
-        # 1) log p_raw and calibrated p
-        p_raw = float(self.model.predict_proba(X)[:, 1][0])
-        LOG.info("[WINPROB] p_raw=%.6f  p_cal=%.6f", p_raw, self._calibrate(p_raw))
+    def _validate_raw_schema(self, raw_row: Dict[str, Any]) -> None:
+        if not isinstance(raw_row, dict):
+            raise SchemaError(f"raw_row must be dict, got {type(raw_row)}")
 
-        # 2) LightGBM contributions to confirm the model is actually using features
-#        try:
-#            contrib = self.model.predict(X, pred_contrib=True)  # last col is base value
-#            vals = contrib[0]
-#            names = list(self.expected_features) + ["<base>"]
-#            top = sorted(zip(names, vals), key=lambda z: abs(z[1]), reverse=True)[:6]
-#            LOG.info("[WINPROB] top_contrib: %s", top)
-#        except Exception as e:
-#            LOG.debug("pred_contrib failed: %s", e)
+        keys = set(raw_row.keys())
+        required = set(self.raw_features)
 
-        return float(np.clip(p, 0.0, 1.0))
+        missing = sorted(required - keys)
+        extra = sorted(keys - required)
 
-    def score_df(self, X: pd.DataFrame) -> float:
-        if not self.is_loaded: return 0.0
-        for c in self.expected_features:
-            if c not in X.columns: X[c] = 0.0
-        X = X[self.expected_features].astype(float)
-        p_raw = float(self.model.predict_proba(X)[:, 1][0])
-        return self._calibrate(p_raw)
+        if missing:
+            raise SchemaError(
+                f"Missing required raw features: {missing[:40]}" + (" ..." if len(missing) > 40 else "")
+            )
+        if self.strict_schema and extra:
+            raise SchemaError(
+                f"Extra raw features not in manifest: {extra[:40]}" + (" ..." if len(extra) > 40 else "")
+            )
+
+        for name in self.raw_features:
+            spec = self._raw_spec_by_name[name]
+            v = raw_row.get(name)
+
+            if spec.kind == "numeric":
+                if v is None or _is_nan(v) or (isinstance(v, (float, np.floating)) and not np.isfinite(v)):
+                    raise SchemaError(f"Invalid numeric value for {name}: {v}")
+                if isinstance(v, bool):
+                    raise SchemaError(f"Invalid numeric value for {name} (bool not allowed): {v}")
+                try:
+                    float(v)
+                except Exception as e:
+                    raise SchemaError(f"Numeric feature {name} not castable to float: {v} ({e})") from e
+
+            else:
+                if v is None or (isinstance(v, float) and not np.isfinite(v)):
+                    raise SchemaError(f"Invalid categorical value for {name}: {v}")
+
+                allowed: Optional[set] = None
+                if spec.categories is not None:
+                    allowed = set(str(x) for x in spec.categories)
+                if spec.codes is not None:
+                    allowed_codes = set(str(k) for k in spec.codes.keys()) | set(str(x) for x in spec.codes.values())
+                    allowed = allowed_codes if allowed is None else (allowed | allowed_codes)
+
+                if allowed is not None and str(v) not in allowed:
+                    raise SchemaError(f"Categorical {name} value '{v}' not in allowed set")
+
+    def _build_X(self, raw_row: Dict[str, Any]) -> Tuple[np.ndarray, str]:
+        self._validate_raw_schema(raw_row)
+
+        # Build cat frame for OHE
+        cat_vals: Dict[str, Any] = {}
+        for c in self.raw_cat_cols:
+            if c not in raw_row:
+                raise SchemaError(f"OHE expects raw categorical '{c}' but it's missing from raw_row/manifest")
+            cat_vals[c] = raw_row[c]
+        cat_df = pd.DataFrame([cat_vals]) if self.raw_cat_cols else pd.DataFrame(index=[0])
+
+        # OHE outputs
+        ohe_cols_out: List[str] = []
+        ohe_vals: Optional[np.ndarray] = None
+        if self.raw_cat_cols:
+            try:
+                Xo = self.ohe.transform(cat_df[self.raw_cat_cols].astype(str))
+                if hasattr(Xo, "toarray"):
+                    Xo = Xo.toarray()
+                ohe_vals = np.asarray(Xo, dtype=np.float64)
+                ohe_cols_out = list(self.ohe.get_feature_names_out(self.raw_cat_cols))
+            except Exception as e:
+                raise SchemaError(f"OHE transform failed: {e}") from e
+
+        # Final model matrix in fixed column order
+        X_df = pd.DataFrame(np.zeros((1, len(self.feature_names)), dtype=np.float64), columns=self.feature_names)
+
+        # Fill numeric raw features
+        for c in self.raw_num_cols:
+            if c in X_df.columns:
+                X_df.at[0, c] = float(raw_row[c])
+
+        # Fill OHE outputs (only those present in feature_names)
+        if ohe_vals is not None and ohe_cols_out:
+            common = [c for c in ohe_cols_out if c in X_df.columns]
+            if common:
+                idx_in_ohe = [ohe_cols_out.index(c) for c in common]
+                X_df.loc[0, common] = ohe_vals[0, idx_in_ohe]
+
+        vec = X_df.to_numpy(dtype=np.float64, copy=False)
+        vec_hash = hashlib.md5(vec.tobytes()).hexdigest()
+        return vec, vec_hash
+
+    def _predict_proba(self, X: np.ndarray) -> float:
+        if X.ndim != 2 or X.shape[0] != 1:
+            raise ValueError(f"X must be shape (1, n_features), got {X.shape}")
+
+        if self.model_kind == "lgb_booster":
+            try:
+                p = float(self.model.predict(X)[0])
+            except Exception as e:
+                raise BundleError(f"LightGBM Booster predict failed: {e}") from e
+        else:
+            try:
+                p = float(self.model.predict_proba(X)[:, 1][0])
+            except Exception as e:
+                raise BundleError(f"Sklearn model predict_proba failed: {e}") from e
+
+        if not np.isfinite(p):
+            raise BundleError(f"Model returned non-finite probability: {p}")
+        return float(min(max(p, 0.0), 1.0))
+
+    def _calibrate(self, p_raw: float) -> float:
+        cal = self.calibrator
+        if cal is None:
+            return p_raw
+
+        if isinstance(cal, dict):
+            ctype = str(cal.get("type", cal.get("kind", ""))).lower()
+            if ctype == "platt":
+                a = float(cal.get("a", 1.0))
+                b = float(cal.get("b", 0.0))
+                z = a * p_raw + b
+                return float(1.0 / (1.0 + np.exp(-z)))
+            if ctype == "isotonic":
+                xs = cal.get("xs") or cal.get("x")
+                ys = cal.get("ys") or cal.get("y")
+                if isinstance(xs, list) and isinstance(ys, list) and len(xs) == len(ys) and len(xs) >= 2:
+                    return float(np.interp(p_raw, np.asarray(xs, dtype=float), np.asarray(ys, dtype=float)))
+            return p_raw
+
+        try:
+            if hasattr(cal, "predict") and not hasattr(cal, "predict_proba"):
+                return float(cal.predict([p_raw])[0])
+            if hasattr(cal, "predict_proba"):
+                return float(cal.predict_proba(np.array([[p_raw]], dtype=float))[:, 1][0])
+        except Exception:
+            return p_raw
+
+        return p_raw
+
+    def _diag(self, vec_hash: str) -> None:
+        if not self._diag_once:
+            LOG.info(
+                "WinProb bundle=%s model_kind=%s raw_feats=%d model_cols=%d p*=%s",
+                self.bundle_id,
+                self.model_kind,
+                len(self.raw_features),
+                len(self.feature_names),
+                (f"{self.pstar:.4f}" if isinstance(self.pstar, (float, int)) else "None"),
+            )
+            self._diag_once = True
+
+        if self._last_hash is None:
+            self._last_hash = vec_hash
+            return
+
+        if vec_hash == self._last_hash:
+            self._same_vec_count += 1
+            if self._same_vec_count in (5, 25, 100):
+                LOG.warning(
+                    "[WINPROB DIAG] %d consecutive identical feature vectors (hash=%s, bundle=%s)",
+                    self._same_vec_count,
+                    vec_hash,
+                    self.bundle_id,
+                )
+        else:
+            self._last_hash = vec_hash
+            self._same_vec_count = 0

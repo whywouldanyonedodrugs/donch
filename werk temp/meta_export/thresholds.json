@@ -1,0 +1,170 @@
+{
+  "criterion": "mean",
+  "selected_scope": "RISK_ON_1",
+  "thresholds_by_scope": {
+    "ALL": {
+      "best": {
+        "mean_pnl_R": 2.301011809712085,
+        "mean_pnl_R_not_time": 2.5672294074309594,
+        "n": 297,
+        "pos_rate": 0.7407407407407407,
+        "rank_by_mean_pnl": 1.0,
+        "rank_by_sum_pnl": 25.0,
+        "scope": "ALL",
+        "sum_pnl_R": 683.4005074844891,
+        "threshold": 0.78,
+        "time_rate": 0.2188552188552188,
+        "win_rate": 0.7643097643097643
+      },
+      "top5": [
+        {
+          "mean_pnl_R": 2.301011809712085,
+          "mean_pnl_R_not_time": 2.5672294074309594,
+          "n": 297,
+          "pos_rate": 0.7407407407407407,
+          "rank_by_mean_pnl": 1.0,
+          "rank_by_sum_pnl": 25.0,
+          "scope": "ALL",
+          "sum_pnl_R": 683.4005074844891,
+          "threshold": 0.78,
+          "time_rate": 0.2188552188552188,
+          "win_rate": 0.7643097643097643
+        },
+        {
+          "mean_pnl_R": 2.2898454128545214,
+          "mean_pnl_R_not_time": 2.5518053565242096,
+          "n": 298,
+          "pos_rate": 0.738255033557047,
+          "rank_by_mean_pnl": 2.0,
+          "rank_by_sum_pnl": 26.0,
+          "scope": "ALL",
+          "sum_pnl_R": 682.3739330306473,
+          "threshold": 0.76,
+          "time_rate": 0.2181208053691275,
+          "win_rate": 0.761744966442953
+        },
+        {
+          "mean_pnl_R": 2.236182818973637,
+          "mean_pnl_R_not_time": 2.4881260248349197,
+          "n": 357,
+          "pos_rate": 0.7254901960784313,
+          "rank_by_mean_pnl": 3.0,
+          "rank_by_sum_pnl": 24.0,
+          "scope": "ALL",
+          "sum_pnl_R": 798.3172663735884,
+          "threshold": 0.74,
+          "time_rate": 0.2240896358543417,
+          "win_rate": 0.7535014005602241
+        },
+        {
+          "mean_pnl_R": 2.236182818973637,
+          "mean_pnl_R_not_time": 2.4881260248349197,
+          "n": 357,
+          "pos_rate": 0.7254901960784313,
+          "rank_by_mean_pnl": 3.0,
+          "rank_by_sum_pnl": 24.0,
+          "scope": "ALL",
+          "sum_pnl_R": 798.3172663735884,
+          "threshold": 0.72,
+          "time_rate": 0.2240896358543417,
+          "win_rate": 0.7535014005602241
+        },
+        {
+          "mean_pnl_R": 2.236182818973637,
+          "mean_pnl_R_not_time": 2.4881260248349197,
+          "n": 357,
+          "pos_rate": 0.7254901960784313,
+          "rank_by_mean_pnl": 3.0,
+          "rank_by_sum_pnl": 24.0,
+          "scope": "ALL",
+          "sum_pnl_R": 798.3172663735884,
+          "threshold": 0.7000000000000001,
+          "time_rate": 0.2240896358543417,
+          "win_rate": 0.7535014005602241
+        }
+      ]
+    },
+    "RISK_ON_1": {
+      "best": {
+        "mean_pnl_R": 2.441249195433913,
+        "mean_pnl_R_not_time": 2.7867820061464585,
+        "n": 215,
+        "pos_rate": 0.786046511627907,
+        "rank_by_mean_pnl": 1.0,
+        "rank_by_sum_pnl": 15.0,
+        "scope": "RISK_ON_1",
+        "sum_pnl_R": 524.8685770182914,
+        "threshold": 0.64,
+        "time_rate": 0.2511627906976744,
+        "win_rate": 0.8093023255813954
+      },
+      "top5": [
+        {
+          "mean_pnl_R": 2.441249195433913,
+          "mean_pnl_R_not_time": 2.7867820061464585,
+          "n": 215,
+          "pos_rate": 0.786046511627907,
+          "rank_by_mean_pnl": 1.0,
+          "rank_by_sum_pnl": 15.0,
+          "scope": "RISK_ON_1",
+          "sum_pnl_R": 524.8685770182914,
+          "threshold": 0.64,
+          "time_rate": 0.2511627906976744,
+          "win_rate": 0.8093023255813954
+        },
+        {
+          "mean_pnl_R": 2.36599542445904,
+          "mean_pnl_R_not_time": 2.6898961497329505,
+          "n": 244,
+          "pos_rate": 0.7663934426229508,
+          "rank_by_mean_pnl": 2.0,
+          "rank_by_sum_pnl": 14.0,
+          "scope": "RISK_ON_1",
+          "sum_pnl_R": 577.3028835680057,
+          "threshold": 0.62,
+          "time_rate": 0.2459016393442623,
+          "win_rate": 0.7868852459016393
+        },
+        {
+          "mean_pnl_R": 2.36599542445904,
+          "mean_pnl_R_not_time": 2.6898961497329505,
+          "n": 244,
+          "pos_rate": 0.7663934426229508,
+          "rank_by_mean_pnl": 2.0,
+          "rank_by_sum_pnl": 14.0,
+          "scope": "RISK_ON_1",
+          "sum_pnl_R": 577.3028835680057,
+          "threshold": 0.6,
+          "time_rate": 0.2459016393442623,
+          "win_rate": 0.7868852459016393
+        },
+        {
+          "mean_pnl_R": 2.36599542445904,
+          "mean_pnl_R_not_time": 2.6898961497329505,
+          "n": 244,
+          "pos_rate": 0.7663934426229508,
+          "rank_by_mean_pnl": 2.0,
+          "rank_by_sum_pnl": 14.0,
+          "scope": "RISK_ON_1",
+          "sum_pnl_R": 577.3028835680057,
+          "threshold": 0.58,
+          "time_rate": 0.2459016393442623,
+          "win_rate": 0.7868852459016393
+        },
+        {
+          "mean_pnl_R": 2.36599542445904,
+          "mean_pnl_R_not_time": 2.6898961497329505,
+          "n": 244,
+          "pos_rate": 0.7663934426229508,
+          "rank_by_mean_pnl": 2.0,
+          "rank_by_sum_pnl": 14.0,
+          "scope": "RISK_ON_1",
+          "sum_pnl_R": 577.3028835680057,
+          "threshold": 0.56,
+          "time_rate": 0.2459016393442623,
+          "win_rate": 0.7868852459016393
+        }
+      ]
+    }
+  }
+}
