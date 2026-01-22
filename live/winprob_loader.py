@@ -62,35 +62,51 @@ def _is_nan(x: Any) -> bool:
 
 def _parse_manifest(manifest_obj: Any) -> List[FeatureSpec]:
     """
-    Supports schema-container exporter format:
+    Supports multiple manifest formats.
 
+    Canonical (offline team):
       {
-        "cat_cols": [...],
-        "num_cols": [...],
-        "dtypes": {...} (optional),
-        "categories": {...} (optional),
-        "codes": {...} (optional)
+        "features": {
+          "numeric_cols": [...],
+          "cat_cols": [...]
+        },
+        ...
       }
 
-    Also supports {"schema": {...}} wrapper and older feature-spec formats.
+    Also supports:
+      {"schema": {...}} wrapper
+      schema-container at top-level: {"cat_cols": [...], "num_cols"/"numeric_cols": [...]}
+      older feature-spec formats (fallback)
     """
 
-    # Allow wrapper: {"schema": {...}}
+    # 1) Unwrap {"schema": {...}} if present
     if isinstance(manifest_obj, dict) and isinstance(manifest_obj.get("schema"), dict):
         inner = manifest_obj["schema"]
-        if ("cat_cols" in inner) or ("num_cols" in inner):
+        if any(k in inner for k in ("cat_cols", "num_cols", "numeric_cols")):
             manifest_obj = inner
 
-    # --- Primary format: cat_cols/num_cols container ---
-    if isinstance(manifest_obj, dict) and (("cat_cols" in manifest_obj) or ("num_cols" in manifest_obj)):
+    # 2) Unwrap canonical {"features": {...}} if it looks like a schema container
+    if isinstance(manifest_obj, dict) and isinstance(manifest_obj.get("features"), dict):
+        inner = manifest_obj["features"]
+        if any(k in inner for k in ("cat_cols", "num_cols", "numeric_cols")):
+            manifest_obj = inner
+
+    # 3) Primary schema-container format
+    if isinstance(manifest_obj, dict) and any(k in manifest_obj for k in ("cat_cols", "num_cols", "numeric_cols")):
         cat_cols = manifest_obj.get("cat_cols") or []
-        num_cols = manifest_obj.get("num_cols") or []
+
+        # canonical key is numeric_cols; accept aliases
+        num_cols = manifest_obj.get("numeric_cols")
+        if num_cols is None:
+            num_cols = manifest_obj.get("num_cols")
+        num_cols = num_cols or []
 
         if not isinstance(cat_cols, list) or not all(isinstance(x, str) for x in cat_cols):
             raise BundleError(f"feature_manifest: cat_cols must be list[str], got {type(cat_cols)}")
         if not isinstance(num_cols, list) or not all(isinstance(x, str) for x in num_cols):
-            raise BundleError(f"feature_manifest: num_cols must be list[str], got {type(num_cols)}")
+            raise BundleError(f"feature_manifest: numeric_cols/num_cols must be list[str], got {type(num_cols)}")
 
+        # Optional maps (not present in your current bundle, but supported)
         dtypes = manifest_obj.get("dtypes") or manifest_obj.get("dtype_map") or manifest_obj.get("raw_dtypes") or {}
         if dtypes is None:
             dtypes = {}
@@ -111,6 +127,11 @@ def _parse_manifest(manifest_obj: Any) -> List[FeatureSpec]:
 
         specs: List[FeatureSpec] = []
 
+        # IMPORTANT: offline team says authoritative order is numeric_cols + cat_cols
+        for name in num_cols:
+            dt = str(dtypes.get(name, "float64"))
+            specs.append(FeatureSpec(name=name, kind="numeric", dtype=dt))
+
         for name in cat_cols:
             dt = str(dtypes.get(name, "category"))
             cats = categories_map.get(name)
@@ -125,10 +146,6 @@ def _parse_manifest(manifest_obj: Any) -> List[FeatureSpec]:
                 )
             )
 
-        for name in num_cols:
-            dt = str(dtypes.get(name, "float64"))
-            specs.append(FeatureSpec(name=name, kind="numeric", dtype=dt))
-
         names = [s.name for s in specs]
         if len(names) != len(set(names)):
             dup = sorted({n for n in names if names.count(n) > 1})
@@ -136,30 +153,20 @@ def _parse_manifest(manifest_obj: Any) -> List[FeatureSpec]:
 
         return specs
 
-    # --- Fallback formats (older exports) ---
+    # 4) Fallback formats (older exports)
     items: List[Tuple[str, Any]] = []
 
     if isinstance(manifest_obj, dict):
         if "features" in manifest_obj and isinstance(manifest_obj["features"], dict):
-            inner = manifest_obj["features"]
-
-            # If "features" is actually a schema container (your current export), parse it via the primary path.
-            if (("cat_cols" in inner) or ("num_cols" in inner)) or (
-                isinstance(inner.get("schema"), dict) and (("cat_cols" in inner["schema"]) or ("num_cols" in inner["schema"]))
-            ):
-                return _parse_manifest(inner)
-
-            # Otherwise treat as old format: feature_name -> {spec...}
-            items = list(inner.items())
+            items = list(manifest_obj["features"].items())
         else:
-            # IMPORTANT: skip schema/meta keys so we never treat cat_cols as a feature
             meta_keys = {
-                "cat_cols", "num_cols", "dtypes", "dtype_map", "raw_dtypes",
+                "cat_cols", "num_cols", "numeric_cols", "dtypes", "dtype_map", "raw_dtypes",
                 "categories", "cats", "codes", "codebook", "codebooks",
                 "version", "created_at", "notes", "schema",
+                "include_regimes_as_features", "target",
             }
             items = [(k, v) for k, v in manifest_obj.items() if isinstance(k, str) and k not in meta_keys]
-
 
     elif isinstance(manifest_obj, list):
         for i, it in enumerate(manifest_obj):
@@ -205,6 +212,7 @@ def _parse_manifest(manifest_obj: Any) -> List[FeatureSpec]:
         raise BundleError(f"feature_manifest has duplicate feature names: {dup}")
 
     return specs
+
 
 class WinProbScorer:
     """
