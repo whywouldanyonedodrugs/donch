@@ -35,7 +35,7 @@ def _parse_manifest(manifest_obj: Any) -> List[FeatureSpec]:
     """
     Supports multiple manifest formats.
 
-    Format A (schema container; your current):
+    Primary supported format (your current export):
       {
         "cat_cols": [...],
         "num_cols": [...],
@@ -44,48 +44,45 @@ def _parse_manifest(manifest_obj: Any) -> List[FeatureSpec]:
         "codes": { "feat": { "A": 0, ... }, ... }         (optional)
       }
 
-    Format B (features dict):
-      { "features": { "feat": {"dtype": "...", ...}, ... } }
-
-    Format C (flat dict mapping feat->spec):
-      { "feat": {"dtype": "...", ...}, ... }
-
-    Format D (list of dicts):
+    Also supports:
+      {"features": { "feat": {"dtype": "...", ...}, ... } }
+      {"feat": {"dtype": "...", ...}, ...}
       [ {"name": "...", "dtype": "...", ...}, ... ]
     """
-    # -------- Format A: schema container with cat_cols/num_cols ----------
-    if isinstance(manifest_obj, dict) and ("cat_cols" in manifest_obj or "num_cols" in manifest_obj):
+
+    # Some exporters nest this under a "schema" key. Support that too.
+    if isinstance(manifest_obj, dict) and isinstance(manifest_obj.get("schema"), dict):
+        schema = manifest_obj["schema"]
+        if ("cat_cols" in schema) or ("num_cols" in schema):
+            manifest_obj = schema
+
+    # -------- Format: cat_cols/num_cols container --------
+    if isinstance(manifest_obj, dict) and (("cat_cols" in manifest_obj) or ("num_cols" in manifest_obj)):
         cat_cols = manifest_obj.get("cat_cols") or []
         num_cols = manifest_obj.get("num_cols") or []
 
         if not isinstance(cat_cols, list) or not all(isinstance(x, str) for x in cat_cols):
-            raise BundleError(f"feature_manifest: cat_cols must be a list[str], got: {type(cat_cols)}")
+            raise BundleError(f"feature_manifest: cat_cols must be list[str], got {type(cat_cols)}")
         if not isinstance(num_cols, list) or not all(isinstance(x, str) for x in num_cols):
-            raise BundleError(f"feature_manifest: num_cols must be a list[str], got: {type(num_cols)}")
+            raise BundleError(f"feature_manifest: num_cols must be list[str], got {type(num_cols)}")
 
-        # Optional helpers
-        dtypes = (
-            manifest_obj.get("dtypes")
-            or manifest_obj.get("dtype_map")
-            or manifest_obj.get("raw_dtypes")
-            or {}
-        )
+        dtypes = manifest_obj.get("dtypes") or manifest_obj.get("dtype_map") or manifest_obj.get("raw_dtypes") or {}
         if dtypes is None:
             dtypes = {}
         if not isinstance(dtypes, dict):
-            raise BundleError(f"feature_manifest: dtypes must be a dict, got: {type(dtypes)}")
+            raise BundleError(f"feature_manifest: dtypes must be dict, got {type(dtypes)}")
 
         categories_map = manifest_obj.get("categories") or manifest_obj.get("cats") or {}
         if categories_map is None:
             categories_map = {}
         if not isinstance(categories_map, dict):
-            raise BundleError(f"feature_manifest: categories must be a dict, got: {type(categories_map)}")
+            raise BundleError(f"feature_manifest: categories must be dict, got {type(categories_map)}")
 
         codes_map = manifest_obj.get("codes") or manifest_obj.get("codebook") or manifest_obj.get("codebooks") or {}
         if codes_map is None:
             codes_map = {}
         if not isinstance(codes_map, dict):
-            raise BundleError(f"feature_manifest: codes must be a dict, got: {type(codes_map)}")
+            raise BundleError(f"feature_manifest: codes must be dict, got {type(codes_map)}")
 
         specs: List[FeatureSpec] = []
 
@@ -114,22 +111,19 @@ def _parse_manifest(manifest_obj: Any) -> List[FeatureSpec]:
 
         return specs
 
-    # -------- Format B/C: dict of features ----------
+    # -------- Other formats --------
     items: List[Tuple[str, Any]] = []
 
     if isinstance(manifest_obj, dict):
         if "features" in manifest_obj and isinstance(manifest_obj["features"], dict):
             items = list(manifest_obj["features"].items())
         else:
-            # Skip known meta-keys if present in other formats
             meta_keys = {
                 "cat_cols", "num_cols", "dtypes", "dtype_map", "raw_dtypes",
                 "categories", "cats", "codes", "codebook", "codebooks",
                 "version", "created_at", "notes", "schema",
             }
             items = [(k, v) for k, v in manifest_obj.items() if isinstance(k, str) and k not in meta_keys]
-
-    # -------- Format D: list of dicts ----------
     elif isinstance(manifest_obj, list):
         for i, it in enumerate(manifest_obj):
             if isinstance(it, dict) and "name" in it:
@@ -186,13 +180,12 @@ def _parse_manifest(manifest_obj: Any) -> List[FeatureSpec]:
 
     return specs
 
+
 class WinProbScorer:
     """
     Strict, deterministic scorer.
-
-    Modes:
-      - external_ohe: uses bundle.ohe + bundle.feature_names to build model matrix
-      - pipeline_raw: uses model.joblib pipeline to transform raw DataFrame internally
+    For your current export, model.joblib is assumed to be a sklearn pipeline that accepts a
+    one-row DataFrame of raw features.
     """
 
     def __init__(
@@ -219,33 +212,9 @@ class WinProbScorer:
         self._raw_spec_by_name = {s.name: s for s in self._raw_specs}
         self.raw_features = [s.name for s in self._raw_specs]
 
-        # Decide mode
-        if bundle.model_kind in ("lgb_booster", "lgbm_sklearn"):
-            if bundle.ohe is None or not bundle.feature_names:
-                raise BundleError("external_ohe mode requires ohe.joblib and feature_names.json")
-            self.mode = "external_ohe"
-            self.ohe = bundle.ohe
-            self.feature_names = list(bundle.feature_names)
+        self.raw_cat_cols = [s.name for s in self._raw_specs if s.kind == "categorical"]
+        self.raw_num_cols = [s.name for s in self._raw_specs if s.kind == "numeric"]
 
-            # determine which raw cols are categorical for OHE
-            try:
-                self.raw_cat_cols = list(getattr(self.ohe, "feature_names_in_", []))
-            except Exception:
-                self.raw_cat_cols = []
-            cat_set = set(self.raw_cat_cols)
-            self.raw_num_cols = [s.name for s in self._raw_specs if (s.name not in cat_set and s.kind != "categorical")]
-
-        else:
-            # pipeline_raw (model.joblib)
-            self.mode = "pipeline_raw"
-            self.ohe = None
-            self.feature_names = list(bundle.feature_names) if bundle.feature_names else []
-
-            # For pipeline_raw, we still want stable dtype casting:
-            self.raw_cat_cols = [s.name for s in self._raw_specs if s.kind == "categorical"]
-            self.raw_num_cols = [s.name for s in self._raw_specs if s.kind == "numeric"]
-
-        # diag
         self._diag_once = False
         self._last_hash = None
         self._same_vec_count = 0
@@ -255,8 +224,8 @@ class WinProbScorer:
         return p_cal
 
     def score_with_details(self, raw_row: Dict[str, Any]) -> Tuple[float, float]:
-        X_obj, vec_hash = self._build_X(raw_row)
-        p_raw = self._predict_proba(X_obj)
+        df, vec_hash = self._build_df(raw_row)
+        p_raw = self._predict_proba(df)
         p_cal = self._calibrate(p_raw)
         self._diag(vec_hash)
         return p_raw, p_cal
@@ -289,9 +258,8 @@ class WinProbScorer:
                     float(v)
                 except Exception as e:
                     raise SchemaError(f"Numeric feature {name} not castable to float: {v} ({e})") from e
-
             else:
-                if v is None or (isinstance(v, float) and not np.isfinite(v)):
+                if v is None:
                     raise SchemaError(f"Invalid categorical value for {name}: {v}")
 
                 allowed: Optional[set] = None
@@ -304,61 +272,29 @@ class WinProbScorer:
                 if allowed is not None and str(v) not in allowed:
                     raise SchemaError(f"Categorical {name} value '{v}' not in allowed set")
 
-    def _build_X(self, raw_row: Dict[str, Any]) -> Tuple[Any, str]:
+    def _build_df(self, raw_row: Dict[str, Any]) -> Tuple[pd.DataFrame, str]:
         self._validate_raw_schema(raw_row)
 
-        if self.mode == "pipeline_raw":
-            # Build DataFrame with correct dtypes (no lookahead / strict schema already enforced)
-            data = {}
-            for s in self._raw_specs:
-                v = raw_row[s.name]
-                if s.kind == "numeric":
-                    data[s.name] = float(v)
-                else:
-                    data[s.name] = str(v)
-            df = pd.DataFrame([data], columns=[s.name for s in self._raw_specs])
+        data = {}
+        for s in self._raw_specs:
+            v = raw_row[s.name]
+            if s.kind == "numeric":
+                data[s.name] = float(v)
+            else:
+                data[s.name] = str(v)
 
-            vec_hash = hashlib.md5(pd.util.hash_pandas_object(df, index=True).values.tobytes()).hexdigest()
-            return df, vec_hash
+        df = pd.DataFrame([data], columns=[s.name for s in self._raw_specs])
+        vec_hash = hashlib.md5(pd.util.hash_pandas_object(df, index=True).values.tobytes()).hexdigest()
+        return df, vec_hash
 
-        # external_ohe mode: manual OHE + fixed feature_names matrix
-        cat_vals = {c: raw_row[c] for c in self.raw_cat_cols}
-        cat_df = pd.DataFrame([cat_vals]) if self.raw_cat_cols else pd.DataFrame(index=[0])
-
-        try:
-            Xo = self.ohe.transform(cat_df[self.raw_cat_cols].astype(str))
-            if hasattr(Xo, "toarray"):
-                Xo = Xo.toarray()
-            ohe_vals = np.asarray(Xo, dtype=np.float64)
-            ohe_cols_out = list(self.ohe.get_feature_names_out(self.raw_cat_cols))
-        except Exception as e:
-            raise SchemaError(f"OHE transform failed: {e}") from e
-
-        X_df = pd.DataFrame(np.zeros((1, len(self.feature_names)), dtype=np.float64), columns=self.feature_names)
-
-        for c in self.raw_num_cols:
-            if c in X_df.columns:
-                X_df.at[0, c] = float(raw_row[c])
-
-        if ohe_vals is not None and ohe_cols_out:
-            common = [c for c in ohe_cols_out if c in X_df.columns]
-            if common:
-                idx = [ohe_cols_out.index(c) for c in common]
-                X_df.loc[0, common] = ohe_vals[0, idx]
-
-        vec = X_df.to_numpy(dtype=np.float64, copy=False)
-        vec_hash = hashlib.md5(vec.tobytes()).hexdigest()
-        return vec, vec_hash
-
-    def _predict_proba(self, X_obj: Any) -> float:
+    def _predict_proba(self, df: pd.DataFrame) -> float:
         try:
             if hasattr(self.model, "predict_proba"):
-                p = float(self.model.predict_proba(X_obj)[:, 1][0])
+                p = float(self.model.predict_proba(df)[:, 1][0])
             else:
-                # LightGBM Booster case not expected here; but keep as guard.
-                p = float(self.model.predict(X_obj)[0])
+                p = float(self.model.predict(df)[0])
         except Exception as e:
-            raise BundleError(f"Model predict failed (mode={self.mode}, kind={self.model_kind}): {e}") from e
+            raise BundleError(f"Model predict failed (kind={self.model_kind}): {e}") from e
 
         if not np.isfinite(p):
             raise BundleError(f"Model returned non-finite probability: {p}")
@@ -369,7 +305,6 @@ class WinProbScorer:
         if cal is None:
             return p_raw
 
-        # joblib calibrator (isotonic/logistic etc.)
         try:
             if hasattr(cal, "predict_proba"):
                 return float(cal.predict_proba(np.array([[p_raw]], dtype=float))[:, 1][0])
@@ -378,7 +313,6 @@ class WinProbScorer:
         except Exception:
             pass
 
-        # json calibrator (platt or isotonic points)
         if isinstance(cal, dict):
             ctype = str(cal.get("type", cal.get("kind", ""))).lower()
             if ctype == "platt":
@@ -397,9 +331,8 @@ class WinProbScorer:
     def _diag(self, vec_hash: str) -> None:
         if not self._diag_once:
             LOG.info(
-                "WinProb ready bundle=%s mode=%s model_kind=%s raw_feats=%d p*=%s",
+                "WinProb ready bundle=%s model_kind=%s raw_feats=%d p*=%s",
                 self.bundle_id,
-                self.mode,
                 self.model_kind,
                 len(self.raw_features),
                 (f"{self.pstar:.4f}" if isinstance(self.pstar, (float, int)) else "None"),
