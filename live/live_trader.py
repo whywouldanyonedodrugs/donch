@@ -435,17 +435,64 @@ class LiveTrader:
         """Strict-parity winprob scoring. Returns calibrated p in [0,1] or None (no-trade)."""
         if not getattr(self, "winprob", None):
             return None
+
+        # --- schema diagnostics (throttled to a small allowlist) ---
+        try:
+            diag_raw = self.cfg.get("META_SCHEMA_DIAG_SYMBOLS", "") or ""
+            if isinstance(diag_raw, str):
+                diag_syms = {s.strip().upper() for s in diag_raw.split(",") if s.strip()}
+            elif isinstance(diag_raw, (list, tuple, set)):
+                diag_syms = {str(s).strip().upper() for s in diag_raw if str(s).strip()}
+            else:
+                diag_syms = set()
+
+            diag_max = int(self.cfg.get("META_SCHEMA_DIAG_MAX_PER_SYMBOL", 2) or 2)
+
+            if not hasattr(self, "_meta_schema_diag_counts"):
+                self._meta_schema_diag_counts = defaultdict(int)
+
+            do_diag = (symbol.upper() in diag_syms) and (self._meta_schema_diag_counts[symbol.upper()] < diag_max)
+
+            if do_diag:
+                required = set(getattr(self.winprob, "raw_features", []) or [])
+                keys = set(meta_row.keys())
+                missing = sorted(required - keys)
+                extra = sorted(keys - required)
+
+                LOG.info(
+                    "Meta schema diag %s: keys=%d required=%d missing=%d extra=%d sample_missing=%s sample_extra=%s",
+                    symbol,
+                    len(keys),
+                    len(required),
+                    len(missing),
+                    len(extra),
+                    missing[:25],
+                    extra[:25],
+                )
+                self._meta_schema_diag_counts[symbol.upper()] += 1
+        except Exception:
+            # Diagnostics must never break trading/scanning.
+            pass
+
         try:
             p = float(self.winprob.score(meta_row))
             if 0.0 <= p <= 1.0:
                 return p
             return None
         except SchemaError as e:
-            LOG.info("Meta no-trade %s: schema_mismatch: %s", symbol, e)
+            # Avoid INFO spam for 700+ symbols; keep INFO only for diag symbols.
+            try:
+                if symbol.upper() in (diag_syms if "diag_syms" in locals() else set()):
+                    LOG.info("Meta no-trade %s: schema_mismatch: %s", symbol, e)
+                else:
+                    LOG.debug("Meta no-trade %s: schema_mismatch: %s", symbol, e)
+            except Exception:
+                LOG.debug("Meta no-trade %s: schema_mismatch: %s", symbol, e)
             return None
         except Exception as e:
             LOG.exception("Meta scoring failed for %s: %s", symbol, e)
             return None
+
 
 
 
