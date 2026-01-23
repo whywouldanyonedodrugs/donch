@@ -83,3 +83,6 @@ OI_LOOKBACK_DAYS: 7                # to compute 7d z-scores
 FUNDING_LOOKBACK_DAYS: 7           # forward-filled to 5m
 FUNDING_UPSAMPLE_TO_5M: true       # keep on by default (matches training)
 META_REQUIRED: true                # (optional) fail-closed on feature mismatch
+
+META_SCHEMA_DIAG_SYMBOLS: "BTCUSDT,ETHUSDT"
+
