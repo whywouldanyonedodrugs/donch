@@ -46,6 +46,7 @@ from .exchange_proxy import ExchangeProxy
 from .database import DB
 from .telegram import TelegramBot
 from .winprob_loader import WinProbScorer
+from .golden_features import GoldenFeatureStore
 
 from .artifact_bundle import load_bundle, BundleError, SchemaError
 
@@ -410,6 +411,38 @@ class LiveTrader:
                 len(getattr(self.winprob, "feature_names", [])),
                 pstar_s,
             )
+            # Optional: golden row injector for parity testing (disabled by default).
+            self.golden_store = None
+            try:
+                if bool(self.cfg.get("META_GOLDEN_ENABLED", False)):
+                    golden_path = Path(self.cfg.get("META_GOLDEN_PATH", "golden_features.parquet"))
+                    allow_syms_raw = self.cfg.get("META_GOLDEN_SYMBOLS", "") or ""
+                    allow_syms = [s.strip() for s in str(allow_syms_raw).split(",") if s.strip()] or None
+
+                    gs = GoldenFeatureStore(
+                        path=golden_path,
+                        feature_names=list(getattr(self.winprob, "raw_features", []) or []),
+                        symbols_allowlist=allow_syms,
+                    )
+                    gs.load()
+                    self.golden_store = gs
+
+                    mm = gs.minmax_ts()
+                    if mm:
+                        LOG.info(
+                            "bundle=%s Golden features loaded: rows=%d ts_range=[%s .. %s]",
+                            self.bundle_id,
+                            gs.available_keys(),
+                            mm[0].isoformat(),
+                            mm[1].isoformat(),
+                        )
+                    else:
+                        LOG.info("bundle=%s Golden features loaded: rows=%d", self.bundle_id, gs.available_keys())
+            except Exception as e:
+                # Golden injector must never prevent startup (parity tool only).
+                LOG.warning("bundle=%s Golden features load failed (continuing without): %s", self.bundle_id, e)
+                self.golden_store = None
+
 
 
 
@@ -1083,6 +1116,30 @@ class LiveTrader:
             meta_row["entry_rule"] = str(entry_rule)
             meta_row["pullback_type"] = str(pullback_type)
             meta_row["regime_1d"] = str(regime_1d)
+
+            # --- Golden row injector (parity testing only) ---
+            try:
+                if getattr(self, "golden_store", None) is not None:
+                    # Decision timestamp = last completed 5m bar timestamp for this symbol.
+                    # dfs[base_tf] had last bar dropped earlier, so df5.index[-1] is "as-of" ts.
+                    ts = df5.index[-1]
+                    golden = self.golden_store.get(symbol, ts)
+                    if golden is not None:
+                        meta_row = golden
+                        LOG.info(
+                            "bundle=%s Meta golden hit %s ts=%s (row_keys=%d)",
+                            getattr(self, "bundle_id", None) or "no_bundle",
+                            symbol,
+                            pd.to_datetime(ts, utc=True).isoformat(),
+                            len(meta_row),
+                        )
+            except Exception as _e:
+                # Never break scanning because of parity tooling.
+                pass
+
+            p = self._score_winprob_safe(symbol, meta_row)
+
+
 
             # -------------- Score meta (even on rejects) ----------
             p = self._score_winprob_safe(symbol, meta_row)
