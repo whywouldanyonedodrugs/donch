@@ -462,6 +462,65 @@ class LiveTrader:
             LOG.debug("OI/Funding feature pack failed for %s: %s", symbol, e)
             return {}
 
+    async def _fetch_ohlcv_df_simple(self, symbol: str, tf: str, limit: int) -> Optional[pd.DataFrame]:
+        """
+        Minimal OHLCV fetch -> DataFrame with UTC datetime index.
+        Drops the last (possibly incomplete) bar for as-of semantics.
+        """
+        try:
+            ohlcv = await self.exchange.fetch_ohlcv(symbol, tf, limit=limit)
+            if not ohlcv or len(ohlcv) < 3:
+                return None
+            df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+            df.set_index("timestamp", inplace=True)
+            df = df.iloc[:-1]
+            return df if not df.empty else None
+        except Exception as e:
+            LOG.debug("Context OHLCV fetch failed for %s %s: %s", symbol, tf, e)
+            return None
+
+    async def _get_gov_ctx(self) -> dict:
+        """
+        Cycle-level context needed by the meta model (BTC/ETH OI+funding snapshots).
+        Cached to avoid per-symbol recomputation.
+        """
+        ttl_sec = int(self.cfg.get("GOV_CTX_TTL_SEC", 60) or 60)
+        now = datetime.now(timezone.utc)
+
+        if hasattr(self, "_gov_ctx_cache") and hasattr(self, "_gov_ctx_cache_ts"):
+            age = (now - self._gov_ctx_cache_ts).total_seconds()
+            if age < ttl_sec:
+                return dict(self._gov_ctx_cache)
+
+        # Fetch 5m OHLCV for BTC/ETH (same limit pattern as base tf elsewhere)
+        df_btc, df_eth = await asyncio.gather(
+            self._fetch_ohlcv_df_simple("BTCUSDT", "5m", limit=1500),
+            self._fetch_ohlcv_df_simple("ETHUSDT", "5m", limit=1500),
+            return_exceptions=False,
+        )
+
+        ctx: dict = {}
+
+        if df_btc is not None:
+            btc_feats = await self._build_oi_funding_features("BTCUSDT", df_btc)
+            if btc_feats:
+                if "funding_rate" in btc_feats:
+                    ctx["btc_funding_rate"] = float(btc_feats["funding_rate"])
+                if "oi_z_7d" in btc_feats:
+                    ctx["btc_oi_z_7d"] = float(btc_feats["oi_z_7d"])
+
+        if df_eth is not None:
+            eth_feats = await self._build_oi_funding_features("ETHUSDT", df_eth)
+            if eth_feats:
+                if "funding_rate" in eth_feats:
+                    ctx["eth_funding_rate"] = float(eth_feats["funding_rate"])
+                if "oi_z_7d" in eth_feats:
+                    ctx["eth_oi_z_7d"] = float(eth_feats["oi_z_7d"])
+
+        self._gov_ctx_cache = dict(ctx)
+        self._gov_ctx_cache_ts = now
+        return ctx
 
 
     def _score_winprob_safe(self, symbol: str, meta_row: dict) -> Optional[float]:
@@ -1072,11 +1131,15 @@ class LiveTrader:
             # --- NEW: OI + Funding features (13) ----------
             oi_feats = await self._build_oi_funding_features(symbol, df5)
 
-            meta_row = {
-                # numerics (existing)
-                "atr_1h": float(last['atr_1h']),
-                "rsi_1h": float(last['rsi_1h']),
-                "adx_1h": float(last['adx_1h']),
+            # --- NEW: OI + Funding features (13) ----------
+            oi_feats = await self._build_oi_funding_features(symbol, df5)
+
+            # Build a superset dict, then FILTER to manifest columns before scoring.
+            meta_full = {
+                # existing numerics you already compute
+                "atr_1h": float(last["atr_1h"]),
+                "rsi_1h": float(last["rsi_1h"]),
+                "adx_1h": float(last["adx_1h"]),
                 "atr_pct": float(atr_pct),
                 "don_break_len": float(don_len),
                 "don_break_level": float(don_level),
@@ -1086,36 +1149,41 @@ class LiveTrader:
                 "hour_cos": float(hour_cos),
                 "dow": float(day_of_week),
                 "vol_mult": float(vol_mult),
-                "eth_macd_hist_4h": float(eth_hist),
-                "regime_up": float(regime_up),
-                "prior_1d_ret": float(ret_30d),
+
+                # ETH MACD (4h) components (manifest requires these names)
+                "eth_macd_line_4h": float((eth_macd or {}).get("macd", 0.0) or 0.0),
+                "eth_macd_signal_4h": float((eth_macd or {}).get("signal", 0.0) or 0.0),
+                "eth_macd_hist_4h": float((eth_macd or {}).get("hist", 0.0) or 0.0),
+
+                # regime flags (manifest expects regime_code_1d + regime_up)
+                "regime_code_1d": str(market_regime),
+                "regime_up": int(regime_up),  # keep as 0/1 (categorical downstream)
+
+                # RS/turnover z-scores from universe snapshot (if present in manifest, filter keeps them)
+                "rs_z": float(rs_z),
+                "turnover_z": float(turnover_z),
 
                 # AVWAP stack
                 "vwap_frac_in_band": float(vwap_feats.get("vwap_frac_in_band", 0.0)),
                 "vwap_expansion_pct": float(vwap_feats.get("vwap_expansion_pct", 0.0)),
                 "vwap_slope_pph": float(vwap_feats.get("vwap_slope_pph", 0.0)),
 
-                # basis / current funding
-                "basis_pct": float(basis_pct),
-                "funding_8h": float(funding_8h),
-
                 # prior breakout stats
                 "prior_breakout_count": float(prior_b),
                 "prior_breakout_fail_count": float(prior_f),
                 "prior_breakout_fail_rate": float(prior_fail_rate),
-
-                # crowding proxies from universe
-                "rs_z": float(rs_z),
-                "turnover_z": float(turnover_z),
             }
 
-            # merge in the 13 new OI/Funding features
-            meta_row.update(oi_feats)
+            # Merge asset OI/funding features
+            meta_full.update(oi_feats or {})
 
-            # categoricals (bases for OHE)
-            meta_row["entry_rule"] = str(entry_rule)
-            meta_row["pullback_type"] = str(pullback_type)
-            meta_row["regime_1d"] = str(regime_1d)
+            # Merge cycle-level BTC/ETH context features (if provided)
+            if isinstance(gov_ctx, dict) and gov_ctx:
+                meta_full.update(gov_ctx)
+
+            # Filter strictly to the manifest-required raw features
+            required = list(getattr(self.winprob, "raw_features", []) or [])
+            meta_row = {k: meta_full[k] for k in required if k in meta_full}
 
             # --- Golden row injector (parity testing only) ---
             try:
@@ -1137,6 +1205,7 @@ class LiveTrader:
                 # Never break scanning because of parity tooling.
                 pass
 
+            # -------------- Score meta (even on rejects) ----------
             p = self._score_winprob_safe(symbol, meta_row)
 
 
@@ -2409,6 +2478,14 @@ class LiveTrader:
                 except Exception as e:
                     LOG.warning("ETH MACD barometer failed: %s", e)
 
+                gov_ctx = {}
+                try:
+                    gov_ctx = await self._get_gov_ctx()
+                except Exception as e:
+                    LOG.warning("Gov context build failed: %s", e)
+                    gov_ctx = {}
+
+
                 equity = await self.db.latest_equity() or 0.0
                 open_positions_count = len(self.open_positions)
                 open_symbols = {p['symbol'] for p in self.open_positions.values()}
@@ -2439,7 +2516,11 @@ class LiveTrader:
                             continue
 
                         # Build signal
-                        signal = await self._scan_symbol_for_signal(sym, current_market_regime, eth_macd_data, gov_ctx=None)
+                        signal = await self._scan_symbol_for_signal(
+                            sym, current_market_regime, eth_macd_data, gov_ctx=gov_ctx
+                        )
+
+
                         if signal:
                             # Optional meta probability gate
                             pstar = self.cfg.get("META_PROB_THRESHOLD", None)
