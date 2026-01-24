@@ -1778,6 +1778,29 @@ class LiveTrader:
             else:
                 reason = "ok"
 
+            def _is_bad_numeric(v) -> bool:
+                if v is None:
+                    return True
+                if isinstance(v, bool):
+                    return False  # if you treat bools separately; otherwise convert to 0/1 upstream
+                if isinstance(v, (int, float)):
+                    return (isinstance(v, float) and (math.isnan(v) or math.isinf(v)))
+                return False
+
+            def meta_report(required_keys, meta_full: dict) -> tuple[list[str], list[tuple[str, object]]]:
+                missing = [k for k in required_keys if k not in meta_full]
+                bad = []
+                for k in required_keys:
+                    if k in meta_full and _is_bad_numeric(meta_full[k]):
+                        bad.append((k, meta_full[k]))
+                return missing, bad
+
+            req = list(getattr(self.winprob, "required_keys", [])) or list(getattr(self.meta_schema, "required_keys", []))
+            missing, bad = meta_report(req, meta_full)
+            if missing or bad:
+                LOG.warning("META_SCHEMA_INPUT_PROBLEMS missing=%d bad=%d missing_head=%s bad_head=%s",
+                            len(missing), len(bad), missing[:25], bad[:25])
+
             LOG.info(
                 "META_DECISION bundle=%s symbol=%s decision_ts=%s schema_ok=%s p_raw=%s p_cal=%s pstar=%.6f meta_ok=%s strat_ok=%s reason=%s err=%s",
                 self.bundle_id,
