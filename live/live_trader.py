@@ -61,6 +61,16 @@ logging.getLogger("watchdog").setLevel(logging.WARNING)
 logging.getLogger("watchdog.observers.inotify_buffer").setLevel(logging.WARNING)
 
 UNIVERSE_CACHE_PATH = Path("universe_cache.json")
+
+REGIME_CODE_MAP = {
+    "BEAR_HIGH_VOL": 0,
+    "BEAR_LOW_VOL": 1,
+    "BULL_HIGH_VOL": 2,
+    "BULL_LOW_VOL": 3,
+}
+
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Shims/utilities that may be referenced by joblib'd pipelines from research
 # ──────────────────────────────────────────────────────────────────────────────
@@ -169,6 +179,7 @@ def load_yaml(p: Path) -> Dict[str, Any]:
 
 class _Watcher(FileSystemEventHandler):
     def __init__(self, path: Path, cb):
+        self.meta_dir = meta_dir
         self.path = path.resolve()
         self.cb = cb
         obs = Observer()
@@ -558,7 +569,18 @@ class LiveTrader:
         """
         thresholds: dict = {}
 
-        report_path = os.getenv("DONCH_REGIMES_REPORT") or str(self.cfg.get("REGIMES_REPORT_PATH", "")).strip()
+        report_path = os.getenv("DONCH_REGIMES_REPORT") or str(self.cfg.get("REGIMES_REPORT_PATH", "") or "").strip()
+        if report_path.lower() in ("none", "null"):
+            report_path = ""
+
+        # auto-discover next to the bundle directory
+        if not report_path:
+            base = getattr(self, "meta_dir", None) or getattr(self, "bundle_dir", None) or str(self.cfg.get("META_DIR", "") or "").strip()
+            if base:
+                cand = os.path.join(str(base), "regimes_report.json")
+                if os.path.exists(cand):
+                    report_path = cand
+
         if report_path and os.path.exists(report_path):
             j = self._load_json_file(report_path)
             thresholds = dict(j.get("thresholds", {}) or {})
@@ -576,7 +598,7 @@ class LiveTrader:
             )
 
         # crowd thresholds: prefer embedded in regimes_report thresholds, else separate file
-        crowd_path = os.getenv("DONCH_CROWD_THRESHOLDS") or str(self.cfg.get("CROWD_THRESHOLDS_PATH", "")).strip()
+        crowd_path = os.getenv("DONCH_CROWD_THRESHOLDS") or str(self.cfg.get("CROWD_THRESHOLDS_PATH", "") or "").strip()
         if ("crowd_z_high" not in thresholds) or ("crowd_z_low" not in thresholds):
             if crowd_path and os.path.exists(crowd_path):
                 cj = self._load_json_file(crowd_path)
@@ -1144,6 +1166,14 @@ class LiveTrader:
         gov_ctx: Optional[dict] = None  # placeholder
     ) -> Optional[Signal]:
         LOG.info("Checking %s...", symbol)
+
+        reg_label = str(current_market_regime).upper().strip()
+        reg_code = REGIME_CODE_MAP.get(reg_label)
+
+        if reg_code is None:
+            LOG.warning("bundle=%s Unknown market regime label=%r; cannot compute regime_code_1d", self.bundle_id, reg_label)
+            return None
+
         try:
             # ---------------- Timeframes to fetch ----------------
             base_tf = str(self.cfg.get('TIMEFRAME', '5m'))
@@ -1377,7 +1407,7 @@ class LiveTrader:
                 "eth_macd_hist_4h": float((eth_macd or {}).get("hist", 0.0) or 0.0),
 
                 # regime flags (manifest expects regime_code_1d + regime_up)
-                "regime_code_1d": str(market_regime),
+                "regime_code_1d": float(reg_code),
                 "regime_up": int(regime_up),  # keep as 0/1 (categorical downstream)
 
                 # RS/turnover z-scores from universe snapshot (if present in manifest, filter keeps them)
@@ -3471,7 +3501,7 @@ class LiveTrader:
         self._listing_dates_cache = await self._load_listing_dates()
 
         await self._resume()
-        await self.tg.send("🤖 DONCH v1.0")
+        await self.tg.send("DONCH v2.4b started successfully.")
 
         try:
             async with asyncio.TaskGroup() as tg:
