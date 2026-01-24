@@ -45,48 +45,89 @@ def _pick_ts_col(df: pd.DataFrame, explicit: Optional[str] = None) -> str:
 
 def _read_manifest_schema(bundle_dir: Path) -> Tuple[List[str], Dict[str, str]]:
     """
-    Returns (feature_names, dtype_map) where dtype_map[name] in {"numeric","categorical","cat","str",...}
-    Robust to minor manifest shape differences.
+    Returns (feature_names, dtype_map).
+    Robust to multiple manifest layouts and dtype representations (string/list/dict).
     """
     mpath = bundle_dir / "feature_manifest.json"
     if not mpath.exists():
         raise FileNotFoundError(f"Missing feature_manifest.json in bundle_dir: {mpath}")
+
     obj = json.loads(mpath.read_text())
 
+    # Case A: schema-like mapping name -> dtype/kind
+    if isinstance(obj, dict):
+        # Common pattern: {"schema": {"feat": "numeric", ...}} or similar
+        for k in ("schema", "columns"):
+            if k in obj and isinstance(obj[k], dict):
+                names = list(obj[k].keys())
+                dtype_map = {str(n): str(obj[k][n]) for n in names}
+                return names, dtype_map
+
+        # Common pattern: {"numeric_cols":[...], "cat_cols":[...]}
+        if "numeric_cols" in obj or "cat_cols" in obj:
+            num = list(obj.get("numeric_cols", []) or [])
+            cat = list(obj.get("cat_cols", []) or [])
+            names = [str(x) for x in (num + cat)]
+            dtype_map = {str(x): "numeric" for x in num}
+            dtype_map.update({str(x): "categorical" for x in cat})
+            return names, dtype_map
+
+    # Case B: list of feature dicts, or dict containing such a list
     feats: List[Dict[str, Any]] = []
     if isinstance(obj, list):
-        feats = [x for x in obj if isinstance(x, dict) and ("name" in x or "key" in x)]
+        feats = [x for x in obj if isinstance(x, dict)]
     elif isinstance(obj, dict):
-        for k in ["raw_features", "features", "schema", "columns"]:
-            if k in obj:
-                if isinstance(obj[k], list):
-                    feats = [x for x in obj[k] if isinstance(x, dict)]
-                elif isinstance(obj[k], dict):
-                    # schema-like mapping name -> dtype
-                    feats = [{"name": kk, "dtype": vv} for kk, vv in obj[k].items()]
+        for k in ("raw_features", "features", "manifest"):
+            if k in obj and isinstance(obj[k], list):
+                feats = [x for x in obj[k] if isinstance(x, dict)]
                 break
-        if not feats and "manifest" in obj and isinstance(obj["manifest"], list):
-            feats = [x for x in obj["manifest"] if isinstance(x, dict)]
+
     if not feats:
         raise RuntimeError("Could not parse feature_manifest.json into a feature list.")
 
     names: List[str] = []
     dtype_map: Dict[str, str] = {}
+
+    def _dtype_to_str(v: Any) -> str:
+        # Prefer string kinds; tolerate list/dict
+        if v is None:
+            return ""
+        if isinstance(v, str):
+            return v.strip()
+        if isinstance(v, list):
+            # If list of one string, use it; otherwise just label as list
+            if len(v) == 1 and isinstance(v[0], str):
+                return v[0].strip()
+            return "list"
+        if isinstance(v, dict):
+            # Try common keys
+            for kk in ("kind", "type", "dtype"):
+                if kk in v:
+                    return _dtype_to_str(v[kk])
+            return "dict"
+        return str(v).strip()
+
     for f in feats:
         name = f.get("name") or f.get("key")
         if not name:
             continue
-        dt = (f.get("dtype") or f.get("type") or f.get("kind") or "").strip()
-        names.append(str(name))
-        dtype_map[str(name)] = str(dt)
+
+        # IMPORTANT: prefer 'kind' first so we don't accidentally take a list-valued 'dtype'
+        dt_val = f.get("kind") or f.get("type") or f.get("dtype")
+        dt = _dtype_to_str(dt_val)
+
+        n = str(name)
+        names.append(n)
+        dtype_map[n] = dt
 
     # Preserve order, drop duplicates
     seen = set()
-    ordered = []
+    ordered: List[str] = []
     for n in names:
         if n not in seen:
             ordered.append(n)
             seen.add(n)
+
     return ordered, dtype_map
 
 

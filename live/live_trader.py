@@ -427,19 +427,22 @@ class LiveTrader:
             LOG.info("Meta bundle loaded: dir=%s id=%s", self.meta_bundle.meta_dir, self.bundle_id)
             pstar = getattr(self.winprob, "pstar", None)
             pstar_s = f"{float(pstar):.4f}" if isinstance(pstar, (int, float)) else "None"
+
             # --- WinProb readiness diagnostics (strict-parity) ---
-            raw_feats = len(getattr(self.meta_schema, "required_keys", []))
+            raw_feats = len(getattr(self.winprob, "raw_features", []) or [])
             model_cols = len(getattr(self.winprob, "model_features", []) or [])
             pstar = getattr(self.winprob, "pstar", None)
+            pstar_s = "None" if pstar is None else f"{float(pstar):.6f}"
 
             LOG.info(
                 "WinProb ready (bundle=%s, raw_feats=%d, model_cols=%d, p*=%s)",
                 self.bundle_id,
                 raw_feats,
                 model_cols,
-                ("None" if pstar is None else f"{float(pstar):.6f}"),
+                pstar_s,
             )
             # -----------------------------------------------
+
             # Optional: golden row injector for parity testing (disabled by default).
             self.golden_store = None
             try:
@@ -1556,8 +1559,9 @@ class LiveTrader:
                 meta_ok,
                 strat_ok,
                 reason,
-                ("None" if meta_err is None else str(meta_err)),
+                ("None" if score_d.get("err") is None else str(score_d.get("err"))),
             )
+
 
             # Apply strict safe-mode: invalid schema => no-trade, and meta veto => no-trade
             should_enter = bool(should_enter) and bool(meta_ok)
