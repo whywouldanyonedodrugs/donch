@@ -402,6 +402,7 @@ class LiveTrader:
         # Meta / win-prob scorer (strict-parity artifact bundle)
         meta_dir = (self.cfg.get("META_EXPORT_DIR")
                     or self.cfg.get("WINPROB_ARTIFACT_DIR", "results/meta_export"))
+        self.meta_dir = str(meta_dir)
         strict_bundle = bool(self.cfg.get("STRICT_META_BUNDLE", True))
         required_extra = self.cfg.get("META_REQUIRED_EXTRA_FILES", []) or []
 
@@ -411,6 +412,7 @@ class LiveTrader:
                 required_extra_files=required_extra,
                 strict=strict_bundle,
             )
+            self.meta_dir = str(self.meta_bundle.meta_dir)
             _set_bundle_id_for_logs(self.meta_bundle.bundle_id)
             self.bundle_id = self.meta_bundle.bundle_id
             self.winprob = WinProbScorer(bundle=self.meta_bundle, strict_schema=True)
@@ -1434,10 +1436,17 @@ class LiveTrader:
             # --- NEW: deterministic regime/set features + S-features (offline spec)
             self._augment_meta_with_regime_sets(meta_full)
 
-            # Filter strictly to the manifest-required raw features
             required = list(getattr(self.winprob, "raw_features", []) or [])
-            meta_row = {k: meta_full[k] for k in required if k in meta_full}
+            num_cols = set(getattr(self.winprob, "numeric_cols", []) or [])
+            cat_cols = set(getattr(self.winprob, "cat_cols", []) or [])
 
+            meta_row = {}
+            for k in required:
+                if k in meta_full:
+                    meta_row[k] = meta_full[k]
+                else:
+                    # default placeholders so keys are present; validator will then report invalid_numeric/invalid_cat
+                    meta_row[k] = (np.nan if k in num_cols else None)
 
             # --- Golden row injector (parity testing only) ---
             try:
@@ -2766,7 +2775,10 @@ class LiveTrader:
 
                         # Build signal
                         signal = await self._scan_symbol_for_signal(
-                            sym, current_market_regime, eth_macd_data, gov_ctx=gov_ctx
+                            symbol=sym,
+                            market_regime=current_market_regime,
+                            eth_macd=eth_macd_data,
+                            gov_ctx=gov_ctx,
                         )
 
 
