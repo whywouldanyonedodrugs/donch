@@ -235,6 +235,7 @@ class RegimeDetector:
         self.exchange = exchange
         self.benchmark_symbol = benchmark_symbol
         self.cache_minutes = cache_minutes
+        self.markov4h_alpha = float(getattr(cfg, "MARKOV4H_PROB_EWMA_ALPHA", 0.2)) if "cfg" in globals() else 0.2
 
         self.last_update = None
         self.cached_regime = None
@@ -276,7 +277,7 @@ class RegimeDetector:
         if tf == "1d":
             floor = asof_ts.floor("D")
         elif tf == "4h":
-            floor = asof_ts.floor("4H")
+            floor = asof_ts.floor("4h")
         else:
             return df
         if df.index[-1] >= floor:
@@ -284,10 +285,13 @@ class RegimeDetector:
         return df
 
     def _calculate_trend_regime(self, df_daily: pd.DataFrame) -> pd.Series:
-        # Same logic as your existing implementation (kept for parity with your current code)
-        close = df_daily["close"]
-        high = df_daily["high"]
-        low = df_daily["low"]
+        """
+        Offline parity: no RANGE state. Set BULL/BEAR only when price breaches channel,
+        otherwise NaN, then ffill/bfill.
+        """
+        close = df_daily["close"].astype(float)
+        high = df_daily["high"].astype(float)
+        low = df_daily["low"].astype(float)
 
         mid = (high + low) / 2.0
         tma20 = triangular_moving_average(mid, 20)
@@ -297,10 +301,11 @@ class RegimeDetector:
         lower = tma20 - (1.5 * atr20)
 
         trend = pd.Series(index=df_daily.index, dtype="object")
-        trend[:] = "RANGE"
-        trend[close > upper] = "BULL"
-        trend[close < lower] = "BEAR"
+        trend.loc[close > upper] = "BULL"
+        trend.loc[close < lower] = "BEAR"
+        trend = trend.ffill().bfill()
         return trend
+
 
     def _calculate_vol_regime_and_prob(self, daily_returns: pd.Series) -> tuple[pd.Series, pd.Series]:
         """
@@ -351,41 +356,45 @@ class RegimeDetector:
 
     def _calculate_markov_4h_state_and_prob(self, df4h: pd.DataFrame) -> tuple[int | None, float | None]:
         """
-        4h Markov regime on pct returns:
-          - markov_state_4h: 1 if P(up-regime) > 0.5 else 0
-          - markov_prob_up_4h: P(up-regime)
-        Uses FILTERED probabilities (no smoothing / no lookahead).
+        Offline parity: 2-state Markov on 4h close-to-close LOG returns.
+        Use FILTERED (past-only) probabilities and apply light EWM smoothing.
+        Returns: (markov_state_4h, markov_prob_up_4h).
         """
-        if df4h is None or df4h.empty or len(df4h) < 300:
+        if df4h is None or df4h.empty or len(df4h) < 200:
             return None, None
 
-        rets = df4h["close"].pct_change().dropna()
-        if len(rets) < 300:
+        close = df4h["close"].astype(float)
+        ret = np.log(close).diff().dropna()
+        if len(ret) < 150:
             return None, None
 
-        model = sm.tsa.MarkovRegression(rets, k_regimes=2, switching_variance=True, trend="c")
-        res = model.fit(disp=False, maxiter=200)
+        alpha = float(getattr(self, "markov4h_alpha", None) or 0.2)
+        try:
+            mod = sm.tsa.MarkovRegression(ret, k_regimes=2, switching_variance=True, trend="c")
+            res = mod.fit(disp=False, maxiter=200)
 
-        probs = res.filtered_marginal_probabilities
-        if not isinstance(probs, pd.DataFrame) or probs.shape[1] != 2:
+            # FILTERED probs (past-only)
+            filt_probs = [res.filtered_marginal_probabilities[i] for i in range(2)]
+
+            # Identify "UP" state as higher weighted mean return
+            means = []
+            for p in filt_probs:
+                w = p.values
+                r = ret.reindex(p.index).values
+                mu = float(np.sum(w * r) / max(float(np.sum(w)), 1e-12))
+                means.append(mu)
+            up_idx = int(np.argmax(means))
+
+            prob_up = filt_probs[up_idx].clip(0.0, 1.0)
+            prob_up = prob_up.ewm(alpha=alpha, adjust=False).mean().clip(0.0, 1.0)
+
+            last_prob = float(prob_up.iloc[-1])
+            last_state = int(last_prob > 0.5)
+            return last_state, last_prob
+
+        except Exception:
             return None, None
 
-        r = rets.values
-        means = []
-        for i in range(2):
-            p = probs[i].reindex(rets.index).fillna(0.0).values
-            denom = np.sum(p)
-            if denom <= 0:
-                means.append(-np.inf)
-            else:
-                means.append(float(np.sum(p * r) / denom))
-
-        up_idx = int(np.argmax(means))
-        prob_up = probs[up_idx].reindex(rets.index).astype(float).clip(0.0, 1.0)
-
-        last_prob = float(prob_up.iloc[-1])
-        last_state = int(last_prob > 0.5)
-        return last_state, last_prob
 
     async def get_current_regime(self, asof_ts: pd.Timestamp | None = None) -> str:
         if asof_ts is None:
