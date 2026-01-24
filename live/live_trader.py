@@ -1278,8 +1278,9 @@ class LiveTrader:
                 return None
 
             atr_1h = ta.atr(df1h, atr_len)
-            rsi_1h = ta.rsi(df1h, rsi_len)
+            rsi_1h = ta.rsi(df1h["close"], rsi_len)
             adx_1h = ta.adx(df1h, adx_len)
+
 
             df5['atr_1h'] = atr_1h.reindex(df5.index, method='ffill')
             df5['rsi_1h'] = rsi_1h.reindex(df5.index, method='ffill')

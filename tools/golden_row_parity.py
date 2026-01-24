@@ -15,12 +15,21 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
-def load_module_from_path(mod_name: str, path: Path):
-    spec = importlib.util.spec_from_file_location(mod_name, str(path))
+def load_module_from_path(module_name, path):
+    import importlib.util
+    import sys
+
+    spec = importlib.util.spec_from_file_location(module_name, str(path))
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"Cannot load module {mod_name} from {path}")
+        raise RuntimeError(f"Cannot load module spec for {module_name} from {path}")
+
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)  # type: ignore[attr-defined]
+
+    # CRITICAL: dataclasses (and other machinery) expects the module to exist in sys.modules
+    # before class decorators run.
+    sys.modules[module_name] = mod
+
+    spec.loader.exec_module(mod)
     return mod
 
 
