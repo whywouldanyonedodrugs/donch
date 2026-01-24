@@ -802,70 +802,54 @@ class LiveTrader:
                 pass
 
 
-    def _score_winprob_safe(self, symbol: str, meta_row: dict) -> Optional[float]:
-        """Strict-parity winprob scoring. Returns calibrated p in [0,1] or None (no-trade)."""
+    def _score_winprob_safe_details(self, symbol: str, meta_row: dict) -> dict:
+        """
+        Strict-parity meta scoring with schema enforcement.
+
+        Returns:
+            {
+              "schema_ok": bool,          # raw row passed schema checks AND p_cal is finite
+              "p_raw": Optional[float],   # model raw probability (before calibration), if available
+              "p_cal": Optional[float],   # calibrated probability, if available
+              "err": Optional[str],       # short error string if failed
+            }
+        """
+        import math
+
+        out = {"schema_ok": False, "p_raw": None, "p_cal": None, "err": None}
+
         if not getattr(self, "winprob", None):
-            return None
-
-        # --- schema diagnostics (throttled to a small allowlist) ---
-        try:
-            diag_raw = self.cfg.get("META_SCHEMA_DIAG_SYMBOLS", "") or ""
-            if isinstance(diag_raw, str):
-                diag_syms = {s.strip().upper() for s in diag_raw.split(",") if s.strip()}
-            elif isinstance(diag_raw, (list, tuple, set)):
-                diag_syms = {str(s).strip().upper() for s in diag_raw if str(s).strip()}
-            else:
-                diag_syms = set()
-
-            diag_max = int(self.cfg.get("META_SCHEMA_DIAG_MAX_PER_SYMBOL", 2) or 2)
-
-            if not hasattr(self, "_meta_schema_diag_counts"):
-                self._meta_schema_diag_counts = defaultdict(int)
-
-            do_diag = (symbol.upper() in diag_syms) and (self._meta_schema_diag_counts[symbol.upper()] < diag_max)
-
-            if do_diag:
-                required = set(getattr(self.winprob, "raw_features", []) or [])
-                keys = set(meta_row.keys())
-                missing = sorted(required - keys)
-                extra = sorted(keys - required)
-
-                LOG.info(
-                    "Meta schema diag %s: keys=%d required=%d missing=%d extra=%d sample_missing=%s sample_extra=%s",
-                    symbol,
-                    len(keys),
-                    len(required),
-                    len(missing),
-                    len(extra),
-                    missing[:25],
-                    extra[:25],
-                )
-                self._meta_schema_diag_counts[symbol.upper()] += 1
-        except Exception:
-            # Diagnostics must never break trading/scanning.
-            pass
+            out["err"] = "winprob_not_loaded"
+            return out
 
         try:
-            p = float(self.winprob.score(meta_row))
-            if 0.0 <= p <= 1.0:
-                return p
-            return None
-        except SchemaError as e:
-            # Avoid INFO spam for 700+ symbols; keep INFO only for diag symbols.
-            try:
-                if symbol.upper() in (diag_syms if "diag_syms" in locals() else set()):
-                    LOG.info("Meta no-trade %s: schema_mismatch: %s", symbol, e)
-                else:
-                    LOG.debug("Meta no-trade %s: schema_mismatch: %s", symbol, e)
-            except Exception:
-                LOG.debug("Meta no-trade %s: schema_mismatch: %s", symbol, e)
-            return None
+            # score_with_details returns (p_raw, p_cal, features_df, schema_diag)
+            p_raw, p_cal, _features_df, _schema_diag = self.winprob.score_with_details(meta_row)
         except Exception as e:
-            LOG.exception("Meta scoring failed for %s: %s", symbol, e)
-            return None
+            # Treat any failure as schema/score failure -> safe-mode no-trade upstream
+            out["err"] = f"{type(e).__name__}:{e}"
+            return out
 
+        # Enforce finiteness of calibrated output for gating
+        if p_cal is None or (isinstance(p_cal, float) and (not math.isfinite(p_cal))):
+            out["err"] = "p_cal_nonfinite"
+            return out
 
+        # p_raw is optional; keep if finite
+        if p_raw is not None and isinstance(p_raw, float) and (not math.isfinite(p_raw)):
+            p_raw = None
 
+        out["p_raw"] = float(p_raw) if p_raw is not None else None
+        out["p_cal"] = float(p_cal)
+        out["schema_ok"] = True
+        return out
+
+    def _score_winprob_safe(self, symbol: str, meta_row: dict):
+        """
+        Backwards-compatible wrapper returning calibrated probability or None.
+        """
+        d = self._score_winprob_safe_details(symbol, meta_row)
+        return d["p_cal"] if d.get("schema_ok") else None
 
 
     def _load_universe_cache_if_fresh(self) -> Optional[dict]:
@@ -1510,18 +1494,63 @@ class LiveTrader:
                 pass
 
             # -------------- Score meta (even on rejects) ----------
-            p = self._score_winprob_safe(symbol, meta_row)
-            pstar = float(getattr(self.winprob, "pstar", None) or self.cfg.get("META_PSTAR", 0.60))
+            decision_ts = df5.index[-1]
 
+            score_d = self._score_winprob_safe_details(symbol, meta_row)
+            schema_ok = bool(score_d.get("schema_ok"))
+            p_raw = score_d.get("p_raw", None)
+            p_cal = score_d.get("p_cal", None)
 
-            if p is None or not np.isfinite(p):
-                meta_ok = True  # don’t block if model unavailable
-                p_disp = "n/a"
-            else:
-                meta_ok = (p >= pstar)
-                p_disp = f"{p:.3f}"
+            pstar = float(self.meta_thresh.get("pstar", 0.0)) if getattr(self, "meta_thresh", None) else 0.0
+            meta_ok = schema_ok and (p_cal is not None) and (p_cal >= pstar)
 
-            LOG.debug("  META: p*=%0.2f,  p=%s → %s", pstar, p_disp, "✅" if meta_ok else "❌")
+            # Minimal, always-on shadow log (can be disabled via cfg META_SHADOW_LOG=False)
+            if bool(getattr(self, "cfg", {}).get("META_SHADOW_LOG", True)):
+                def _fmt(x):
+                    return "None" if x is None else f"{float(x):.6f}"
+
+                bundle_id = None
+                if getattr(self, "winprob", None) is not None:
+                    bundle_id = getattr(self.winprob, "bundle_id", None) or getattr(self.winprob, "id", None)
+                bundle_id = bundle_id or getattr(self, "bundle_id", None) or "no_bundle"
+
+                # strategy rule result BEFORE applying meta veto (assumes you already computed should_enter earlier)
+                strat_ok = bool(should_enter)
+
+                # concise reason (only covers rule/meta; later gates may still veto downstream)
+                if not strat_ok:
+                    reason = "rule_veto"
+                elif not schema_ok:
+                    reason = "schema_invalid"
+                elif p_cal is None:
+                    reason = "meta_unavailable"
+                elif p_cal < pstar:
+                    reason = "meta_below_pstar"
+                else:
+                    reason = "pass_rule_and_meta"
+
+                LOG.info(
+                    "META_DECISION bundle=%s symbol=%s decision_ts=%s schema_ok=%s p_raw=%s p_cal=%s pstar=%s meta_ok=%s strat_ok=%s reason=%s",
+                    bundle_id,
+                    symbol,
+                    decision_ts.isoformat(),
+                    schema_ok,
+                    _fmt(p_raw),
+                    _fmt(p_cal),
+                    f"{pstar:.6f}",
+                    meta_ok,
+                    strat_ok,
+                    reason,
+                )
+
+            # Apply strict safe-mode: invalid schema => no-trade, and meta veto => no-trade
+            should_enter = bool(should_enter) and bool(meta_ok)
+
+            # Keep existing debug line if present
+            try:
+                LOG.debug("META: p*=%.3f p=%.3f → %s", pstar, (p_cal if p_cal is not None else float("nan")), ("OK" if meta_ok else "VETO"))
+            except Exception:
+                pass
 
 
             # ---------- DIAGNOSTICS (always) ----------------------
@@ -1540,7 +1569,8 @@ class LiveTrader:
                 g_vol = vol_mult >= vol_needed
                 g_regime = (regime_up == 1.0) or (not regime_block)
                 g_micro = (atr_pct >= float(self.cfg.get("ENTRY_MIN_ATR_PCT", 0.0)))
-                g_meta = (p is not None and p >= pstar)
+                g_meta = (p_cal is not None and p_cal >= pstar)
+
 
                 # Try to expose "why" from StrategyEngine when present
                 why = None
@@ -1569,7 +1599,7 @@ class LiveTrader:
                         f"  RegimeUp / not blocked ...... {_ok(g_regime)} (block_when_down={regime_block})\n"
                         f"  Volume spike x{vol_needed:.1f} .... {_ok(g_vol)}\n"
                         f"  Micro-ATR min ............... {_ok(g_micro)} (min={float(self.cfg.get('ENTRY_MIN_ATR_PCT',0.0)):.5f})\n"
-                        f"  META: p*={pstar:.2f},  p={(p if p is not None else float('nan')):.3f} → {_ok(g_meta)}\n"
+                        f"  META: p*={pstar:.2f},  p={(p_cal if p_cal is not None else float('nan')):.3f} → {_ok(g_meta)}\n"
                         f"===================================================="
                     )
                 )
@@ -1679,16 +1709,14 @@ class LiveTrader:
             signal_obj.pullback_type = pullback_type
             signal_obj.regime_1d = regime_1d or ""
 
-            # -------------- Win-prob: reuse p if available -------
+            # -------------- Win-prob: attach already-computed calibrated meta probability -------
+            # IMPORTANT: Do NOT re-score here. This must match the p_cal you log in META_DECISION.
             try:
-                if p is not None and np.isfinite(p):
-                    signal_obj.win_probability = max(0.0, min(1.0, float(p)))
+                if p_cal is not None and np.isfinite(p_cal):
+                    signal_obj.win_probability = float(min(max(float(p_cal), 0.0), 1.0))
                 else:
-                    # one more attempt on the fully-computed row, same protocol
-                    p2 = self._score_winprob_safe(symbol, meta_row)
-                    signal_obj.win_probability = max(0.0, min(1.0, float(p2))) if (p2 is not None and np.isfinite(p2)) else 0.0
-            except Exception as e:
-                LOG.warning("Failed to score signal for %s: %s", symbol, e)
+                    signal_obj.win_probability = 0.0
+            except Exception:
                 signal_obj.win_probability = 0.0
 
             # -------------- Final INFO line ----------------------
@@ -1697,6 +1725,7 @@ class LiveTrader:
                 symbol, float(last['close']), market_regime, signal_obj.win_probability * 100.0
             )
             return signal_obj
+
 
         except ccxt.BadSymbol:
             LOG.warning("Invalid symbol on exchange: %s", symbol)
