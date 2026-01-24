@@ -179,13 +179,13 @@ def load_yaml(p: Path) -> Dict[str, Any]:
 
 class _Watcher(FileSystemEventHandler):
     def __init__(self, path: Path, cb):
-        self.meta_dir = meta_dir
         self.path = path.resolve()
         self.cb = cb
         obs = Observer()
         obs.schedule(self, self.path.parent.as_posix(), recursive=False)
         obs.daemon = True
         obs.start()
+
 
     def on_modified(self, e):
         if Path(e.src_path).resolve() == self.path:

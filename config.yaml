@@ -86,3 +86,4 @@ META_REQUIRED: true                # (optional) fail-closed on feature mismatch
 
 META_SCHEMA_DIAG_SYMBOLS: "BTCUSDT,ETHUSDT"
 
+REGIMES_REPORT_PATH: "/root/apps/donch/results/meta_export/regimes_report.json"
