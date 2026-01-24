@@ -576,6 +576,9 @@ class LiveTrader:
             _set_bundle_id_for_logs(self.meta_bundle.bundle_id)
             self.bundle_id = self.meta_bundle.bundle_id
             self.winprob = WinProbScorer(bundle=self.meta_bundle, strict_schema=True)
+            # WinProb bundle may carry a schema object; keep it optional.
+            self.meta_schema = getattr(self.winprob, "schema", None)
+
         except Exception as e:
             if strict_bundle:
                 raise
@@ -589,7 +592,8 @@ class LiveTrader:
             pstar_s = f"{float(pstar):.4f}" if isinstance(pstar, (int, float)) else "None"
 
             # --- WinProb readiness diagnostics (strict-parity) ---
-            raw_feats = len(getattr(self.winprob, "raw_features", []) or [])
+            raw_feats = len(getattr(self.winprob, "required_keys", []))
+
             model_cols = len(getattr(self.winprob, "model_features", []) or [])
             pstar = getattr(self.winprob, "pstar", None)
             pstar_s = "None" if pstar is None else f"{float(pstar):.6f}"
@@ -658,6 +662,81 @@ class LiveTrader:
             LOG.debug("OI/Funding feature pack failed for %s: %s", symbol, e)
             return {}
 
+    async def _fetch_ohlcv_df_paged(self, symbol: str, tf: str, limit: int) -> Optional[pd.DataFrame]:
+        """
+        Fetch `limit` candles via pagination (CCXT usually caps per-call limit).
+        Returns DataFrame indexed at BAR CLOSE TIME (shifted), and drops the last incomplete bar.
+        """
+        try:
+            page_limit = int(self.cfg.get("OHLCV_PAGE_LIMIT", 1000))
+            tf_ms = int(_tf_to_timedelta(tf).total_seconds() * 1000)
+
+            need = int(limit) + 2  # +2 for safety; we drop last bar later
+            since = None
+            rows: list[list] = []
+
+            while len(rows) < need:
+                batch = await self.exchange.fetch_ohlcv(symbol, tf, since=since, limit=min(page_limit, need - len(rows)))
+                if not batch:
+                    break
+
+                # de-overlap
+                if rows:
+                    last_ts = rows[-1][0]
+                    batch = [r for r in batch if r[0] > last_ts]
+                    if not batch:
+                        break
+
+                rows.extend(batch)
+                since = rows[-1][0] + tf_ms
+
+            if len(rows) < 2:
+                return None
+
+            df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+
+            df = df.set_index("timestamp").sort_index()
+
+            if len(df) > 1:
+                df = df.iloc[:-1]  # drop last possibly-incomplete bar
+
+            if len(df) > limit:
+                df = df.iloc[-limit:]
+
+            return df
+        except Exception as e:
+            LOG.debug("OHLCV paged fetch failed %s %s: %s", symbol, tf, e)
+            return None
+
+    def _init_ohlcv_cache(self) -> None:
+        self._ohlcv_cache: dict[tuple[str, str], pd.DataFrame] = {}
+
+    async def _get_ohlcv(self, symbol: str, tf: str, min_bars: int) -> Optional[pd.DataFrame]:
+        key = (symbol, tf)
+        df = self._ohlcv_cache.get(key)
+
+        if df is None or len(df) < min_bars:
+            df = await self._fetch_ohlcv_df_paged(symbol, tf, min_bars)
+            if df is None:
+                return None
+            self._ohlcv_cache[key] = df
+            return df
+
+        # incremental refresh: fetch a small tail and merge
+        tail = int(self.cfg.get("OHLCV_TAIL_FETCH", 400))
+        df_new = await self._fetch_ohlcv_df_paged(symbol, tf, min(tail, min_bars))
+        if df_new is None:
+            return df
+
+        df = pd.concat([df, df_new], axis=0)
+        df = df[~df.index.duplicated(keep="last")].sort_index()
+        if len(df) > min_bars:
+            df = df.iloc[-min_bars:]
+        self._ohlcv_cache[key] = df
+        return df
+
+
     async def _fetch_ohlcv_df_simple(self, symbol: str, tf: str, limit: int) -> Optional[pd.DataFrame]:
         """
         Minimal OHLCV fetch -> DataFrame with UTC datetime index at BAR CLOSE TIME.
@@ -669,7 +748,8 @@ class LiveTrader:
                 return None
             df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
             # ccxt timestamps are candle OPEN time; shift to CLOSE time for parity with offline/golden
-            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True) + _tf_to_timedelta(tf)
+            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+
             df = df.set_index("timestamp").sort_index()
             # drop last possibly-incomplete bar
             if len(df) > 1:
@@ -1036,6 +1116,14 @@ class LiveTrader:
                 meta_full["S6_fresh_x_compress"] = float(fcode * 3 + ccode)
             except Exception:
                 pass
+
+    def _missing_required_features(self, row: dict, required: list[str]) -> list[str]:
+        missing = []
+        for k in required:
+            v = row.get(k, None)
+            if self._is_bad_numeric(v):
+                missing.append(k)
+        return missing
 
 
     def _score_winprob_safe_details(self, symbol: str, meta_row: dict) -> dict:
@@ -1716,10 +1804,25 @@ class LiveTrader:
             if isinstance(gov_ctx, dict) and gov_ctx:
                 meta_full.update(gov_ctx)
 
+            required = list(getattr(self.winprob, "raw_features", []))
+            missing = self._missing_required_features(meta_row, required)
+            if missing:
+                LOG.warning(
+                    "META_INPUT_MISSING symbol=%s decision_ts=%s missing=%s",
+                    symbol,
+                    decision_ts.isoformat(),
+                    ",".join(missing),
+                )
+                # treat as meta veto; do not call score() at all
+                return None
+
+
+
             # --- NEW: deterministic regime/set features + S-features (offline spec)
             self._augment_meta_with_regime_sets(meta_full)
 
             required = list(getattr(self.winprob, "raw_features", []) or [])
+            req = required
             num_cols = set(getattr(self.winprob, "numeric_cols", getattr(self.winprob, "raw_num_cols", [])) or [])
             cat_cols = set(getattr(self.winprob, "cat_cols", getattr(self.winprob, "raw_cat_cols", [])) or [])
 
@@ -1795,7 +1898,7 @@ class LiveTrader:
                         bad.append((k, meta_full[k]))
                 return missing, bad
 
-            req = list(getattr(self.winprob, "required_keys", [])) or list(getattr(self.meta_schema, "required_keys", []))
+            req = list(self.winprob.required_keys)
             missing, bad = meta_report(req, meta_full)
             if missing or bad:
                 LOG.warning("META_SCHEMA_INPUT_PROBLEMS missing=%d bad=%d missing_head=%s bad_head=%s",

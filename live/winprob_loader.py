@@ -272,6 +272,11 @@ class WinProbScorer:
         self._last_hash = None
         self._same_vec_count = 0
 
+    @property
+    def required_keys(self) -> list[str]:
+        # Backwards-compatible alias used by live_trader integration.
+        return list(self.raw_features)
+
 
     def score(self, raw_row: Dict[str, Any]) -> float:
         p_raw, p_cal = self.score_with_details(raw_row)
