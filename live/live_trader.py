@@ -823,26 +823,40 @@ class LiveTrader:
             return out
 
         try:
-            # score_with_details returns (p_raw, p_cal, features_df, schema_diag)
-            p_raw, p_cal, _features_df, _schema_diag = self.winprob.score_with_details(meta_row)
+            # winprob_loader.WinProbScorer.score_with_details returns (p_raw, p_cal)
+            p_raw, p_cal = self.winprob.score_with_details(meta_row)
         except Exception as e:
-            # Treat any failure as schema/score failure -> safe-mode no-trade upstream
             out["err"] = f"{type(e).__name__}:{e}"
             return out
 
         # Enforce finiteness of calibrated output for gating
-        if p_cal is None or (isinstance(p_cal, float) and (not math.isfinite(p_cal))):
-            out["err"] = "p_cal_nonfinite"
+        try:
+            if p_cal is None:
+                out["err"] = "p_cal_none"
+                return out
+            p_cal_f = float(p_cal)
+            if not math.isfinite(p_cal_f):
+                out["err"] = "p_cal_nonfinite"
+                return out
+        except Exception:
+            out["err"] = "p_cal_cast_fail"
             return out
 
         # p_raw is optional; keep if finite
-        if p_raw is not None and isinstance(p_raw, float) and (not math.isfinite(p_raw)):
-            p_raw = None
+        p_raw_f = None
+        try:
+            if p_raw is not None:
+                pr = float(p_raw)
+                if math.isfinite(pr):
+                    p_raw_f = pr
+        except Exception:
+            p_raw_f = None
 
-        out["p_raw"] = float(p_raw) if p_raw is not None else None
-        out["p_cal"] = float(p_cal)
+        out["p_raw"] = p_raw_f
+        out["p_cal"] = p_cal_f
         out["schema_ok"] = True
         return out
+
 
     def _score_winprob_safe(self, symbol: str, meta_row: dict):
         """
@@ -1213,7 +1227,7 @@ class LiveTrader:
             dfs: dict[str, pd.DataFrame] = {}
             for tf, data in ohlcv_data.items():
                 if isinstance(data, Exception) or not data:
-                    LOG.debug("Could not fetch OHLCV for %s on %s.", symbol, tf)
+                    LOG.warning("SCAN_SKIP symbol=%s stage=ohlcv_fetch_fail tf=%s", symbol, tf)
                     return None
                 df = pd.DataFrame(data, columns=['timestamp','open','high','low','close','volume'])
                 df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
@@ -1229,10 +1243,14 @@ class LiveTrader:
 
                 # Drop possibly incomplete last bar; ensure non-empty
                 if len(df) < 3:
+                    LOG.warning("SCAN_SKIP symbol=%s stage=too_few_bars tf=%s n=%d", symbol, tf, len(df))
                     return None
+
                 df = df.iloc[:-1]
                 if df.empty:
+                    LOG.warning("SCAN_SKIP symbol=%s stage=empty_after_drop tf=%s", symbol, tf)
                     return None
+
 
                 dfs[tf] = df
 
@@ -1240,6 +1258,7 @@ class LiveTrader:
                 LOG.warning("Base TF %s not available for %s.", base_tf, symbol)
                 return None
             df5 = dfs[base_tf]
+            decision_ts = df5.index[-1]  # last fully closed 5m bar (after dropping incomplete last bar)
 
             # ---------------- Indicators aligned to base index ---
             # EMA on ema_tf (for optional heuristics)
@@ -1275,7 +1294,9 @@ class LiveTrader:
             needed = ['close','volume','atr_1h','rsi_1h','adx_1h','ema_fast','ema_slow']
             df5_req = df5[needed].dropna()
             if df5_req.empty:
+                LOG.warning("SCAN_SKIP symbol=%s stage=df5_req_empty decision_ts=%s", symbol, decision_ts.isoformat())
                 return None
+
             last = df5_req.iloc[-1]
 
             # ---------------- Listing age ------------------------
@@ -1492,9 +1513,6 @@ class LiveTrader:
             except Exception as _e:
                 # Never break scanning because of parity tooling.
                 pass
-
-            # -------------- Score meta (even on rejects) ----------
-            decision_ts = df5.index[-1]
 
             score_d = self._score_winprob_safe_details(symbol, meta_row)
             schema_ok = bool(score_d.get("schema_ok"))
