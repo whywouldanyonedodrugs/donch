@@ -2,162 +2,216 @@
 from __future__ import annotations
 
 import argparse
-import importlib.util
+import json
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
 
-def repo_root() -> Path:
+def _repo_root() -> Path:
+    # tools/golden_row_parity.py -> repo root is parent of tools/
     return Path(__file__).resolve().parents[1]
 
 
-def load_module_from_path(module_name, path):
-    import importlib.util
-    import sys
-
-    spec = importlib.util.spec_from_file_location(module_name, str(path))
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Cannot load module spec for {module_name} from {path}")
-
-    mod = importlib.util.module_from_spec(spec)
-
-    # CRITICAL: dataclasses (and other machinery) expects the module to exist in sys.modules
-    # before class decorators run.
-    sys.modules[module_name] = mod
-
-    spec.loader.exec_module(mod)
-    return mod
+def _ensure_repo_on_syspath(repo_root: Path) -> None:
+    root_s = str(repo_root)
+    if root_s not in sys.path:
+        sys.path.insert(0, root_s)
 
 
-def find_required_files(root: Path) -> Tuple[Path, Path]:
-    """
-    Find artifact_bundle.py and winprob_loader.py anywhere under repo.
-    Deterministic: first match in sorted path order.
-    """
-    ab = sorted(root.rglob("artifact_bundle.py"))
-    wp = sorted(root.rglob("winprob_loader.py"))
-    if not ab:
-        raise RuntimeError("Could not find artifact_bundle.py under repo")
-    if not wp:
-        raise RuntimeError("Could not find winprob_loader.py under repo")
-    return ab[0], wp[0]
+def _load_fixture(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        raise FileNotFoundError(f"Fixture not found: {path}")
+    if path.suffix.lower() in {".parquet", ".pq"}:
+        return pd.read_parquet(path)
+    if path.suffix.lower() in {".csv"}:
+        return pd.read_csv(path)
+    raise ValueError(f"Unsupported fixture format: {path.suffix} (use .parquet or .csv)")
 
 
-def pick_ts_col(df: pd.DataFrame) -> str:
-    for c in ("timestamp", "decision_ts", "entry_ts", "ts"):
+def _pick_ts_col(df: pd.DataFrame, explicit: Optional[str] = None) -> str:
+    if explicit is not None:
+        if explicit not in df.columns:
+            raise KeyError(f"--ts_col={explicit} not found in fixture columns")
+        return explicit
+    for c in ["decision_ts", "asof_ts", "ts", "timestamp", "time", "datetime"]:
         if c in df.columns:
             return c
-    raise ValueError("Fixture must contain a timestamp column: timestamp|decision_ts|entry_ts|ts")
+    raise KeyError("Could not infer timestamp column. Provide --ts_col.")
 
 
-def pick_expected_prob_cols(df: pd.DataFrame) -> Tuple[Optional[str], Optional[str]]:
-    raw_cands = ("p_raw", "wp_raw", "prob_raw", "score_raw")
-    cal_cands = ("p_cal", "wp_cal", "prob_cal", "score_cal", "p", "wp", "win_probability")
-    raw = next((c for c in raw_cands if c in df.columns), None)
-    cal = next((c for c in cal_cands if c in df.columns), None)
-    return raw, cal
+def _read_manifest_schema(bundle_dir: Path) -> Tuple[List[str], Dict[str, str]]:
+    """
+    Returns (feature_names, dtype_map) where dtype_map[name] in {"numeric","categorical","cat","str",...}
+    Robust to minor manifest shape differences.
+    """
+    mpath = bundle_dir / "feature_manifest.json"
+    if not mpath.exists():
+        raise FileNotFoundError(f"Missing feature_manifest.json in bundle_dir: {mpath}")
+    obj = json.loads(mpath.read_text())
+
+    feats: List[Dict[str, Any]] = []
+    if isinstance(obj, list):
+        feats = [x for x in obj if isinstance(x, dict) and ("name" in x or "key" in x)]
+    elif isinstance(obj, dict):
+        for k in ["raw_features", "features", "schema", "columns"]:
+            if k in obj:
+                if isinstance(obj[k], list):
+                    feats = [x for x in obj[k] if isinstance(x, dict)]
+                elif isinstance(obj[k], dict):
+                    # schema-like mapping name -> dtype
+                    feats = [{"name": kk, "dtype": vv} for kk, vv in obj[k].items()]
+                break
+        if not feats and "manifest" in obj and isinstance(obj["manifest"], list):
+            feats = [x for x in obj["manifest"] if isinstance(x, dict)]
+    if not feats:
+        raise RuntimeError("Could not parse feature_manifest.json into a feature list.")
+
+    names: List[str] = []
+    dtype_map: Dict[str, str] = {}
+    for f in feats:
+        name = f.get("name") or f.get("key")
+        if not name:
+            continue
+        dt = (f.get("dtype") or f.get("type") or f.get("kind") or "").strip()
+        names.append(str(name))
+        dtype_map[str(name)] = str(dt)
+
+    # Preserve order, drop duplicates
+    seen = set()
+    ordered = []
+    for n in names:
+        if n not in seen:
+            ordered.append(n)
+            seen.add(n)
+    return ordered, dtype_map
+
+
+def _is_cat(dtype_str: str) -> bool:
+    s = (dtype_str or "").lower()
+    return ("cat" in s) or (s in {"categorical", "category"})
+
+
+def _format_float(x: Optional[float]) -> str:
+    if x is None:
+        return "None"
+    try:
+        return f"{float(x):.10f}"
+    except Exception:
+        return str(x)
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--bundle_dir", required=True)
-    ap.add_argument("--fixture", required=True)
-    ap.add_argument("--max_rows", type=int, default=0)
-    ap.add_argument("--symbols", default="")
-    ap.add_argument("--tol_p", type=float, default=1e-6)
+    ap = argparse.ArgumentParser(description="Golden-row parity: validate bundle scorer vs golden fixture outputs.")
+    ap.add_argument("--bundle_dir", required=True, help="Bundle directory (e.g., results/meta_export)")
+    ap.add_argument("--fixture", required=True, help="Golden fixture (.parquet or .csv)")
+    ap.add_argument("--max_rows", type=int, default=2000, help="Max rows to check")
+    ap.add_argument("--ts_col", default=None, help="Timestamp column name in fixture (optional)")
+    ap.add_argument("--p_raw_col", default="p_raw", help="Column name for expected raw prob (if present)")
+    ap.add_argument("--p_cal_col", default="p_cal", help="Column name for expected calibrated prob (if present)")
+    ap.add_argument("--rtol", type=float, default=1e-6, help="Relative tolerance for prob comparison")
+    ap.add_argument("--atol", type=float, default=1e-8, help="Absolute tolerance for prob comparison")
+    ap.add_argument("--require_prob_cols", action="store_true", help="Fail if expected prob columns are missing")
     args = ap.parse_args()
 
-    root = repo_root()
-    ab_path, wp_path = find_required_files(root)
+    repo_root = _repo_root()
+    _ensure_repo_on_syspath(repo_root)
 
-    ab = load_module_from_path("_artifact_bundle_dyn", ab_path)
-    wp = load_module_from_path("_winprob_loader_dyn", wp_path)
+    bundle_dir = Path(args.bundle_dir).resolve()
+    fixture_path = Path(args.fixture).resolve()
 
-    load_bundle = getattr(ab, "load_bundle")
-    SchemaError = getattr(ab, "SchemaError")
-    BundleError = getattr(ab, "BundleError")
-    WinProbScorer = getattr(wp, "WinProbScorer")
+    # Import in proper package context (fixes relative imports inside live/*)
+    from live.artifact_bundle import BundleError, SchemaError, load_bundle  # type: ignore
+    from live.winprob_loader import WinProbScorer  # type: ignore
 
-    bundle_dir = (root / args.bundle_dir).resolve()
-    fixture_path = (root / args.fixture).resolve()
+    df = _load_fixture(fixture_path)
+    if df.empty:
+        raise RuntimeError("Fixture dataframe is empty.")
 
-    bundle = load_bundle(bundle_dir, strict=True)
+    ts_col = _pick_ts_col(df, args.ts_col)
+
+    # Load schema from manifest for column selection
+    feat_names, dtype_map = _read_manifest_schema(bundle_dir)
+
+    missing_cols = [c for c in feat_names if c not in df.columns]
+    if missing_cols:
+        raise RuntimeError(f"Fixture missing {len(missing_cols)} required feature columns. First 10: {missing_cols[:10]}")
+
+    has_p_raw = args.p_raw_col in df.columns
+    has_p_cal = args.p_cal_col in df.columns
+    if args.require_prob_cols and (not has_p_raw or not has_p_cal):
+        raise RuntimeError(
+            f"Expected prob columns missing: have_p_raw={has_p_raw} have_p_cal={has_p_cal} "
+            f"(expected {args.p_raw_col}, {args.p_cal_col})"
+        )
+
+    bundle = load_bundle(str(bundle_dir))
     scorer = WinProbScorer(bundle=bundle, strict_schema=True)
 
-    raw_feats = list(getattr(scorer, "raw_features", []) or [])
-    if not raw_feats:
-        print("[FAIL] scorer.raw_features empty", flush=True)
-        return 2
+    n = min(int(args.max_rows), len(df))
+    sub = df.iloc[:n].copy()
 
-    if fixture_path.suffix.lower() == ".parquet":
-        df = pd.read_parquet(fixture_path)
-    else:
-        df = pd.read_csv(fixture_path, low_memory=False)
+    # Track failures
+    prob_fail = 0
+    schema_fail = 0
+    max_abs_raw = 0.0
+    max_abs_cal = 0.0
 
-    if "symbol" not in df.columns:
-        raise ValueError("Fixture must contain column: symbol")
+    for i, row in sub.iterrows():
+        # Build raw row dict using manifest order
+        raw_row: Dict[str, Any] = {}
+        for k in feat_names:
+            v = row[k]
+            # Preserve categorical codes as-is; numerics as python floats when possible
+            if _is_cat(dtype_map.get(k, "")):
+                raw_row[k] = (None if pd.isna(v) else int(v))
+            else:
+                raw_row[k] = (None if pd.isna(v) else float(v))
 
-    ts_col = pick_ts_col(df)
-    df["symbol"] = df["symbol"].astype(str).str.upper().str.strip()
-    df[ts_col] = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
-    df = df.dropna(subset=["symbol", ts_col])
-
-    allow = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
-    if allow:
-        df = df[df["symbol"].isin(allow)]
-
-    if args.max_rows and args.max_rows > 0:
-        df = df.head(args.max_rows)
-
-    missing = sorted(set(raw_feats) - set(df.columns))
-    if missing:
-        print(f"[FAIL] fixture missing required feature columns: {missing[:50]}", flush=True)
-        return 2
-
-    raw_exp_col, cal_exp_col = pick_expected_prob_cols(df)
-
-    n = len(df)
-    bad = 0
-    max_abs_err = 0.0
-
-    for r in df.itertuples(index=False):
-        row = r._asdict()
-        sym = row["symbol"]
-        ts = row[ts_col]
-        raw_row: Dict[str, Any] = {k: row[k] for k in raw_feats}
-
+        # Score
         try:
-            p_raw, p_cal = scorer.score_with_details(raw_row)  # returns (p_raw, p_cal)
-            p_cal = float(p_cal)
-            if not np.isfinite(p_cal):
-                raise RuntimeError("p_cal_nonfinite")
+            p_raw, p_cal = scorer.score_with_details(raw_row)
         except (SchemaError, BundleError, Exception) as e:
-            bad += 1
-            print(f"[FAIL] {sym} ts={pd.to_datetime(ts, utc=True).isoformat()} err={type(e).__name__}:{e}", flush=True)
+            schema_fail += 1
+            tsv = row[ts_col]
+            print(f"[SCHEMA_FAIL] idx={i} ts={tsv} err={e}")
             continue
 
-        if cal_exp_col is not None:
-            try:
-                exp = float(row[cal_exp_col])
-                err = abs(p_cal - exp)
-                max_abs_err = max(max_abs_err, err)
-                if err > float(args.tol_p):
-                    bad += 1
+        # Compare to expected if present
+        if has_p_raw:
+            exp_raw = None if pd.isna(row[args.p_raw_col]) else float(row[args.p_raw_col])
+            if exp_raw is not None:
+                diff = abs(float(p_raw) - exp_raw)
+                max_abs_raw = max(max_abs_raw, diff)
+                if not np.isclose(float(p_raw), exp_raw, rtol=args.rtol, atol=args.atol):
+                    prob_fail += 1
                     print(
-                        f"[FAIL] {sym} ts={pd.to_datetime(ts, utc=True).isoformat()} "
-                        f"p_cal_mismatch exp={exp:.8f} got={p_cal:.8f} abs_err={err:.6g}",
-                        flush=True,
+                        f"[P_RAW_MISMATCH] idx={i} ts={row[ts_col]} got={_format_float(p_raw)} exp={_format_float(exp_raw)} diff={diff:.10f}"
                     )
-            except Exception as e:
-                bad += 1
-                print(f"[FAIL] {sym} ts={pd.to_datetime(ts, utc=True).isoformat()} bad_expected:{e}", flush=True)
 
-    print(f"[DONE] rows={n} bad={bad} max_abs_cal_err={max_abs_err:.6g}", flush=True)
-    return 0 if bad == 0 else 1
+        if has_p_cal:
+            exp_cal = None if pd.isna(row[args.p_cal_col]) else float(row[args.p_cal_col])
+            if exp_cal is not None:
+                diff = abs(float(p_cal) - exp_cal)
+                max_abs_cal = max(max_abs_cal, diff)
+                if not np.isclose(float(p_cal), exp_cal, rtol=args.rtol, atol=args.atol):
+                    prob_fail += 1
+                    print(
+                        f"[P_CAL_MISMATCH] idx={i} ts={row[ts_col]} got={_format_float(p_cal)} exp={_format_float(exp_cal)} diff={diff:.10f}"
+                    )
+
+    print(
+        f"Checked rows={n} schema_fail={schema_fail} prob_fail={prob_fail} "
+        f"max_abs_raw={max_abs_raw:.10f} max_abs_cal={max_abs_cal:.10f}"
+    )
+
+    # Exit code policy
+    if schema_fail > 0 or prob_fail > 0:
+        return 2
+    return 0
 
 
 if __name__ == "__main__":

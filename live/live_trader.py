@@ -427,13 +427,19 @@ class LiveTrader:
             LOG.info("Meta bundle loaded: dir=%s id=%s", self.meta_bundle.meta_dir, self.bundle_id)
             pstar = getattr(self.winprob, "pstar", None)
             pstar_s = f"{float(pstar):.4f}" if isinstance(pstar, (int, float)) else "None"
+            # --- WinProb readiness diagnostics (strict-parity) ---
+            raw_feats = len(getattr(self.meta_schema, "required_keys", []))
+            model_cols = len(getattr(self.winprob, "model_features", []) or [])
+            pstar = getattr(self.winprob, "pstar", None)
+
             LOG.info(
                 "WinProb ready (bundle=%s, raw_feats=%d, model_cols=%d, p*=%s)",
                 self.bundle_id,
-                len(getattr(self.winprob, "raw_features", [])),
-                len(getattr(self.winprob, "feature_names", [])),
-                pstar_s,
+                raw_feats,
+                model_cols,
+                ("None" if pstar is None else f"{float(pstar):.6f}"),
             )
+            # -----------------------------------------------
             # Optional: golden row injector for parity testing (disabled by default).
             self.golden_store = None
             try:
@@ -1515,52 +1521,43 @@ class LiveTrader:
                 # Never break scanning because of parity tooling.
                 pass
 
-            score_d = self._score_winprob_safe_details(symbol, meta_row)
+            score_d = self._score_winprob_safe_details(symbol=symbol, meta_row=meta_row)
+            p_raw = score_d.get("p_raw")
+            p_cal = score_d.get("p_cal")
             schema_ok = bool(score_d.get("schema_ok"))
-            p_raw = score_d.get("p_raw", None)
-            p_cal = score_d.get("p_cal", None)
+            meta_err = score_d.get("err")
 
-            pstar = float(self.meta_thresh.get("pstar", 0.0)) if getattr(self, "meta_thresh", None) else 0.0
-            meta_ok = schema_ok and (p_cal is not None) and (p_cal >= pstar)
+            # meta_ok should reflect *meta gate* only, not strategy veto
+            pstar = getattr(self.winprob, "pstar", None)
+            if (pstar is None) or (p_cal is None):
+                meta_ok = False
+            else:
+                meta_ok = bool(float(p_cal) >= float(pstar))
 
-            # Minimal, always-on shadow log (can be disabled via cfg META_SHADOW_LOG=False)
-            if bool(getattr(self, "cfg", {}).get("META_SHADOW_LOG", True)):
-                def _fmt(x):
-                    return "None" if x is None else f"{float(x):.6f}"
+            # Reason precedence: schema failure is the primary safe-mode no-trade reason
+            if not schema_ok:
+                reason = "meta_schema_or_score_fail"
+            elif not strat_ok:
+                reason = "rule_veto"
+            elif not meta_ok:
+                reason = "meta_veto"
+            else:
+                reason = "ok"
 
-                bundle_id = None
-                if getattr(self, "winprob", None) is not None:
-                    bundle_id = getattr(self.winprob, "bundle_id", None) or getattr(self.winprob, "id", None)
-                bundle_id = bundle_id or getattr(self, "bundle_id", None) or "no_bundle"
-
-                # strategy rule result BEFORE applying meta veto (assumes you already computed should_enter earlier)
-                strat_ok = bool(should_enter)
-
-                # concise reason (only covers rule/meta; later gates may still veto downstream)
-                if not strat_ok:
-                    reason = "rule_veto"
-                elif not schema_ok:
-                    reason = "schema_invalid"
-                elif p_cal is None:
-                    reason = "meta_unavailable"
-                elif p_cal < pstar:
-                    reason = "meta_below_pstar"
-                else:
-                    reason = "pass_rule_and_meta"
-
-                LOG.info(
-                    "META_DECISION bundle=%s symbol=%s decision_ts=%s schema_ok=%s p_raw=%s p_cal=%s pstar=%s meta_ok=%s strat_ok=%s reason=%s",
-                    bundle_id,
-                    symbol,
-                    decision_ts.isoformat(),
-                    schema_ok,
-                    _fmt(p_raw),
-                    _fmt(p_cal),
-                    f"{pstar:.6f}",
-                    meta_ok,
-                    strat_ok,
-                    reason,
-                )
+            LOG.info(
+                "META_DECISION bundle=%s symbol=%s decision_ts=%s schema_ok=%s p_raw=%s p_cal=%s pstar=%.6f meta_ok=%s strat_ok=%s reason=%s err=%s",
+                self.bundle_id,
+                symbol,
+                (decision_ts.isoformat() if decision_ts is not None else "None"),
+                schema_ok,
+                ("None" if p_raw is None else f"{float(p_raw):.6f}"),
+                ("None" if p_cal is None else f"{float(p_cal):.6f}"),
+                (0.0 if pstar is None else float(pstar)),
+                meta_ok,
+                strat_ok,
+                reason,
+                ("None" if meta_err is None else str(meta_err)),
+            )
 
             # Apply strict safe-mode: invalid schema => no-trade, and meta veto => no-trade
             should_enter = bool(should_enter) and bool(meta_ok)
