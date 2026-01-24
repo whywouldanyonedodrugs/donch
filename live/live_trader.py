@@ -446,7 +446,7 @@ class RegimeDetector:
             return self.cached_regime
 
         except Exception as e:
-            LOG.warning(f"Regime detector error: {e!r}")
+            LOG.exception("Regime detector error")
             # Do not update cached_regime on failure; keep previous if any.
             if self.cached_regime is None:
                 self.cached_regime = "UNKNOWN"
@@ -513,7 +513,12 @@ class LiveTrader:
 
         # Exchange & regime detector
         self.exchange = ExchangeProxy(self._init_ccxt())
-        self.regime_detector = RegimeDetector(self.exchange, self.cfg)
+        self.regime_detector = RegimeDetector(
+            self.exchange,
+            self.cfg.get("REGIME_BENCHMARK_SYMBOL", "BTCUSDT"),
+            int(self.cfg.get("REGIME_CACHE_MINUTES", 60)),
+        )
+
 
         self.symbols = self._load_symbols()
         self._universe_ctx: dict[str, dict] = {}
