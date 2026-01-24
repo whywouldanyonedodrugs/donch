@@ -1530,14 +1530,17 @@ class LiveTrader:
             schema_ok = bool(score_d.get("schema_ok"))
             meta_err = score_d.get("err")
 
-            # meta_ok should reflect *meta gate* only, not strategy veto
+            # Strategy OK (pre-meta) already exists as should_enter (from StrategyEngine verdict)
+            strat_ok = bool(should_enter)
+
+            # Meta gate uses calibrated probability and pstar (if configured)
             pstar = getattr(self.winprob, "pstar", None)
             if (pstar is None) or (p_cal is None):
                 meta_ok = False
             else:
                 meta_ok = bool(float(p_cal) >= float(pstar))
 
-            # Reason precedence: schema failure is the primary safe-mode no-trade reason
+            # Reason precedence: schema/score failure first, then strategy veto, then meta veto
             if not schema_ok:
                 reason = "meta_schema_or_score_fail"
             elif not strat_ok:
@@ -1559,12 +1562,12 @@ class LiveTrader:
                 meta_ok,
                 strat_ok,
                 reason,
-                ("None" if score_d.get("err") is None else str(score_d.get("err"))),
+                ("None" if meta_err is None else str(meta_err)),
             )
 
-
-            # Apply strict safe-mode: invalid schema => no-trade, and meta veto => no-trade
+            # Strict safe-mode: invalid schema => no-trade; meta veto => no-trade
             should_enter = bool(should_enter) and bool(meta_ok)
+
 
             # Keep existing debug line if present
             try:
