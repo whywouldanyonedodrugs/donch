@@ -521,93 +521,111 @@ class LiveTrader:
 
     async def _get_gov_ctx(self) -> dict:
         """
-        Governance / benchmark context.
+        Cycle-level context needed by the meta model.
 
-        This is called once per scan cycle and cached briefly. Values here are merged into meta features
-        (via compute_meta_features_live) so they MUST be finite / well-typed for any keys that the meta
-        feature_manifest requires.
+        MUST populate any manifest-required "global" features, including Markov 4h regime probability.
+        Uses as-of semantics: only fully closed bars (our fetch helper drops last partial bar).
+        Cached to avoid per-symbol recomputation.
         """
-        now_ts = time.time()
-        ttl_sec = float(self.cfg.get("GOV_CTX_CACHE_TTL_SEC", 60.0))
+        ttl_sec = int(self.cfg.get("GOV_CTX_TTL_SEC", 60) or 60)
+        now = datetime.now(timezone.utc)
+
         if hasattr(self, "_gov_ctx_cache") and hasattr(self, "_gov_ctx_cache_ts"):
-            if (now_ts - float(getattr(self, "_gov_ctx_cache_ts"))) < ttl_sec:
-                return dict(getattr(self, "_gov_ctx_cache"))
+            age = (now - self._gov_ctx_cache_ts).total_seconds()
+            if age < ttl_sec:
+                return dict(self._gov_ctx_cache)
+
+        # Fetch 5m OHLCV for BTC/ETH (same limit pattern as base tf elsewhere)
+        df_btc, df_eth = await asyncio.gather(
+            self._fetch_ohlcv_df_simple("BTCUSDT", "5m", limit=1500),
+            self._fetch_ohlcv_df_simple("ETHUSDT", "5m", limit=1500),
+            return_exceptions=False,
+        )
 
         ctx: dict = {}
 
-        # --- Open Interest / Funding (BTC & ETH) ---
+        # Choose a conservative "as-of" timestamp for gov features:
+        # use the earliest available last-closed 5m timestamp among BTC/ETH so we do not look ahead vs either.
+        decision_ts_gov = None
         try:
-            df_btc = await self._fetch_ohlcv_df_simple("BTCUSDT", "5m", limit=1500)
-            df_eth = await self._fetch_ohlcv_df_simple("ETHUSDT", "5m", limit=1500)
+            candidates = []
+            if df_btc is not None and not df_btc.empty:
+                candidates.append(df_btc.index[-1])
+            if df_eth is not None and not df_eth.empty:
+                candidates.append(df_eth.index[-1])
+            if candidates:
+                decision_ts_gov = min(candidates)
+        except Exception:
+            decision_ts_gov = None
 
-            # BTC open interest (z) and funding (latest)
-            oi_z_btc = await self._compute_oi_z("BTCUSDT", df_btc, resample_tf="1h")
-            ctx["oi_z_btc"] = float(oi_z_btc) if oi_z_btc is not None and np.isfinite(float(oi_z_btc)) else None
-            fr_btc = await self._fetch_funding_rate("BTCUSDT")
-            ctx["funding_rate_btc"] = float(fr_btc) if fr_btc is not None and np.isfinite(float(fr_btc)) else None
+        if df_btc is not None:
+            btc_feats = await self._build_oi_funding_features("BTCUSDT", df_btc)
+            if btc_feats:
+                if "funding_rate" in btc_feats:
+                    ctx["btc_funding_rate"] = float(btc_feats["funding_rate"])
+                if "oi_z_7d" in btc_feats:
+                    ctx["btc_oi_z_7d"] = float(btc_feats["oi_z_7d"])
 
-            # ETH open interest (z) and funding (latest)
-            oi_z_eth = await self._compute_oi_z("ETHUSDT", df_eth, resample_tf="1h")
-            ctx["oi_z_eth"] = float(oi_z_eth) if oi_z_eth is not None and np.isfinite(float(oi_z_eth)) else None
-            fr_eth = await self._fetch_funding_rate("ETHUSDT")
-            ctx["funding_rate_eth"] = float(fr_eth) if fr_eth is not None and np.isfinite(float(fr_eth)) else None
+        if df_eth is not None:
+            eth_feats = await self._build_oi_funding_features("ETHUSDT", df_eth)
+            if eth_feats:
+                if "funding_rate" in eth_feats:
+                    ctx["eth_funding_rate"] = float(eth_feats["funding_rate"])
+                if "oi_z_7d" in eth_feats:
+                    ctx["eth_oi_z_7d"] = float(eth_feats["oi_z_7d"])
 
-        except Exception as e:
-            LOG.warning("GOV_CTX: failed to compute OI/funding features: %s", e)
-
-        # --- Markov 4h regime probability (ETH) ---
-        # Required by some meta feature manifests as: markov_prob_up_4h (float in [0,1]) and markov_state_up_4h (0/1).
+        # ------------------------------------------------------------------
+        # Markov 4h regime probability on ETH close-to-close returns
+        # Required by manifest: markov_prob_up_4h (numeric, finite)
+        # Also provide markov_state_up_4h (categorical/int) if present in manifests.
+        # ------------------------------------------------------------------
         try:
-            # Pull enough 4h history to fit the MarkovRegression model.
             markov_limit = int(self.cfg.get("MARKOV4H_LIMIT", 500) or 500)
             df4 = await self._fetch_ohlcv_df_simple("ETHUSDT", "4h", limit=markov_limit)
 
             if df4 is not None and not df4.empty and len(df4) >= 60:
-                # Use close-to-close log returns.
-                close = df4["close"].astype(float)
-                ret = np.log(close).diff().dropna()
+                if decision_ts_gov is not None:
+                    df4 = df4.loc[df4.index <= decision_ts_gov]
+                if len(df4) >= 60:
+                    close = df4["close"].astype(float)
+                    ret = np.log(close).diff().dropna()
 
-                if len(ret) >= 50:
-                    # Two-regime Markov switching variance; matches regime_detector.compute_markov_regime_4h()
-                    mod = sm.tsa.MarkovRegression(ret, k_regimes=2, switching_variance=True, trend="c")
-                    res = mod.fit(disp=False)
+                    if len(ret) >= 50:
+                        alpha = float(self.cfg.get("MARKOV4H_PROB_EWMA_ALPHA", 0.2) or 0.2)
 
-                    filt_probs = [res.filtered_marginal_probabilities[i] for i in range(2)]
+                        mod = sm.tsa.MarkovRegression(ret, k_regimes=2, switching_variance=True, trend="c")
+                        res = mod.fit(disp=False, maxiter=200)
 
-                    # Identify UP regime as the one with higher weighted mean return.
-                    means = []
-                    for p in filt_probs:
-                        r = ret.reindex(p.index)
-                        w = p.astype(float).values
-                        rv = r.astype(float).values
-                        denom = float(np.sum(w))
-                        mu = float(np.sum(w * rv) / (denom if denom > 0 else 1.0))
-                        means.append(mu)
+                        # FILTERED (past-only) probs
+                        filt_probs = [res.filtered_marginal_probabilities[i] for i in range(2)]
 
-                    up_idx = int(np.argmax(means))
-                    prob_up = filt_probs[up_idx].clip(0.0, 1.0)
+                        # identify UP state as higher weighted mean return
+                        means = []
+                        for p in filt_probs:
+                            w = p.values
+                            r = ret.reindex(p.index).values
+                            denom = float(np.sum(w))
+                            mu = float(np.sum(w * r) / (denom if denom > 1e-12 else 1.0))
+                            means.append(mu)
 
-                    # EWMA smoothing to reduce jitter
-                    alpha = float(self.cfg.get("MARKOV4H_PROB_EWMA_ALPHA", 0.2) or 0.2)
-                    prob_up = prob_up.ewm(alpha=alpha, adjust=False).mean().clip(0.0, 1.0)
+                        up_idx = int(np.argmax(means))
+                        prob_up = filt_probs[up_idx].clip(0.0, 1.0)
+                        prob_up = prob_up.ewm(alpha=alpha, adjust=False).mean().clip(0.0, 1.0)
 
-                    # Latest fully-closed bar (df4 already drops the last partial bar in _fetch_ohlcv_df_simple)
-                    pu = float(prob_up.iloc[-1])
-                    su = int((pu > 0.5))
-
-                    if np.isfinite(pu):
-                        ctx["markov_prob_up_4h"] = pu
-                        ctx["markov_state_up_4h"] = su
-                        # Backwards-compat names sometimes used in older manifests
-                        ctx.setdefault("markov_state_4h", su)
+                        pu = float(prob_up.iloc[-1])
+                        if np.isfinite(pu):
+                            ctx["markov_prob_up_4h"] = pu
+                            ctx["markov_state_up_4h"] = int(pu > 0.5)
+                            # Some older variants use this name:
+                            ctx.setdefault("markov_state_4h", int(pu > 0.5))
 
         except Exception as e:
-            LOG.warning("GOV_CTX: failed to compute markov 4h regime: %s", e)
+            LOG.warning("GOV_CTX: Markov 4h computation failed: %s", e)
 
-        # Cache
         self._gov_ctx_cache = dict(ctx)
-        self._gov_ctx_cache_ts = now_ts
+        self._gov_ctx_cache_ts = now
         return ctx
+
 
 
     # ──────────────────────────────────────────────────────────────────────
