@@ -69,6 +69,16 @@ class ModelBundle:
     """Shim so joblib can unpickle research ModelBundle saved elsewhere."""
     pass
 
+def _tf_to_timedelta(tf: str) -> pd.Timedelta:
+    tf = tf.strip().lower()
+    if tf.endswith("m"):
+        return pd.Timedelta(minutes=int(tf[:-1]))
+    if tf.endswith("h"):
+        return pd.Timedelta(hours=int(tf[:-1]))
+    if tf.endswith("d"):
+        return pd.Timedelta(days=int(tf[:-1]))
+    raise ValueError(f"Unsupported timeframe: {tf}")
+
 def _hour_cyc(X):
     """Cyclical hour encoder: returns [sin(hour*2π/24), cos(hour*2π/24)]."""
     h = np.asarray(X).astype(float).reshape(-1, 1)
@@ -443,6 +453,10 @@ class LiveTrader:
                 LOG.warning("bundle=%s Golden features load failed (continuing without): %s", self.bundle_id, e)
                 self.golden_store = None
 
+            # --- NEW: regimes thresholds for deterministic meta feature codes (S2/S3/S4/S6, etc.)
+            self.regime_thresholds = self._load_regime_thresholds()
+            
+
 
 
 
@@ -464,20 +478,23 @@ class LiveTrader:
 
     async def _fetch_ohlcv_df_simple(self, symbol: str, tf: str, limit: int) -> Optional[pd.DataFrame]:
         """
-        Minimal OHLCV fetch -> DataFrame with UTC datetime index.
+        Minimal OHLCV fetch -> DataFrame with UTC datetime index at BAR CLOSE TIME.
         Drops the last (possibly incomplete) bar for as-of semantics.
         """
         try:
             ohlcv = await self.exchange.fetch_ohlcv(symbol, tf, limit=limit)
-            if not ohlcv or len(ohlcv) < 3:
+            if not ohlcv:
                 return None
             df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
-            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-            df.set_index("timestamp", inplace=True)
-            df = df.iloc[:-1]
-            return df if not df.empty else None
+            # ccxt timestamps are candle OPEN time; shift to CLOSE time for parity with offline/golden
+            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True) + _tf_to_timedelta(tf)
+            df = df.set_index("timestamp").sort_index()
+            # drop last possibly-incomplete bar
+            if len(df) > 1:
+                df = df.iloc[:-1]
+            return df
         except Exception as e:
-            LOG.debug("Context OHLCV fetch failed for %s %s: %s", symbol, tf, e)
+            LOG.debug("OHLCV fetch failed %s %s: %s", symbol, tf, e)
             return None
 
     async def _get_gov_ctx(self) -> dict:
@@ -521,6 +538,213 @@ class LiveTrader:
         self._gov_ctx_cache = dict(ctx)
         self._gov_ctx_cache_ts = now
         return ctx
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Regime thresholds + deterministic regime/set encoders (offline spec)
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _load_json_file(self, path: str) -> dict:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def _load_regime_thresholds(self) -> dict:
+        """
+        Load regimes_report.json thresholds (offline 02_make_regimes.py output) and crowd thresholds.
+
+        Sources (in priority order):
+          1) env DONCH_REGIMES_REPORT / cfg REGIMES_REPORT_PATH
+          2) env DONCH_CROWD_THRESHOLDS / cfg CROWD_THRESHOLDS_PATH (optional)
+          3) cfg CROWD_Z_HIGH / CROWD_Z_LOW defaults
+        """
+        thresholds: dict = {}
+
+        report_path = os.getenv("DONCH_REGIMES_REPORT") or str(self.cfg.get("REGIMES_REPORT_PATH", "")).strip()
+        if report_path and os.path.exists(report_path):
+            j = self._load_json_file(report_path)
+            thresholds = dict(j.get("thresholds", {}) or {})
+            LOG.info(
+                "bundle=%s Loaded regimes_report thresholds from %s (keys=%d)",
+                getattr(self, "bundle_id", None) or "no_bundle",
+                report_path,
+                len(thresholds),
+            )
+        else:
+            LOG.warning(
+                "bundle=%s regimes_report.json not found (set DONCH_REGIMES_REPORT or REGIMES_REPORT_PATH). "
+                "S3/S6/regime helpers may be unavailable.",
+                getattr(self, "bundle_id", None) or "no_bundle",
+            )
+
+        # crowd thresholds: prefer embedded in regimes_report thresholds, else separate file
+        crowd_path = os.getenv("DONCH_CROWD_THRESHOLDS") or str(self.cfg.get("CROWD_THRESHOLDS_PATH", "")).strip()
+        if ("crowd_z_high" not in thresholds) or ("crowd_z_low" not in thresholds):
+            if crowd_path and os.path.exists(crowd_path):
+                cj = self._load_json_file(crowd_path)
+                if "crowd_z_high" in cj:
+                    thresholds["crowd_z_high"] = cj["crowd_z_high"]
+                if "crowd_z_low" in cj:
+                    thresholds["crowd_z_low"] = cj["crowd_z_low"]
+                LOG.info(
+                    "bundle=%s Loaded crowd thresholds from %s",
+                    getattr(self, "bundle_id", None) or "no_bundle",
+                    crowd_path,
+                )
+
+        # final fallback: config defaults
+        thresholds.setdefault("crowd_z_high", float(self.cfg.get("CROWD_Z_HIGH", 1.0)))
+        thresholds.setdefault("crowd_z_low", float(self.cfg.get("CROWD_Z_LOW", -1.0)))
+        return thresholds
+
+    def _funding_regime_code(self, funding_rate: float) -> int:
+        eps = float(self.regime_thresholds.get("funding_neutral_eps", 1e-8))
+        fr = float(funding_rate)
+        if fr <= -eps:
+            return -1
+        if fr >= eps:
+            return 1
+        return 0
+
+    def _oi_regime_code(self, meta: dict) -> int:
+        """
+        oi_regime_code from x = oi_z_7d or oi_pct_1d using thresholds oi_q33/oi_q66 and oi_source.
+        """
+        q33 = float(self.regime_thresholds["oi_q33"])
+        q66 = float(self.regime_thresholds["oi_q66"])
+        src = str(self.regime_thresholds.get("oi_source", "oi_z_7d"))
+        x = meta.get(src)
+        if x is None:
+            x = meta.get("oi_z_7d")
+        if x is None:
+            x = meta.get("oi_pct_1d", 0.0)
+        x = float(x)
+
+        if x <= q33:
+            return -1
+        if x >= q66:
+            return 1
+        return 0
+
+    def _trend_regime_code_1d(self, trend_regime_1d: Optional[str], regime_code_1d: int) -> int:
+        if trend_regime_1d:
+            s = str(trend_regime_1d).upper()
+            return 1 if "BULL" in s else 0
+        return 1 if int(regime_code_1d) in (2, 3) else 0
+
+    def _vol_regime_code_1d(
+        self,
+        vol_regime_1d: Optional[str],
+        vol_prob_low_1d: Optional[float],
+        regime_code_1d: int,
+    ) -> int:
+        if vol_regime_1d:
+            s = str(vol_regime_1d).upper()
+            return 0 if "LOW" in s else 1
+        if vol_prob_low_1d is not None:
+            return 0 if float(vol_prob_low_1d) >= 0.5 else 1
+        # fallback from regime_code_1d: low-vol regimes are 1,3; high-vol regimes are 0,2
+        return 0 if int(regime_code_1d) in (1, 3) else 1
+
+    def _tercile_code(self, x: float, q33: float, q66: float) -> int:
+        x = float(x)
+        if x <= float(q33):
+            return 0
+        if x < float(q66):
+            return 1
+        return 2
+
+    def _augment_meta_with_regime_sets(self, meta_full: dict) -> None:
+        """
+        Mutates meta_full in-place. Adds:
+          funding_regime_code, oi_regime_code, crowd_side,
+          S1/S2/S3/S4/S6 when prerequisites are present.
+
+        This is deterministic and mirrors offline logic as provided by the offline team.
+        """
+        if not getattr(self, "regime_thresholds", None):
+            return
+
+        # funding_regime_code prereq: funding_rate
+        if "funding_rate" in meta_full:
+            frc = self._funding_regime_code(float(meta_full["funding_rate"]))
+            meta_full["funding_regime_code"] = float(frc)
+
+        # oi_regime_code prereqs: oi_z_7d or oi_pct_1d
+        try:
+            oic = self._oi_regime_code(meta_full)
+            meta_full["oi_regime_code"] = float(oic)
+        except Exception:
+            pass
+
+        # crowd_side prereqs: oi_z_7d, funding_z_7d, thresholds crowd_z_high/low
+        try:
+            cz_hi = float(self.regime_thresholds["crowd_z_high"])
+            cz_lo = float(self.regime_thresholds["crowd_z_low"])
+            oi_z = float(meta_full.get("oi_z_7d", 0.0) or 0.0)
+            fz = float(meta_full.get("funding_z_7d", 0.0) or 0.0)
+
+            crowd_side = 0
+            if (oi_z >= cz_hi) and (fz >= cz_hi):
+                crowd_side = 1
+            elif (oi_z >= cz_hi) and (fz <= cz_lo):
+                crowd_side = -1
+            meta_full["crowd_side"] = float(crowd_side)
+        except Exception:
+            pass
+
+        # S3_funding_x_oi prereqs: funding_regime_code, oi_regime_code
+        if "funding_regime_code" in meta_full and "oi_regime_code" in meta_full:
+            frc = int(float(meta_full["funding_regime_code"]))
+            oic = int(float(meta_full["oi_regime_code"]))
+            meta_full["S3_funding_x_oi"] = float((frc + 1) * 3 + (oic + 1))
+
+        # The remaining features need regime_code_1d + markov_state_4h + vol_prob_low_1d etc.
+        # Only compute them when those prereqs exist (to avoid KeyError).
+        if "regime_code_1d" in meta_full:
+            try:
+                rc = int(float(meta_full["regime_code_1d"]))  # IMPORTANT: must be numeric in live (fix separately)
+            except Exception:
+                rc = None
+
+            if rc is not None:
+                meta_full["S1_regime_code_1d"] = float(rc)
+
+                # trend/vol regime codes (fallback chain)
+                tr_str = meta_full.get("trend_regime_1d", None)
+                vr_str = meta_full.get("vol_regime_1d", None)
+                vpl = meta_full.get("vol_prob_low_1d", None)
+
+                trc = self._trend_regime_code_1d(tr_str, rc)
+                vrc = self._vol_regime_code_1d(vr_str, (float(vpl) if vpl is not None else None), rc)
+
+                meta_full["trend_regime_code_1d"] = float(trc)
+                meta_full["vol_regime_code_1d"] = float(vrc)
+
+                # S2_markov_x_vol1d prereqs: markov_state_4h
+                if "markov_state_4h" in meta_full:
+                    ms = int(float(meta_full["markov_state_4h"]))
+                    meta_full["S2_markov_x_vol1d"] = float(ms * 2 + int(vrc))
+
+                # S4_crowd_x_trend1d prereqs: crowd_side + trend_regime_code_1d
+                if "crowd_side" in meta_full and "trend_regime_code_1d" in meta_full:
+                    cs = int(float(meta_full["crowd_side"]))
+                    meta_full["S4_crowd_x_trend1d"] = float((cs + 1) * 2 + int(trc))
+
+        # S6_fresh_x_compress prereqs: days_since_prev_break + consolidation_range_atr + thresholds
+        if ("days_since_prev_break" in meta_full) and ("consolidation_range_atr" in meta_full):
+            try:
+                fresh_q33 = float(self.regime_thresholds["fresh_q33"])
+                fresh_q66 = float(self.regime_thresholds["fresh_q66"])
+                comp_q33 = float(self.regime_thresholds["compression_q33"])
+                comp_q66 = float(self.regime_thresholds["compression_q66"])
+
+                fresh = float(meta_full["days_since_prev_break"])
+                comp = float(meta_full["consolidation_range_atr"])
+                fcode = self._tercile_code(fresh, fresh_q33, fresh_q66)
+                ccode = self._tercile_code(comp, comp_q33, comp_q66)
+
+                meta_full["S6_fresh_x_compress"] = float(fcode * 3 + ccode)
+            except Exception:
+                pass
 
 
     def _score_winprob_safe(self, symbol: str, meta_row: dict) -> Optional[float]:
@@ -1131,9 +1355,6 @@ class LiveTrader:
             # --- NEW: OI + Funding features (13) ----------
             oi_feats = await self._build_oi_funding_features(symbol, df5)
 
-            # --- NEW: OI + Funding features (13) ----------
-            oi_feats = await self._build_oi_funding_features(symbol, df5)
-
             # Build a superset dict, then FILTER to manifest columns before scoring.
             meta_full = {
                 # existing numerics you already compute
@@ -1177,13 +1398,16 @@ class LiveTrader:
             # Merge asset OI/funding features
             meta_full.update(oi_feats or {})
 
-            # Merge cycle-level BTC/ETH context features (if provided)
             if isinstance(gov_ctx, dict) and gov_ctx:
                 meta_full.update(gov_ctx)
+
+            # --- NEW: deterministic regime/set features + S-features (offline spec)
+            self._augment_meta_with_regime_sets(meta_full)
 
             # Filter strictly to the manifest-required raw features
             required = list(getattr(self.winprob, "raw_features", []) or [])
             meta_row = {k: meta_full[k] for k in required if k in meta_full}
+
 
             # --- Golden row injector (parity testing only) ---
             try:
@@ -1204,11 +1428,6 @@ class LiveTrader:
             except Exception as _e:
                 # Never break scanning because of parity tooling.
                 pass
-
-            # -------------- Score meta (even on rejects) ----------
-            p = self._score_winprob_safe(symbol, meta_row)
-
-
 
             # -------------- Score meta (even on rejects) ----------
             p = self._score_winprob_safe(symbol, meta_row)
