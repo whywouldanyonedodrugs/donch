@@ -219,93 +219,239 @@ class RiskManager:
 
 class RegimeDetector:
     """
-    Calculates and caches the market regime based on a live benchmark asset.
+    Computes a daily combined regime on a benchmark symbol and exposes:
+      - trend_regime_1d (str)
+      - vol_regime_1d (str)
+      - vol_prob_low_1d (float)
+      - regime_code_1d (int)
+      - markov_state_4h (int)
+      - markov_prob_up_4h (float)
+
+    These are intended to be injected into gov_ctx so the meta feature builder
+    can satisfy the feature_manifest schema.
     """
-    def __init__(self, exchange, config: dict):
+
+    def __init__(self, exchange, benchmark_symbol="BTCUSDT", cache_minutes: int = 60):
         self.exchange = exchange
-        self.cfg = config
-        self.benchmark_symbol = self.cfg.get("REGIME_BENCHMARK_SYMBOL", "BTCUSDT")
-        self.cache_duration = timedelta(minutes=self.cfg.get("REGIME_CACHE_MINUTES", 60))
-        self.cached_regime = "UNKNOWN"
-        self.last_calculation_time = None
-        LOG.info(
-            "RegimeDetector initialized for benchmark %s with a %d-minute cache.",
-            self.benchmark_symbol, self.cfg.get("REGIME_CACHE_MINUTES", 60)
-        )
+        self.benchmark_symbol = benchmark_symbol
+        self.cache_minutes = cache_minutes
 
-    async def _fetch_benchmark_data(self) -> pd.DataFrame | None:
-        """Fetches the last ~500 days of daily OHLCV data for the benchmark symbol."""
-        try:
-            ohlcv = await self.exchange.fetch_ohlcv(self.benchmark_symbol, '1d', limit=500)
-            if len(ohlcv) < 200:
-                LOG.warning("Not enough historical data for %s to calculate regime (%d bars).",
-                            self.benchmark_symbol, len(ohlcv))
-                return None
-            df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
-            df.set_index('timestamp', inplace=True)
+        self.last_update = None
+        self.cached_regime = None
+
+        # Latest primitives (populated on successful recompute)
+        self.latest_meta = {
+            "trend_regime_1d": None,
+            "vol_regime_1d": None,
+            "vol_prob_low_1d": None,
+            "regime_code_1d": None,
+            "markov_state_4h": None,
+            "markov_prob_up_4h": None,
+            "daily_regime_str_1d": None,
+        }
+
+    def _cache_expired(self) -> bool:
+        if self.last_update is None:
+            return True
+        return (datetime.now(timezone.utc) - self.last_update).total_seconds() > (self.cache_minutes * 60)
+
+    def get_latest_meta_features(self) -> dict:
+        # Return a shallow copy so callers can safely update() it.
+        return dict(self.latest_meta)
+
+    def _to_ohlcv_df(self, ohlcv) -> pd.DataFrame:
+        df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
+        df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+        df = df.set_index("ts").sort_index()
+        df = df[~df.index.duplicated(keep="last")]
+        return df
+
+    def _drop_incomplete_last_bar(self, df: pd.DataFrame, tf: str, asof_ts: pd.Timestamp) -> pd.DataFrame:
+        """
+        CCXT candles are typically timestamped at bar OPEN.
+        If the last bar open is >= floor(tf) of asof_ts, it is the currently-forming bar and should be excluded.
+        """
+        if df.empty:
             return df
-        except Exception as e:
-            LOG.error("Failed to fetch benchmark data for regime detection: %s", e)
-            return None
-
-    def _calculate_vol_regime(self, daily_returns: pd.Series) -> pd.Series:
-        """Volatility regime via Markov Switching (2 states)."""
-        try:
-            model = sm.tsa.MarkovRegression(daily_returns.dropna(), k_regimes=2, switching_variance=True)
-            results = model.fit(disp=False)
-            low_vol_regime_idx = np.argmin(results.params[-2:])
-            vol_regimes = np.where(
-                results.smoothed_marginal_probabilities[low_vol_regime_idx] > 0.5,
-                "LOW_VOL", "HIGH_VOL"
-            )
-            return pd.Series(vol_regimes, index=daily_returns.dropna().index, name="vol_regime")
-        except Exception as e:
-            LOG.warning("Markov vol regime failed: %s. Defaulting to UNKNOWN.", e)
-            return pd.Series("UNKNOWN", index=daily_returns.index, name="vol_regime")
+        if tf == "1d":
+            floor = asof_ts.floor("D")
+        elif tf == "4h":
+            floor = asof_ts.floor("4H")
+        else:
+            return df
+        if df.index[-1] >= floor:
+            return df.iloc[:-1]
+        return df
 
     def _calculate_trend_regime(self, df_daily: pd.DataFrame) -> pd.Series:
-        """Trend regime via TMA ± Keltner (ATR×mult)."""
-        df_daily['tma'] = triangular_moving_average(df_daily['close'], self.cfg.get("REGIME_MA_PERIOD", 100))
-        atr_series = ta.atr(df_daily, period=self.cfg.get("REGIME_ATR_PERIOD", 20))
-        df_daily['keltner_upper'] = df_daily['tma'] + (atr_series * self.cfg.get("REGIME_ATR_MULT", 2.0))
-        df_daily['keltner_lower'] = df_daily['tma'] - (atr_series * self.cfg.get("REGIME_ATR_MULT", 2.0))
-        df_daily.dropna(inplace=True)
+        # Same logic as your existing implementation (kept for parity with your current code)
+        close = df_daily["close"]
+        high = df_daily["high"]
+        low = df_daily["low"]
 
-        trend = pd.Series(np.nan, index=df_daily.index, dtype="object")
-        for i in range(1, len(df_daily)):
-            if df_daily['close'].iloc[i] > df_daily['keltner_upper'].iloc[i]:
-                trend.iloc[i] = "BULL"
-            elif df_daily['close'].iloc[i] < df_daily['keltner_lower'].iloc[i]:
-                trend.iloc[i] = "BEAR"
+        mid = (high + low) / 2.0
+        tma20 = triangular_moving_average(mid, 20)
+
+        atr20 = ta.atr(df_daily, 20)
+        upper = tma20 + (1.5 * atr20)
+        lower = tma20 - (1.5 * atr20)
+
+        trend = pd.Series(index=df_daily.index, dtype="object")
+        trend[:] = "RANGE"
+        trend[close > upper] = "BULL"
+        trend[close < lower] = "BEAR"
+        return trend
+
+    def _calculate_vol_regime_and_prob(self, daily_returns: pd.Series) -> tuple[pd.Series, pd.Series]:
+        """
+        Fits MarkovRegression(k_regimes=2, switching_variance=True) and returns:
+          - vol_regime: LOW_VOL / HIGH_VOL (by low-prob > 0.5)
+          - vol_prob_low: P(low-vol regime), smoothed
+        Uses weighted variance to identify which regime is "low vol" (robust).
+        """
+        rets = daily_returns.dropna()
+        if len(rets) < 200:
+            # Too little data for stable 2-state regime; return NaNs aligned to rets
+            vol_regime = pd.Series(index=rets.index, data=np.nan, name="vol_regime")
+            vol_prob_low = pd.Series(index=rets.index, data=np.nan, name="vol_prob_low")
+            return vol_regime, vol_prob_low
+
+        model = sm.tsa.MarkovRegression(rets, k_regimes=2, switching_variance=True, trend="c")
+        res = model.fit(disp=False, maxiter=200)
+
+        probs = res.smoothed_marginal_probabilities
+        if not isinstance(probs, pd.DataFrame) or probs.shape[1] != 2:
+            vol_regime = pd.Series(index=rets.index, data=np.nan, name="vol_regime")
+            vol_prob_low = pd.Series(index=rets.index, data=np.nan, name="vol_prob_low")
+            return vol_regime, vol_prob_low
+
+        # Weighted variance per regime to decide which state is low-vol
+        var_est = []
+        r = rets.values
+        for i in range(2):
+            p = probs[i].reindex(rets.index).fillna(0.0).values
+            denom = np.sum(p)
+            if denom <= 0:
+                var_est.append(np.inf)
+                continue
+            mu = float(np.sum(p * r) / denom)
+            v = float(np.sum(p * (r - mu) ** 2) / denom)
+            var_est.append(v)
+
+        low_idx = int(np.argmin(var_est))
+        low_prob = probs[low_idx].reindex(rets.index).astype(float).clip(0.0, 1.0)
+
+        vol_regime = pd.Series(
+            index=rets.index,
+            data=np.where(low_prob.values > 0.5, "LOW_VOL", "HIGH_VOL"),
+            name="vol_regime",
+        )
+        vol_prob_low = pd.Series(index=rets.index, data=low_prob.values, name="vol_prob_low")
+        return vol_regime, vol_prob_low
+
+    def _calculate_markov_4h_state_and_prob(self, df4h: pd.DataFrame) -> tuple[int | None, float | None]:
+        """
+        4h Markov regime on pct returns:
+          - markov_state_4h: 1 if P(up-regime) > 0.5 else 0
+          - markov_prob_up_4h: P(up-regime)
+        Uses FILTERED probabilities (no smoothing / no lookahead).
+        """
+        if df4h is None or df4h.empty or len(df4h) < 300:
+            return None, None
+
+        rets = df4h["close"].pct_change().dropna()
+        if len(rets) < 300:
+            return None, None
+
+        model = sm.tsa.MarkovRegression(rets, k_regimes=2, switching_variance=True, trend="c")
+        res = model.fit(disp=False, maxiter=200)
+
+        probs = res.filtered_marginal_probabilities
+        if not isinstance(probs, pd.DataFrame) or probs.shape[1] != 2:
+            return None, None
+
+        r = rets.values
+        means = []
+        for i in range(2):
+            p = probs[i].reindex(rets.index).fillna(0.0).values
+            denom = np.sum(p)
+            if denom <= 0:
+                means.append(-np.inf)
             else:
-                trend.iloc[i] = trend.iloc[i-1]
-        return trend.ffill().bfill()
+                means.append(float(np.sum(p * r) / denom))
 
-    async def get_current_regime(self) -> str:
-        now = datetime.now(timezone.utc)
-        if self.last_calculation_time and (now - self.last_calculation_time) < self.cache_duration:
+        up_idx = int(np.argmax(means))
+        prob_up = probs[up_idx].reindex(rets.index).astype(float).clip(0.0, 1.0)
+
+        last_prob = float(prob_up.iloc[-1])
+        last_state = int(last_prob > 0.5)
+        return last_state, last_prob
+
+    async def get_current_regime(self, asof_ts: pd.Timestamp | None = None) -> str:
+        if asof_ts is None:
+            asof_ts = pd.Timestamp(datetime.now(timezone.utc))
+
+        if not self._cache_expired() and self.cached_regime is not None:
             return self.cached_regime
 
         LOG.info("Regime cache expired/empty. Recomputing…")
-        self.last_calculation_time = now
+        try:
+            # DAILY
+            ohlcv_d = await self.exchange.fetch_ohlcv(self.benchmark_symbol, timeframe="1d", limit=600)
+            df_d = self._to_ohlcv_df(ohlcv_d)
+            df_d = self._drop_incomplete_last_bar(df_d, "1d", asof_ts)
 
-        df_daily = await self._fetch_benchmark_data()
-        if df_daily is None:
-            self.cached_regime = "UNKNOWN"
+            if len(df_d) < 250:
+                raise RuntimeError(f"Not enough daily bars for regime ({len(df_d)})")
+
+            df_d["trend_regime"] = self._calculate_trend_regime(df_d)
+
+            daily_returns = df_d["close"].pct_change()
+            vol_regime, vol_prob_low = self._calculate_vol_regime_and_prob(daily_returns.dropna())
+
+            df_d.loc[vol_regime.index, "vol_regime"] = vol_regime
+            df_d.loc[vol_prob_low.index, "vol_prob_low"] = vol_prob_low
+
+            df_d["combined_regime"] = df_d["trend_regime"].astype(str) + "_" + df_d["vol_regime"].astype(str)
+
+            df_ok = df_d.dropna(subset=["trend_regime", "vol_regime", "vol_prob_low", "combined_regime"])
+            if df_ok.empty:
+                raise RuntimeError("No valid daily regime rows after dropna")
+
+            last = df_ok.iloc[-1]
+            combined = str(last["combined_regime"])
+
+            code_map = {"BEAR_HIGH_VOL": 0, "BEAR_LOW_VOL": 1, "BULL_HIGH_VOL": 2, "BULL_LOW_VOL": 3}
+            regime_code = code_map.get(combined, None)
+
+            # 4H Markov (benchmark)
+            ohlcv_4h = await self.exchange.fetch_ohlcv(self.benchmark_symbol, timeframe="4h", limit=900)
+            df4h = self._to_ohlcv_df(ohlcv_4h)
+            df4h = self._drop_incomplete_last_bar(df4h, "4h", asof_ts)
+            m_state, m_prob = self._calculate_markov_4h_state_and_prob(df4h)
+
+            # Publish cache
+            self.cached_regime = combined
+            self.last_update = datetime.now(timezone.utc)
+
+            self.latest_meta["trend_regime_1d"] = str(last["trend_regime"])
+            self.latest_meta["vol_regime_1d"] = str(last["vol_regime"])
+            self.latest_meta["vol_prob_low_1d"] = float(last["vol_prob_low"])
+            self.latest_meta["daily_regime_str_1d"] = combined
+            self.latest_meta["regime_code_1d"] = int(regime_code) if regime_code is not None else None
+            self.latest_meta["markov_state_4h"] = int(m_state) if m_state is not None else None
+            self.latest_meta["markov_prob_up_4h"] = float(m_prob) if m_prob is not None else None
+
+            LOG.info(f"New market regime: {self.cached_regime}")
             return self.cached_regime
 
-        daily_returns = df_daily['close'].pct_change()
-        df_daily['vol_regime'] = self._calculate_vol_regime(daily_returns)
-        df_daily['trend_regime'] = self._calculate_trend_regime(df_daily)
-        df_daily.dropna(subset=['vol_regime','trend_regime'], inplace=True)
-        if df_daily.empty:
-            self.cached_regime = "UNKNOWN"
+        except Exception as e:
+            LOG.warning(f"Regime detector error: {e!r}")
+            # Do not update cached_regime on failure; keep previous if any.
+            if self.cached_regime is None:
+                self.cached_regime = "UNKNOWN"
             return self.cached_regime
 
-        self.cached_regime = f"{df_daily['trend_regime'].iloc[-1]}_{df_daily['vol_regime'].iloc[-1]}"
-        LOG.info("New market regime: %s", self.cached_regime)
-        return self.cached_regime
 
 ###############################################################################
 # 6 ▸ SIGNAL DATACLASS ########################################################
@@ -1560,8 +1706,9 @@ class LiveTrader:
             self._augment_meta_with_regime_sets(meta_full)
 
             required = list(getattr(self.winprob, "raw_features", []) or [])
-            num_cols = set(getattr(self.winprob, "numeric_cols", []) or [])
-            cat_cols = set(getattr(self.winprob, "cat_cols", []) or [])
+            num_cols = set(getattr(self.winprob, "numeric_cols", getattr(self.winprob, "raw_num_cols", [])) or [])
+            cat_cols = set(getattr(self.winprob, "cat_cols", getattr(self.winprob, "raw_cat_cols", [])) or [])
+
 
             meta_row = {}
             for k in required:
@@ -1674,28 +1821,17 @@ class LiveTrader:
                 pstar_disp = "None" if pstar is None else f"{float(pstar):.2f}"
                 p_disp = "None" if p_cal is None else f"{float(p_cal):.3f}"
 
-                diag = (
-                    f"\n--- {symbol} | {df5.index[-1].strftime('%Y-%m-%d %H:%M')} UTC ---\n"
-                    f"[Strategy verdict] should_enter={should_enter}"
-                    f"{'  why=' + str(why) if why is not None else ''}\n"
-                    f"[Inputs]\n"
-                    f"  Price: {last['close']:.6f}\n"
-                    f"  ATR1h: {last['atr_1h']:.6f} ({atr_pct*100:.3f}%)  RSI1h: {last['rsi_1h']:.2f}  ADX1h: {last['adx_1h']:.2f}\n"
-                    f"  RS pct: {rs_pct:.1f}%  Liquidity(24h med USD): {liq_usd:,.0f} (thr {liq_thr:,.0f})\n"
-                    f"  ETH MACD(4h) hist: {eth_hist:.4f}  macd>signal: {bool(eth_above)}  → regime_up={bool(regime_up)}\n"
-                    f"  Donch({don_len}d prev) upper: {don_level:.6f}  dist_atr={don_dist_atr:+.3f}\n"
-                    f"  Vol mult (median {int(self.cfg.get('VOL_LOOKBACK_DAYS',30))}d): x{vol_mult:.2f}\n"
-                    f"  Pullback/Entry: {pullback_type} + {entry_rule}\n"
-                    f"[Gates]\n"
-                    f"  RS≥{rs_min:.0f} ............. {_ok(g_rs)}\n"
-                    f"  Liquidity≥{liq_thr:,.0f} ..... {_ok(g_liq)}\n"
-                    f"  RegimeUp / not blocked ...... {_ok(g_regime)} (block_when_down={regime_block})\n"
-                    f"  Volume spike x{vol_needed:.1f} .... {_ok(g_vol)}\n"
-                    f"  Micro-ATR min ............... {_ok(g_micro)} (min={float(self.cfg.get('ENTRY_MIN_ATR_PCT',0.0)):.5f})\n"
-                    f"  META: p*={pstar_disp},  p={p_disp} → {_ok(g_meta)}\n"
-                    f"===================================================="
+                LOG.debug(
+                    (
+                        f"\n--- {symbol} | {df5.index[-1].strftime('%Y-%m-%d %H:%M')} UTC ---\n"
+                        f"[Strategy verdict] should_enter={should_enter}"
+                        f"{'  why=' + str(why) if why is not None else ''}\n"
+                        f"[Gates]\n"
+                        f"  META: p*={pstar_disp},  p={p_disp} → {_ok(g_meta)}\n"
+                        f"===================================================="
+                    )
                 )
-                LOG.debug(diag)
+
 
 
             # If rules say NO, stop here (we already printed p/p*)
@@ -2903,6 +3039,8 @@ class LiveTrader:
                 gov_ctx = {}
                 try:
                     gov_ctx = await self._get_gov_ctx()
+                    gov_ctx.update(self.regime_detector.get_latest_meta_features())
+
                 except Exception as e:
                     LOG.warning("Gov context build failed: %s", e)
                     gov_ctx = {}
