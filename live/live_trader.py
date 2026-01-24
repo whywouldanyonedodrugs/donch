@@ -1167,7 +1167,7 @@ class LiveTrader:
     ) -> Optional[Signal]:
         LOG.info("Checking %s...", symbol)
 
-        reg_label = str(current_market_regime).upper().strip()
+        reg_label = str(market_regime).upper().strip()
         reg_code = REGIME_CODE_MAP.get(reg_label)
 
         if reg_code is None:
