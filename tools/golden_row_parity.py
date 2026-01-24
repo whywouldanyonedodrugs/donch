@@ -1,147 +1,239 @@
 #!/usr/bin/env python3
+"""
+Golden row parity / bundle scoring sanity check.
+
+- loads the meta bundle (feature_manifest + model + calibration)
+- loads a fixture Parquet containing golden raw feature rows
+- validates each row against the bundle's strict schema
+- scores each row and (optionally) compares p_raw / p_cal to columns in the fixture, if present
+
+Run:
+  python tools/golden_row_parity.py --bundle_dir results/meta_export --fixture results/meta_export/golden_features.parquet
+"""
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
-import numpy as np
 import pandas as pd
 
-
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[1]
-
-
-def _ensure_repo_on_syspath(repo_root: Path) -> None:
-    s = str(repo_root)
-    if s not in sys.path:
-        sys.path.insert(0, s)
+# Ensure repo root is importable when running as "python tools/..."
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 
-def _load_fixture(path: Path) -> pd.DataFrame:
-    if path.suffix.lower() in {".parquet", ".pq"}:
-        return pd.read_parquet(path)
-    if path.suffix.lower() == ".csv":
-        return pd.read_csv(path, low_memory=False)
-    raise ValueError(f"Unsupported fixture format: {path.suffix} (use .parquet or .csv)")
+def _as_float(x: Any) -> Optional[float]:
+    if x is None:
+        return None
+    try:
+        if pd.isna(x):
+            return None
+    except Exception:
+        pass
+
+    if isinstance(x, (int, float)):
+        return float(x)
+
+    if isinstance(x, bool):
+        # caller may pass bool-like values; convert to 0/1 numeric
+        return 1.0 if x else 0.0
+
+    if isinstance(x, str):
+        s = x.strip().lower()
+        if s in ("true", "t", "yes", "y", "1"):
+            return 1.0
+        if s in ("false", "f", "no", "n", "0"):
+            return 0.0
+        try:
+            return float(x)
+        except Exception:
+            return None
+
+    try:
+        return float(x)
+    except Exception:
+        return None
 
 
-def _pick_ts_col(df: pd.DataFrame, explicit: Optional[str] = None) -> str:
-    if explicit is not None:
-        if explicit not in df.columns:
-            raise KeyError(f"--ts_col={explicit} not found in fixture columns")
-        return explicit
-    for c in ("decision_ts", "asof_ts", "ts", "timestamp", "time", "datetime", "entry_ts"):
-        if c in df.columns:
-            return c
-    raise KeyError("Could not infer timestamp column. Provide --ts_col.")
+def _as_str(x: Any) -> Optional[str]:
+    if x is None:
+        return None
+    try:
+        if pd.isna(x):
+            return None
+    except Exception:
+        pass
+    return str(x)
+
+
+def _fmt(x: Any, nd: int = 6) -> str:
+    try:
+        if x is None:
+            return "None"
+        xf = float(x)
+        if not math.isfinite(xf):
+            if math.isnan(xf):
+                return "nan"
+            return "inf" if xf > 0 else "-inf"
+        return f"{xf:.{nd}f}"
+    except Exception:
+        return repr(x)
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Golden-row parity: validate bundle scorer vs golden fixture outputs.")
-    ap.add_argument("--bundle_dir", required=True, help="Bundle directory (e.g., results/meta_export)")
-    ap.add_argument("--fixture", required=True, help="Golden fixture (.parquet or .csv)")
-    ap.add_argument("--max_rows", type=int, default=2000, help="Max rows to check")
-    ap.add_argument("--ts_col", default=None, help="Timestamp column name in fixture (optional)")
-    ap.add_argument("--symbol_col", default="symbol", help="Symbol column name in fixture")
-    ap.add_argument("--p_raw_col", default="p_raw", help="Expected raw prob col (optional)")
-    ap.add_argument("--p_cal_col", default="p_cal", help="Expected calibrated prob col (optional)")
-    ap.add_argument("--rtol", type=float, default=1e-6)
-    ap.add_argument("--atol", type=float, default=1e-8)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--bundle_dir", required=True, help="Path to exported meta bundle dir.")
+    ap.add_argument("--fixture", required=True, help="Path to golden fixture parquet.")
+    ap.add_argument("--max_rows", type=int, default=0, help="Limit rows processed (0 = all).")
+    ap.add_argument("--symbol", default="", help="Optional symbol filter if fixture has a 'symbol' column.")
+    ap.add_argument("--ts_col", default="", help="Optional timestamp column name to show in output.")
+    ap.add_argument("--quiet", action="store_true", help="Only print summary.")
     args = ap.parse_args()
-
-    repo_root = _repo_root()
-    _ensure_repo_on_syspath(repo_root)
-
-    # Import in proper package context (fixes relative imports inside live/*)
-    from live.artifact_bundle import BundleError, SchemaError, load_bundle  # type: ignore
-    from live.winprob_loader import WinProbScorer  # type: ignore
 
     bundle_dir = Path(args.bundle_dir).resolve()
     fixture_path = Path(args.fixture).resolve()
+    if not bundle_dir.exists():
+        print(f"ERROR: bundle_dir does not exist: {bundle_dir}")
+        return 2
+    if not fixture_path.exists():
+        print(f"ERROR: fixture does not exist: {fixture_path}")
+        return 2
 
-    df = _load_fixture(fixture_path)
+    # Import from the same code-path as the service.
+    from live.winprob_loader import WinProbScorer, SchemaError  # type: ignore
+
+    try:
+        scorer = WinProbScorer(str(bundle_dir))
+    except Exception as e:
+        print(f"ERROR: failed to initialize WinProbScorer from {bundle_dir}: {e!r}")
+        return 2
+
+    df = pd.read_parquet(fixture_path)
+    if args.symbol and "symbol" in df.columns:
+        df = df[df["symbol"].astype(str) == args.symbol].copy()
+
     if df.empty:
-        raise RuntimeError("Fixture dataframe is empty.")
+        print("No rows to process (empty fixture or filter removed everything).")
+        return 0
 
-    if args.symbol_col not in df.columns:
-        raise KeyError(f"Fixture missing required column: {args.symbol_col}")
+    if args.max_rows and args.max_rows > 0:
+        df = df.head(args.max_rows).copy()
 
-    ts_col = _pick_ts_col(df, args.ts_col)
-    df[ts_col] = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
-    df = df.dropna(subset=[ts_col])
+    raw_features = list(scorer.raw_features)
+    spec_by_name = getattr(scorer, "_raw_spec_by_name", {})  # internal mapping (used by the service too)
 
-    bundle = load_bundle(str(bundle_dir))
-    scorer = WinProbScorer(bundle=bundle, strict_schema=True)
-
-    required = list(getattr(scorer, "raw_features", []) or [])
-    if not required:
-        raise RuntimeError("scorer.raw_features is empty")
-
-    numeric_cols = set(getattr(scorer, "numeric_cols", []) or [])
-    cat_cols = set(getattr(scorer, "cat_cols", []) or [])
-
-    missing_cols = [c for c in required if c not in df.columns]
+    missing_cols = [c for c in raw_features if c not in df.columns]
     if missing_cols:
-        raise RuntimeError(f"Fixture missing {len(missing_cols)} required feature columns. First 10: {missing_cols[:10]}")
+        print("ERROR: fixture missing required raw feature columns:")
+        for c in missing_cols[:50]:
+            print(f"  - {c}")
+        if len(missing_cols) > 50:
+            print(f"  ... ({len(missing_cols)-50} more)")
+        return 2
 
-    has_p_raw = args.p_raw_col in df.columns
-    has_p_cal = args.p_cal_col in df.columns
+    has_p_raw = "p_raw" in df.columns
+    has_p_cal = "p_cal" in df.columns
 
-    n = min(int(args.max_rows), len(df))
-    sub = df.iloc[:n].copy()
+    n = 0
+    n_schema_ok = 0
+    n_scored = 0
+    n_p_raw_match = 0
+    n_p_cal_match = 0
+    schema_fail_examples = []
+    score_fail_examples = []
+    mismatch_examples = []
 
-    schema_fail = 0
-    prob_fail = 0
-    max_abs_raw = 0.0
-    max_abs_cal = 0.0
+    tol = 1e-10
 
-    for idx, row in sub.iterrows():
+    for idx, row in df.iterrows():
+        n += 1
+        ts_val = row.get(args.ts_col) if args.ts_col else None
+        sym_val = row.get("symbol") if "symbol" in df.columns else None
+
         raw_row: Dict[str, Any] = {}
-        for k in required:
+        for k in raw_features:
             v = row[k]
-            if pd.isna(v):
-                raw_row[k] = None
-                continue
-            if k in cat_cols:
-                # categorical codes must be ints (or None)
-                raw_row[k] = int(v)
+            spec = spec_by_name.get(k)
+            kind = getattr(spec, "kind", None) if spec is not None else None
+
+            if kind == "categorical":
+                raw_row[k] = _as_str(v)
             else:
-                raw_row[k] = float(v)
+                raw_row[k] = _as_float(v)
 
         try:
-            p_raw, p_cal = scorer.score_with_details(raw_row)  # returns (p_raw, p_cal)
-        except (SchemaError, BundleError, Exception) as e:
-            schema_fail += 1
-            print(f"[SCHEMA_FAIL] idx={idx} ts={row[ts_col]} err={type(e).__name__}:{e}", flush=True)
-            continue
+            details = scorer.score_with_details(raw_row)
+            if details.get("schema_ok"):
+                n_schema_ok += 1
+                n_scored += 1
 
-        if has_p_raw and (not pd.isna(row[args.p_raw_col])):
-            exp = float(row[args.p_raw_col])
-            got = float(p_raw)
-            diff = abs(got - exp)
-            max_abs_raw = max(max_abs_raw, diff)
-            if not np.isclose(got, exp, rtol=args.rtol, atol=args.atol):
-                prob_fail += 1
-                print(f"[P_RAW_MISMATCH] idx={idx} ts={row[ts_col]} got={got:.10f} exp={exp:.10f} diff={diff:.10f}", flush=True)
+            p_raw = details.get("p_raw")
+            p_cal = details.get("p_cal")
 
-        if has_p_cal and (not pd.isna(row[args.p_cal_col])):
-            exp = float(row[args.p_cal_col])
-            got = float(p_cal)
-            diff = abs(got - exp)
-            max_abs_cal = max(max_abs_cal, diff)
-            if not np.isclose(got, exp, rtol=args.rtol, atol=args.atol):
-                prob_fail += 1
-                print(f"[P_CAL_MISMATCH] idx={idx} ts={row[ts_col]} got={got:.10f} exp={exp:.10f} diff={diff:.10f}", flush=True)
+            if has_p_raw and details.get("schema_ok"):
+                exp = _as_float(row["p_raw"])
+                if exp is not None and p_raw is not None and abs(float(p_raw) - float(exp)) <= tol:
+                    n_p_raw_match += 1
+                elif exp is not None:
+                    mismatch_examples.append(("p_raw", idx, sym_val, ts_val, exp, p_raw))
 
-    print(
-        f"Checked rows={n} schema_fail={schema_fail} prob_fail={prob_fail} "
-        f"max_abs_raw={max_abs_raw:.10f} max_abs_cal={max_abs_cal:.10f}",
-        flush=True,
-    )
-    return 0 if (schema_fail == 0 and prob_fail == 0) else 2
+            if has_p_cal and details.get("schema_ok"):
+                exp = _as_float(row["p_cal"])
+                if exp is not None and p_cal is not None and abs(float(p_cal) - float(exp)) <= tol:
+                    n_p_cal_match += 1
+                elif exp is not None:
+                    mismatch_examples.append(("p_cal", idx, sym_val, ts_val, exp, p_cal))
+
+        except SchemaError as e:
+            if len(schema_fail_examples) < 10:
+                schema_fail_examples.append((idx, sym_val, ts_val, str(e)))
+        except Exception as e:
+            if len(score_fail_examples) < 10:
+                score_fail_examples.append((idx, sym_val, ts_val, repr(e)))
+
+    print(f"Rows processed: {n}")
+    print(f"Schema OK:      {n_schema_ok}/{n}")
+    print(f"Scored OK:      {n_scored}/{n}")
+    if has_p_raw:
+        print(f"p_raw matches:  {n_p_raw_match}/{n_schema_ok}")
+    if has_p_cal:
+        print(f"p_cal matches:  {n_p_cal_match}/{n_schema_ok}")
+
+    if schema_fail_examples and not args.quiet:
+        print("\nSchema failures (first 10):")
+        for i, sym, ts, err in schema_fail_examples:
+            where = f"idx={i}"
+            if sym is not None:
+                where += f" symbol={sym}"
+            if ts is not None:
+                where += f" ts={ts}"
+            print(f"  {where}: {err}")
+
+    if score_fail_examples and not args.quiet:
+        print("\nScore failures (first 10):")
+        for i, sym, ts, err in score_fail_examples:
+            where = f"idx={i}"
+            if sym is not None:
+                where += f" symbol={sym}"
+            if ts is not None:
+                where += f" ts={ts}"
+            print(f"  {where}: {err}")
+
+    if mismatch_examples and not args.quiet:
+        print("\nProbability mismatches (first 10):")
+        for kind, i, sym, ts, exp, got in mismatch_examples[:10]:
+            where = f"idx={i}"
+            if sym is not None:
+                where += f" symbol={sym}"
+            if ts is not None:
+                where += f" ts={ts}"
+            print(f"  {where}: {kind} expected={_fmt(exp)} got={_fmt(got)}")
+
+    return 1 if (schema_fail_examples or score_fail_examples or mismatch_examples) else 0
 
 
 if __name__ == "__main__":

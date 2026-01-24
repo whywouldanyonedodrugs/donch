@@ -521,45 +521,94 @@ class LiveTrader:
 
     async def _get_gov_ctx(self) -> dict:
         """
-        Cycle-level context needed by the meta model (BTC/ETH OI+funding snapshots).
-        Cached to avoid per-symbol recomputation.
+        Governance / benchmark context.
+
+        This is called once per scan cycle and cached briefly. Values here are merged into meta features
+        (via compute_meta_features_live) so they MUST be finite / well-typed for any keys that the meta
+        feature_manifest requires.
         """
-        ttl_sec = int(self.cfg.get("GOV_CTX_TTL_SEC", 60) or 60)
-        now = datetime.now(timezone.utc)
-
+        now_ts = time.time()
+        ttl_sec = float(self.cfg.get("GOV_CTX_CACHE_TTL_SEC", 60.0))
         if hasattr(self, "_gov_ctx_cache") and hasattr(self, "_gov_ctx_cache_ts"):
-            age = (now - self._gov_ctx_cache_ts).total_seconds()
-            if age < ttl_sec:
-                return dict(self._gov_ctx_cache)
-
-        # Fetch 5m OHLCV for BTC/ETH (same limit pattern as base tf elsewhere)
-        df_btc, df_eth = await asyncio.gather(
-            self._fetch_ohlcv_df_simple("BTCUSDT", "5m", limit=1500),
-            self._fetch_ohlcv_df_simple("ETHUSDT", "5m", limit=1500),
-            return_exceptions=False,
-        )
+            if (now_ts - float(getattr(self, "_gov_ctx_cache_ts"))) < ttl_sec:
+                return dict(getattr(self, "_gov_ctx_cache"))
 
         ctx: dict = {}
 
-        if df_btc is not None:
-            btc_feats = await self._build_oi_funding_features("BTCUSDT", df_btc)
-            if btc_feats:
-                if "funding_rate" in btc_feats:
-                    ctx["btc_funding_rate"] = float(btc_feats["funding_rate"])
-                if "oi_z_7d" in btc_feats:
-                    ctx["btc_oi_z_7d"] = float(btc_feats["oi_z_7d"])
+        # --- Open Interest / Funding (BTC & ETH) ---
+        try:
+            df_btc = await self._fetch_ohlcv_df_simple("BTCUSDT", "5m", limit=1500)
+            df_eth = await self._fetch_ohlcv_df_simple("ETHUSDT", "5m", limit=1500)
 
-        if df_eth is not None:
-            eth_feats = await self._build_oi_funding_features("ETHUSDT", df_eth)
-            if eth_feats:
-                if "funding_rate" in eth_feats:
-                    ctx["eth_funding_rate"] = float(eth_feats["funding_rate"])
-                if "oi_z_7d" in eth_feats:
-                    ctx["eth_oi_z_7d"] = float(eth_feats["oi_z_7d"])
+            # BTC open interest (z) and funding (latest)
+            oi_z_btc = await self._compute_oi_z("BTCUSDT", df_btc, resample_tf="1h")
+            ctx["oi_z_btc"] = float(oi_z_btc) if oi_z_btc is not None and np.isfinite(float(oi_z_btc)) else None
+            fr_btc = await self._fetch_funding_rate("BTCUSDT")
+            ctx["funding_rate_btc"] = float(fr_btc) if fr_btc is not None and np.isfinite(float(fr_btc)) else None
 
+            # ETH open interest (z) and funding (latest)
+            oi_z_eth = await self._compute_oi_z("ETHUSDT", df_eth, resample_tf="1h")
+            ctx["oi_z_eth"] = float(oi_z_eth) if oi_z_eth is not None and np.isfinite(float(oi_z_eth)) else None
+            fr_eth = await self._fetch_funding_rate("ETHUSDT")
+            ctx["funding_rate_eth"] = float(fr_eth) if fr_eth is not None and np.isfinite(float(fr_eth)) else None
+
+        except Exception as e:
+            LOG.warning("GOV_CTX: failed to compute OI/funding features: %s", e)
+
+        # --- Markov 4h regime probability (ETH) ---
+        # Required by some meta feature manifests as: markov_prob_up_4h (float in [0,1]) and markov_state_up_4h (0/1).
+        try:
+            # Pull enough 4h history to fit the MarkovRegression model.
+            markov_limit = int(self.cfg.get("MARKOV4H_LIMIT", 500) or 500)
+            df4 = await self._fetch_ohlcv_df_simple("ETHUSDT", "4h", limit=markov_limit)
+
+            if df4 is not None and not df4.empty and len(df4) >= 60:
+                # Use close-to-close log returns.
+                close = df4["close"].astype(float)
+                ret = np.log(close).diff().dropna()
+
+                if len(ret) >= 50:
+                    # Two-regime Markov switching variance; matches regime_detector.compute_markov_regime_4h()
+                    mod = sm.tsa.MarkovRegression(ret, k_regimes=2, switching_variance=True, trend="c")
+                    res = mod.fit(disp=False)
+
+                    filt_probs = [res.filtered_marginal_probabilities[i] for i in range(2)]
+
+                    # Identify UP regime as the one with higher weighted mean return.
+                    means = []
+                    for p in filt_probs:
+                        r = ret.reindex(p.index)
+                        w = p.astype(float).values
+                        rv = r.astype(float).values
+                        denom = float(np.sum(w))
+                        mu = float(np.sum(w * rv) / (denom if denom > 0 else 1.0))
+                        means.append(mu)
+
+                    up_idx = int(np.argmax(means))
+                    prob_up = filt_probs[up_idx].clip(0.0, 1.0)
+
+                    # EWMA smoothing to reduce jitter
+                    alpha = float(self.cfg.get("MARKOV4H_PROB_EWMA_ALPHA", 0.2) or 0.2)
+                    prob_up = prob_up.ewm(alpha=alpha, adjust=False).mean().clip(0.0, 1.0)
+
+                    # Latest fully-closed bar (df4 already drops the last partial bar in _fetch_ohlcv_df_simple)
+                    pu = float(prob_up.iloc[-1])
+                    su = int((pu > 0.5))
+
+                    if np.isfinite(pu):
+                        ctx["markov_prob_up_4h"] = pu
+                        ctx["markov_state_up_4h"] = su
+                        # Backwards-compat names sometimes used in older manifests
+                        ctx.setdefault("markov_state_4h", su)
+
+        except Exception as e:
+            LOG.warning("GOV_CTX: failed to compute markov 4h regime: %s", e)
+
+        # Cache
         self._gov_ctx_cache = dict(ctx)
-        self._gov_ctx_cache_ts = now
+        self._gov_ctx_cache_ts = now_ts
         return ctx
+
 
     # ──────────────────────────────────────────────────────────────────────
     # Regime thresholds + deterministic regime/set encoders (offline spec)
@@ -1603,29 +1652,33 @@ class LiveTrader:
                         break
 
                 def _ok(b): return "✅" if b else "❌"
-                LOG.debug(
-                    (
-                        f"\n--- {symbol} | {df5.index[-1].strftime('%Y-%m-%d %H:%M')} UTC ---\n"
-                        f"[Strategy verdict] should_enter={should_enter}"
-                        f"{'  why=' + str(why) if why is not None else ''}\n"
-                        f"[Inputs]\n"
-                        f"  Price: {last['close']:.6f}\n"
-                        f"  ATR1h: {last['atr_1h']:.6f} ({atr_pct*100:.3f}%)  RSI1h: {last['rsi_1h']:.2f}  ADX1h: {last['adx_1h']:.2f}\n"
-                        f"  RS pct: {rs_pct:.1f}%  Liquidity(24h med USD): {liq_usd:,.0f} (thr {liq_thr:,.0f})\n"
-                        f"  ETH MACD(4h) hist: {eth_hist:.4f}  macd>signal: {bool(eth_above)}  → regime_up={bool(regime_up)}\n"
-                        f"  Donch({don_len}d prev) upper: {don_level:.6f}  dist_atr={don_dist_atr:+.3f}\n"
-                        f"  Vol mult (median {int(self.cfg.get('VOL_LOOKBACK_DAYS',30))}d): x{vol_mult:.2f}\n"
-                        f"  Pullback/Entry: {pullback_type} + {entry_rule}\n"
-                        f"[Gates]\n"
-                        f"  RS≥{rs_min:.0f} ............. {_ok(g_rs)}\n"
-                        f"  Liquidity≥{liq_thr:,.0f} ..... {_ok(g_liq)}\n"
-                        f"  RegimeUp / not blocked ...... {_ok(g_regime)} (block_when_down={regime_block})\n"
-                        f"  Volume spike x{vol_needed:.1f} .... {_ok(g_vol)}\n"
-                        f"  Micro-ATR min ............... {_ok(g_micro)} (min={float(self.cfg.get('ENTRY_MIN_ATR_PCT',0.0)):.5f})\n"
-                        f"  META: p*={pstar:.2f},  p={(p_cal if p_cal is not None else float('nan')):.3f} → {_ok(g_meta)}\n"
-                        f"===================================================="
-                    )
+                # Safe formatting for META line (pstar can be None, p_cal can be None)
+                pstar_disp = "None" if pstar is None else f"{float(pstar):.2f}"
+                p_disp = "None" if p_cal is None else f"{float(p_cal):.3f}"
+
+                diag = (
+                    f"\n--- {symbol} | {df5.index[-1].strftime('%Y-%m-%d %H:%M')} UTC ---\n"
+                    f"[Strategy verdict] should_enter={should_enter}"
+                    f"{'  why=' + str(why) if why is not None else ''}\n"
+                    f"[Inputs]\n"
+                    f"  Price: {last['close']:.6f}\n"
+                    f"  ATR1h: {last['atr_1h']:.6f} ({atr_pct*100:.3f}%)  RSI1h: {last['rsi_1h']:.2f}  ADX1h: {last['adx_1h']:.2f}\n"
+                    f"  RS pct: {rs_pct:.1f}%  Liquidity(24h med USD): {liq_usd:,.0f} (thr {liq_thr:,.0f})\n"
+                    f"  ETH MACD(4h) hist: {eth_hist:.4f}  macd>signal: {bool(eth_above)}  → regime_up={bool(regime_up)}\n"
+                    f"  Donch({don_len}d prev) upper: {don_level:.6f}  dist_atr={don_dist_atr:+.3f}\n"
+                    f"  Vol mult (median {int(self.cfg.get('VOL_LOOKBACK_DAYS',30))}d): x{vol_mult:.2f}\n"
+                    f"  Pullback/Entry: {pullback_type} + {entry_rule}\n"
+                    f"[Gates]\n"
+                    f"  RS≥{rs_min:.0f} ............. {_ok(g_rs)}\n"
+                    f"  Liquidity≥{liq_thr:,.0f} ..... {_ok(g_liq)}\n"
+                    f"  RegimeUp / not blocked ...... {_ok(g_regime)} (block_when_down={regime_block})\n"
+                    f"  Volume spike x{vol_needed:.1f} .... {_ok(g_vol)}\n"
+                    f"  Micro-ATR min ............... {_ok(g_micro)} (min={float(self.cfg.get('ENTRY_MIN_ATR_PCT',0.0)):.5f})\n"
+                    f"  META: p*={pstar_disp},  p={p_disp} → {_ok(g_meta)}\n"
+                    f"===================================================="
                 )
+                LOG.debug(diag)
+
 
             # If rules say NO, stop here (we already printed p/p*)
             if not should_enter:
