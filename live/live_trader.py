@@ -676,6 +676,37 @@ class LiveTrader:
             return 1
         return 2
 
+    def _atr_pre_at_ts(self, df5: pd.DataFrame, ts: pd.Timestamp) -> float:
+        """
+        Offline-parity ATR-at-entry:
+        - Use ATR_LEN
+        - Use ATR_TIMEFRAME if set (e.g. "1h"); else default to "5m"
+        - If timeframe != 5m, compute ATR on resampled OHLCV and forward-fill back to df5 index
+        - Return finite float at ts
+        """
+        atr_len = int(self.cfg.get("ATR_LEN", 14))
+
+        tf = str(self.cfg.get("ATR_TIMEFRAME", "") or "").strip().lower()
+        if tf in ("", "none", "null"):
+            tf = "5m"
+
+        if tf != "5m":
+            df_atr = ta.resample_ohlcv(df5, tf)
+            atr_tf = ta.atr(df_atr, atr_len)
+            atr_pre = atr_tf.reindex(df5.index, method="ffill")
+        else:
+            atr_pre = ta.atr(df5, atr_len)
+
+        v = atr_pre.loc[ts] if ts in atr_pre.index else atr_pre.iloc[-1]
+        v = float(v)
+
+        if not np.isfinite(v):
+            raise ValueError(f"atr_pre not finite for ts={ts}: {v}")
+
+        return v
+
+
+
     def _augment_meta_with_regime_sets(self, meta_full: dict) -> None:
         """
         Mutates meta_full in-place. Adds:
@@ -1233,13 +1264,19 @@ class LiveTrader:
 
             # Training features are 1h ATR/RSI/ADX
             atr_len = int(self.cfg.get("ATR_LEN", 14))
+            rsi_len = int(self.cfg.get("RSI_LEN", 14))
+            adx_len = int(self.cfg.get("ADX_LEN", 14))
+
+
+
             df1h = dfs.get('1h')
             if df1h is None or df1h.empty:
                 LOG.warning("No 1h data for %s; cannot compute ATR/RSI/ADX features.", symbol)
                 return None
+
             atr_1h = ta.atr(df1h, atr_len)
-            rsi_1h = ta.rsi(df1h['close'], atr_len)
-            adx_1h = ta.adx(df1h, atr_len)
+            rsi_1h = ta.rsi(df1h, rsi_len)
+            adx_1h = ta.adx(df1h, adx_len)
 
             df5['atr_1h'] = atr_1h.reindex(df5.index, method='ffill')
             df5['rsi_1h'] = rsi_1h.reindex(df5.index, method='ffill')
@@ -1335,6 +1372,8 @@ class LiveTrader:
             if not np.isfinite(don_dist_atr):
                 don_dist_atr = 0.0
 
+            atr_at_entry = self._atr_pre_at_ts(df5, decision_ts)
+
             # -------------- Meta-model feature row (canonical) ----
             entry_rule = getattr(verdict, "entry_rule", None) or self.cfg.get("ENTRY_RULE", "close_above_break")
             pullback_type = getattr(verdict, "pullback_type", None) or self.cfg.get("PULLBACK_TYPE", "retest")
@@ -1425,6 +1464,8 @@ class LiveTrader:
                 "prior_breakout_count": float(prior_b),
                 "prior_breakout_fail_count": float(prior_f),
                 "prior_breakout_fail_rate": float(prior_fail_rate),
+
+                "atr_at_entry": atr_at_entry,
             }
 
             # Merge asset OI/funding features
