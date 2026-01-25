@@ -29,12 +29,24 @@ def _norm_tf(tf: str) -> str:
 def resample_ohlcv(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
     """
     Standard resampling (Label='left', Closed='left').
-    Delegates to existing live.indicators.resample_ohlcv with normalized timeframe.
     Used for Entry Quality features (ATR, RSI, ADX, etc.) and days_since_prev_break.
     """
-    if df.empty:
+    if df is None or df.empty:
         return df
-    return ta.resample_ohlcv(df, _norm_tf(timeframe))
+
+    freq = _norm_tf(timeframe)
+
+    # Explicit left/left to match offline/scout behavior
+    res = df.resample(freq, label="left", closed="left")
+    agg = res.agg({
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "volume": "sum",
+    })
+    return agg.dropna()
+
 
 def resample_ohlcv_robust(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
     """

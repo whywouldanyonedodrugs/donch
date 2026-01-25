@@ -1606,7 +1606,7 @@ class LiveTrader:
                 if tf == base_tf:
                     continue
                 try:
-                    dfs[tf] = resample_ohlcv(df5, tf)  # pandas default label="left", closed="left"
+                    dfs[tf] = resample_ohlcv(df_base, tf)  # pandas default label="left", closed="left"
                 except Exception as e:
                     LOG.warning("SCAN_SKIP symbol=%s stage=resample_fail tf=%s err=%s", symbol, tf, e)
                     return None
