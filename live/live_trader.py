@@ -1117,20 +1117,28 @@ class LiveTrader:
                     cs = int(float(meta_full["crowd_side"]))
                     meta_full["S4_crowd_x_trend1d"] = float((cs + 1) * 2 + int(trc))
 
-        # S6_fresh_x_compress prereqs: days_since_prev_break + consolidation_range_atr + thresholds
+        # live/live_trader.py (inside _augment_meta_with_regime_sets), S6_fresh_x_compress section
+
         if ("days_since_prev_break" in meta_full) and ("consolidation_range_atr" in meta_full):
             try:
-                fresh_q33 = float(self.regime_thresholds["fresh_q33"])
-                fresh_q66 = float(self.regime_thresholds["fresh_q66"])
-                comp_q33 = float(self.regime_thresholds["compression_q33"])
-                comp_q66 = float(self.regime_thresholds["compression_q66"])
+                t = self._regimes_thresholds.get("S6_fresh_x_compress", {}) or {}
+                fresh_q33 = t.get("fresh_q33")
+                fresh_q66 = t.get("fresh_q66")
+                comp_q33  = t.get("compression_q33")
+                comp_q66  = t.get("compression_q66")
 
                 fresh = float(meta_full["days_since_prev_break"])
-                comp = float(meta_full["consolidation_range_atr"])
-                fcode = self._tercile_code(fresh, fresh_q33, fresh_q66)
-                ccode = self._tercile_code(comp, comp_q33, comp_q66)
+                comp  = float(meta_full["consolidation_range_atr"])
 
-                meta_full["S6_fresh_x_compress"] = float(fcode * 3 + ccode)
+                # Match offline: only compute S6 if both inputs are finite
+                if np.isfinite(fresh) and np.isfinite(comp) and \
+                fresh_q33 is not None and fresh_q66 is not None and \
+                comp_q33 is not None and comp_q66 is not None:
+                    fcode = self._tercile_code(fresh, float(fresh_q33), float(fresh_q66))
+                    ccode = self._tercile_code(comp,  float(comp_q33),  float(comp_q66))
+                    meta_full["S6_fresh_x_compress"] = float(fcode * 3 + ccode)
+                else:
+                    meta_full["S6_fresh_x_compress"] = np.nan
             except Exception:
                 pass
 

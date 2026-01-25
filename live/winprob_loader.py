@@ -308,15 +308,27 @@ class WinProbScorer:
             spec = self._raw_spec_by_name[name]
             v = raw_row.get(name)
 
+            # live/winprob_loader.py (inside _validate_raw_schema)
+
             if spec.kind == "numeric":
-                if v is None or _is_nan(v) or (isinstance(v, (float, np.floating)) and not np.isfinite(v)):
+                if v is None:
+                    raise SchemaError(f"Missing required numeric feature: {name}")
+
+                # Reject bools (they cast to float but are almost always a bug)
+                if isinstance(v, (bool, np.bool_)):
                     raise SchemaError(f"Invalid numeric value for {name}: {v}")
-                if isinstance(v, bool):
-                    raise SchemaError(f"Invalid numeric value for {name} (bool not allowed): {v}")
+
+                # Allow NaN, but reject +/-inf and non-castable values
                 try:
-                    float(v)
-                except Exception as e:
-                    raise SchemaError(f"Numeric feature {name} not castable to float: {v} ({e})") from e
+                    fv = float(v)
+                except Exception:
+                    raise SchemaError(f"Invalid numeric value for {name}: {v}")
+
+                if np.isinf(fv):
+                    raise SchemaError(f"Invalid numeric value for {name}: {v}")
+
+                # NOTE: NaN is allowed here on purpose; downstream pipeline/model should handle it.
+
             else:
                 if v is None:
                     raise SchemaError(f"Invalid categorical value for {name}: {v}")
