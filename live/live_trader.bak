@@ -54,9 +54,6 @@ from pydantic import Field, ValidationError
 from pydantic_settings import BaseSettings
 from .strategy_engine import StrategyEngine
 
-from .feature_builder import FeatureBuilder
-from .parity_utils import resample_ohlcv, donchian_upper_days_no_lookahead
-
 from .oi_funding import fetch_series_5m, compute_oi_funding_features
 
 import logging
@@ -519,8 +516,6 @@ class LiveTrader:
         self.cfg.update(cfg_dict)
         for k, v in self.cfg.items():  # keep config.py attributes in sync too
             setattr(cfg, k, v)
-
-        self.feature_builder = FeatureBuilder(self.cfg)
 
         self.db = DB(settings.pg_dsn)
         self.tg = TelegramBot(settings.tg_bot_token, settings.tg_chat_id)
@@ -1606,7 +1601,7 @@ class LiveTrader:
                 if tf == base_tf:
                     continue
                 try:
-                    dfs[tf] = resample_ohlcv(df5, tf)  # pandas default label="left", closed="left"
+                    dfs[tf] = ta.resample_ohlcv(df_base, tf)  # pandas default label="left", closed="left"
                 except Exception as e:
                     LOG.warning("SCAN_SKIP symbol=%s stage=resample_fail tf=%s err=%s", symbol, tf, e)
                     return None
@@ -1616,29 +1611,7 @@ class LiveTrader:
                 LOG.warning("Base TF %s not available for %s.", base_tf, symbol)
                 return None
             df5 = dfs[base_tf]
-
-
-            # --- Strict-parity: enforce tz-aware UTC index ---
-            if df5.index.tz is None:
-                # If your fetcher is already UTC but naive, localize; otherwise fix fetcher upstream.
-                df5.index = df5.index.tz_localize("UTC")
-            else:
-                df5.index = df5.index.tz_convert("UTC")
-
-            df5 = df5.sort_index()
-            df5 = df5[~df5.index.duplicated(keep="last")]
-
-            # --- Strict-parity: drop currently forming 5m bar (assumes index is bar OPEN time) ---
-            now_utc = pd.Timestamp.now(tz="UTC")
-            cur_bucket = now_utc.floor("5min")
-            if len(df5) > 0 and df5.index[-1] >= cur_bucket:
-                df5 = df5.iloc[:-1]
-
-            if df5.empty:
-                return None
-
-            decision_ts = df5.index[-1]
-
+            decision_ts = df5.index[-1]  # last fully closed 5m bar (after dropping incomplete last bar)
 
             # ---------------- Indicators aligned to base index ---
             # EMA on ema_tf (for optional heuristics)
@@ -1695,22 +1668,6 @@ class LiveTrader:
                 "is_symbol_blacklisted": is_blacklisted(symbol),
                 **univ, **eth_ctx,
             }
-
-            # --- Strict Parity: Inject Robust Breakout Level ---
-            don_days = int(self.cfg.get("DON_N_DAYS", 20))
-            don_upper_s = donchian_upper_days_no_lookahead(df5["high"], don_days)
-
-            # decision_ts must exist; if not, fallback to last index
-            if decision_ts in don_upper_s.index:
-                injected_level = float(don_upper_s.loc[decision_ts])
-            else:
-                injected_level = float(don_upper_s.iloc[-1])
-
-            if np.isfinite(injected_level):
-                ctx["don_break_level"] = injected_level
-                ctx["don_break_len"] = don_days
-
-
             verdict = self.strategy_engine.evaluate(dfs, ctx)
             should_enter = bool(getattr(verdict, "should_enter", False))
 
@@ -1876,74 +1833,128 @@ class LiveTrader:
             if isinstance(gov_ctx, dict) and gov_ctx:
                 meta_full.update(gov_ctx)
 
-            # --- Strict-parity: Entry Quality overlay (overwrites critical fields) ---
-            eq_feats = self.feature_builder.compute_entry_quality_features(df5, decision_ts)
-            meta_full.update(eq_feats)
+            # ---------------- Model-required feature slice (order matters) ----------------
+            required = list(getattr(self.winprob, "raw_features", None) or getattr(self.winprob, "required_keys", []) or [])
+            if not required:
+                LOG.error("META_MODEL_NO_FEATURES bundle=%s", self.bundle_id)
+                return None
+
+            # Validate REQUIRED features against meta_full before slicing
+            missing = self._missing_required_features(meta_full, required)
+            if missing:
+                LOG.error("META_SCHEMA_FAIL symbol=%s missing_or_bad=%s", symbol, missing)
+                if hasattr(self, "_append_meta_error_report"):
+                    self._append_meta_error_report(
+                        symbol=symbol,
+                        stage="meta_schema_fail",
+                        missing=missing,
+                        decision_ts=decision_ts,
+                        meta_keys=sorted(meta_full.keys()),
+                    )
+                return None
+
+            num_cols = set(getattr(self.winprob, "numeric_cols", []) or getattr(self.winprob, "raw_num_cols", []) or [])
+            cat_cols = set(getattr(self.winprob, "categorical_cols", []) or getattr(self.winprob, "raw_cat_cols", []) or [])
+
+            # Build meta_row with correct typed defaults (exactly required keys)
+            meta_row = {}
+            for k in required:
+                v = meta_full.get(k, None)
+                if v is None:
+                    v = np.nan if k in num_cols else None
+                meta_row[k] = v
+
+            req = required
+            num_cols = set(getattr(self.winprob, "numeric_cols", getattr(self.winprob, "raw_num_cols", [])) or [])
+            cat_cols = set(getattr(self.winprob, "cat_cols", getattr(self.winprob, "raw_cat_cols", [])) or [])
 
 
-
-            # ---------------- 10. Strict Slice & Score ----------------
-            required = list(getattr(self.winprob, "raw_features", []) or [])
-            
-            # Construct row with EXACTLY required keys (WinProbScorer expects strict input)
-            if required:
-                meta_row = {k: meta_full.get(k, np.nan) for k in required}
-            else:
-                meta_row = {}
+            meta_row = {}
+            for k in required:
+                if k in meta_full:
+                    meta_row[k] = meta_full[k]
+                else:
+                    # default placeholders so keys are present; validator will then report invalid_numeric/invalid_cat
+                    meta_row[k] = (np.nan if k in num_cols else None)
 
             # --- Golden row injector (parity testing only) ---
             try:
                 if getattr(self, "golden_store", None) is not None:
-                    # Decision timestamp = last completed 5m bar timestamp
+                    # Decision timestamp = last completed 5m bar timestamp for this symbol.
+                    # dfs[base_tf] had last bar dropped earlier, so df5.index[-1] is "as-of" ts.
                     ts = df5.index[-1]
                     golden = self.golden_store.get(symbol, ts)
                     if golden is not None:
                         meta_row = golden
-                        LOG.info("bundle=%s Meta golden hit %s ts=%s", 
-                                 self.bundle_id, symbol, ts.isoformat())
-            except Exception:
+                        LOG.info(
+                            "bundle=%s Meta golden hit %s ts=%s (row_keys=%d)",
+                            getattr(self, "bundle_id", None) or "no_bundle",
+                            symbol,
+                            pd.to_datetime(ts, utc=True).isoformat(),
+                            len(meta_row),
+                        )
+            except Exception as _e:
+                # Never break scanning because of parity tooling.
                 pass
 
-            # Score using the safe wrapper
-            if required:
-                score_d = self._score_winprob_safe_details(symbol, meta_row)
-                p_cal = score_d.get("p_cal")
-                p_raw = score_d.get("p_raw")
-                schema_ok = score_d.get("schema_ok")
-                meta_err = score_d.get("err")
-            else:
-                # No model loaded or no features required
-                p_cal, p_raw = None, None
-                schema_ok = True
-                meta_err = "no_model_features"
+            score_d = self._score_winprob_safe_details(symbol=symbol, meta_row=meta_row)
+            p_raw = score_d.get("p_raw")
+            p_cal = score_d.get("p_cal")
+            schema_ok = bool(score_d.get("schema_ok"))
+            meta_err = score_d.get("err")
 
-            # --- Logic Glue: Define thresholds and gating verdict ---
-            # 1. Get Threshold
-            pstar = float(getattr(self.winprob, "pstar", 0.0) or self.cfg.get("META_PROB_THRESHOLD", 0.0) or 0.0)
+            # Strategy OK (pre-meta) already exists as should_enter (from StrategyEngine verdict)
+            strat_ok = bool(should_enter)
 
-            # 2. Determine meta_ok
-            if not schema_ok:
+            # Meta gate uses calibrated probability and pstar (if configured)
+            pstar = getattr(self.winprob, "pstar", None)
+            if (pstar is None) or (p_cal is None):
                 meta_ok = False
-                reason = f"schema_fail:{meta_err}"
-            elif p_cal is not None:
-                meta_ok = (float(p_cal) >= pstar)
-                reason = f"prob_{p_cal:.3f}<{pstar:.3f}" if not meta_ok else "pass"
             else:
-                # No model or empty requirements -> Pass (neutral)
-                meta_ok = True
-                reason = "no_model_pass"
+                meta_ok = bool(float(p_cal) >= float(pstar))
 
-            # 3. Clean Logging (strat_ok is just the current state of should_enter)
-            strat_ok = should_enter 
+            # Reason precedence: schema/score failure first, then strategy veto, then meta veto
+            if not schema_ok:
+                reason = "meta_schema_or_score_fail"
+            elif not strat_ok:
+                reason = "rule_veto"
+            elif not meta_ok:
+                reason = "meta_veto"
+            else:
+                reason = "ok"
+
+            def _is_bad_numeric(v) -> bool:
+                if v is None:
+                    return True
+                if isinstance(v, bool):
+                    return False  # if you treat bools separately; otherwise convert to 0/1 upstream
+                if isinstance(v, (int, float)):
+                    return (isinstance(v, float) and (math.isnan(v) or math.isinf(v)))
+                return False
+
+            def meta_report(required_keys, meta_full: dict) -> tuple[list[str], list[tuple[str, object]]]:
+                missing = [k for k in required_keys if k not in meta_full]
+                bad = []
+                for k in required_keys:
+                    if k in meta_full and _is_bad_numeric(meta_full[k]):
+                        bad.append((k, meta_full[k]))
+                return missing, bad
+
+            req = list(self.winprob.required_keys)
+            missing, bad = meta_report(req, meta_full)
+            if missing or bad:
+                LOG.warning("META_SCHEMA_INPUT_PROBLEMS missing=%d bad=%d missing_head=%s bad_head=%s",
+                            len(missing), len(bad), missing[:25], bad[:25])
 
             LOG.info(
-                "META_DECISION bundle=%s symbol=%s decision_ts=%s schema_ok=%s p_cal=%s pstar=%.4f meta_ok=%s strat_ok=%s reason=%s err=%s",
+                "META_DECISION bundle=%s symbol=%s decision_ts=%s schema_ok=%s p_raw=%s p_cal=%s pstar=%.6f meta_ok=%s strat_ok=%s reason=%s err=%s",
                 self.bundle_id,
                 symbol,
                 (decision_ts.isoformat() if decision_ts is not None else "None"),
                 schema_ok,
-                ("None" if p_cal is None else f"{float(p_cal):.4f}"),
-                pstar,
+                ("None" if p_raw is None else f"{float(p_raw):.6f}"),
+                ("None" if p_cal is None else f"{float(p_cal):.6f}"),
+                (0.0 if pstar is None else float(pstar)),
                 meta_ok,
                 strat_ok,
                 reason,
@@ -2125,15 +2136,8 @@ class LiveTrader:
                 "SIGNAL %s @ %.6f | regime=%s | wp=%.2f%%",
                 symbol, float(last['close']), market_regime, signal_obj.win_probability * 100.0
             )
-
-
-            # Attach donch fields for downstream logging/telemetry
-            # (Signal class may not declare them explicitly, so we attach dynamically)
-            setattr(signal_obj, "don_break_level", meta_full.get("don_break_level"))
-            setattr(signal_obj, "don_dist_atr", meta_full.get("don_dist_atr"))
-            setattr(signal_obj, "don_break_len", meta_full.get("don_break_len"))
-
             return signal_obj
+
 
         except ccxt.BadSymbol:
             LOG.warning("Invalid symbol on exchange: %s", symbol)
