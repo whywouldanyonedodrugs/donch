@@ -506,6 +506,7 @@ class Signal:
 class LiveTrader:
     def __init__(self, settings: Settings, cfg_dict: Dict[str, Any]):
         self.settings = settings
+        self.meta_schema = None  # always defined; assigned after bundle/winprob load if available
 
         # Merge python config defaults (config.py) with YAML overrides into self.cfg
         self.cfg: Dict[str, Any] = {}
@@ -739,25 +740,36 @@ class LiveTrader:
 
     async def _fetch_ohlcv_df_simple(self, symbol: str, tf: str, limit: int) -> Optional[pd.DataFrame]:
         """
-        Minimal OHLCV fetch -> DataFrame with UTC datetime index at BAR CLOSE TIME.
-        Drops the last (possibly incomplete) bar for as-of semantics.
+        Minimal OHLCV fetch -> DataFrame with UTC datetime index at BAR OPEN (left-labeled),
+        matching offline/base semantics. Drops the last bar if it is still forming.
         """
         try:
             ohlcv = await self.exchange.fetch_ohlcv(symbol, tf, limit=limit)
             if not ohlcv:
                 return None
-            df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
-            # ccxt timestamps are candle OPEN time; shift to CLOSE time for parity with offline/golden
-            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
 
+            df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+            # CCXT timestamps are candle OPEN time; keep as OPEN time for parity with offline base candles
+            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
             df = df.set_index("timestamp").sort_index()
-            # drop last possibly-incomplete bar
+
+            # Drop last bar if it is still forming (open-labeled semantics)
             if len(df) > 1:
-                df = df.iloc[:-1]
+                now_ts = pd.Timestamp(datetime.now(timezone.utc))
+                freq = {"5m": "5min", "15m": "15min", "30m": "30min", "1h": "1h", "4h": "4h", "1d": "D"}.get(tf)
+                if freq is None:
+                    # Fallback: conservative behavior
+                    df = df.iloc[:-1]
+                else:
+                    floor = now_ts.floor(freq)
+                    if df.index[-1] >= floor:
+                        df = df.iloc[:-1]
+
             return df
         except Exception as e:
             LOG.debug("OHLCV fetch failed %s %s: %s", symbol, tf, e)
             return None
+
 
     async def _get_gov_ctx(self) -> dict:
         """
@@ -1539,10 +1551,31 @@ class LiveTrader:
             required_tfs = {base_tf, ema_tf, rsi_tf, adx_tf, '1d', '1h'}
             required_tfs |= set(self.strategy_engine.required_timeframes() or [])
 
+
+            # ---------------- Lookback sizing for base timeframe ----------------
+            # Offline features (e.g., days_since_prev_break, vol lookbacks) require enough 5m history
+            # to warm up daily resamples + rolling windows.
+            if base_tf == "5m":
+                bars_per_day = 288
+            else:
+                # fallback for other base tfs (keeps behavior defined, but your default is 5m)
+                bars_per_day = int(pd.Timedelta("1D") / _tf_to_timedelta(base_tf))
+
+            vol_lookback_days = int(self.cfg.get("VOL_LOOKBACK_DAYS", 30))
+            don_n_days = int(self.cfg.get("DON_N_DAYS", 20))
+
+            # days_since_prev_break needs at least DON_N_DAYS daily highs, plus shift(1),
+            # so we use DON_N_DAYS + 2 days as the minimum warmup.
+            need_days = max(vol_lookback_days, don_n_days + 2)
+
+            base_limit = max(1500, need_days * bars_per_day)
+
+
             # ---------------- OHLCV fetch ------------------------
             async with self.api_semaphore:
                 tasks = {
-                    tf: self.exchange.fetch_ohlcv(symbol, tf, limit=1500 if tf == base_tf else 500)
+                    tf: self.exchange.fetch_ohlcv(symbol, tf, limit=base_limit if tf == base_tf else 500)
+
                     for tf in sorted(required_tfs)
                 }
                 results = await asyncio.gather(*tasks.values(), return_exceptions=True)
@@ -1804,7 +1837,7 @@ class LiveTrader:
             if isinstance(gov_ctx, dict) and gov_ctx:
                 meta_full.update(gov_ctx)
 
-            required = list(getattr(self.winprob, "raw_features", []))
+            required = list(getattr(self.winprob, "required_keys", [])) or list(getattr(getattr(self, "meta_schema", None), "required_keys", []))
             missing = self._missing_required_features(meta_row, required)
             if missing:
                 LOG.warning(
