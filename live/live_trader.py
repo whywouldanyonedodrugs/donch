@@ -1571,45 +1571,41 @@ class LiveTrader:
             base_limit = max(1500, need_days * bars_per_day)
 
 
-            # ---------------- OHLCV fetch ------------------------
+            # ---------------- OHLCV fetch (PARITY: fetch base TF only; resample HTFs) ----------------
+            bars_per_day = int(pd.Timedelta("1D") / _tf_to_timedelta(base_tf))
+
+            need_vol = bars_per_day * (int(self.cfg.get("VOL_LOOKBACK_DAYS", 30)) + 2)
+            need_don = bars_per_day * (int(self.cfg.get("DON_N_DAYS", 20)) + 2)
+            need_cap = int(self.cfg.get("VOL_CAP_BARS", 9000))
+            base_limit = max(1500, need_vol, need_don, need_cap)
+
             async with self.api_semaphore:
-                tasks = {
-                    tf: self.exchange.fetch_ohlcv(symbol, tf, limit=base_limit if tf == base_tf else 500)
+                df_base = await self._fetch_ohlcv_df_paged(symbol, base_tf, limit=base_limit)
 
-                    for tf in sorted(required_tfs)
-                }
-                results = await asyncio.gather(*tasks.values(), return_exceptions=True)
-                ohlcv_data = dict(zip(tasks.keys(), results))
+            if df_base is None or df_base.empty or len(df_base) < 3:
+                LOG.warning("SCAN_SKIP symbol=%s stage=too_few_bars tf=%s n=%s", symbol, base_tf, 0 if df_base is None else len(df_base))
+                return None
 
-            dfs: dict[str, pd.DataFrame] = {}
-            for tf, data in ohlcv_data.items():
-                if isinstance(data, Exception) or not data:
-                    LOG.warning("SCAN_SKIP symbol=%s stage=ohlcv_fetch_fail tf=%s", symbol, tf)
-                    return None
-                df = pd.DataFrame(data, columns=['timestamp','open','high','low','close','volume'])
-                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
-                df.set_index('timestamp', inplace=True)
-
-                # Stale/illiquid guard on last 100 completed bars
-                recent = df.tail(100)
-                if not recent.empty:
-                    zero_vol_pct = (recent['volume'] == 0).sum() / len(recent)
-                    if zero_vol_pct > 0.25:
-                        LOG.warning("DATA_ERROR %s %s: stale (%.0f%% zero vol).", symbol, tf, zero_vol_pct * 100)
-                        return None
-
-                # Drop possibly incomplete last bar; ensure non-empty
-                if len(df) < 3:
-                    LOG.warning("SCAN_SKIP symbol=%s stage=too_few_bars tf=%s n=%d", symbol, tf, len(df))
+            # Stale/illiquid guard on last 100 completed bars (base TF only)
+            recent = df_base.tail(100)
+            if not recent.empty:
+                zero_vol_pct = (recent["volume"] == 0).sum() / len(recent)
+                if zero_vol_pct > 0.25:
+                    LOG.warning("DATA_ERROR %s %s: stale (%.0f%% zero vol).", symbol, base_tf, zero_vol_pct * 100)
                     return None
 
-                df = df.iloc[:-1]
-                if df.empty:
-                    LOG.warning("SCAN_SKIP symbol=%s stage=empty_after_drop tf=%s", symbol, tf)
+            dfs: dict[str, pd.DataFrame] = {base_tf: df_base}
+
+            # Build required HTFs by resampling the base stream (offline parity)
+            for tf in sorted(required_tfs):
+                if tf == base_tf:
+                    continue
+                try:
+                    dfs[tf] = ta.resample_ohlcv(df_base, tf)  # pandas default label="left", closed="left"
+                except Exception as e:
+                    LOG.warning("SCAN_SKIP symbol=%s stage=resample_fail tf=%s err=%s", symbol, tf, e)
                     return None
 
-
-                dfs[tf] = df
 
             if base_tf not in dfs:
                 LOG.warning("Base TF %s not available for %s.", base_tf, symbol)
@@ -1837,24 +1833,37 @@ class LiveTrader:
             if isinstance(gov_ctx, dict) and gov_ctx:
                 meta_full.update(gov_ctx)
 
-            required = list(getattr(self.winprob, "required_keys", [])) or list(getattr(getattr(self, "meta_schema", None), "required_keys", []))
-            missing = self._missing_required_features(meta_row, required)
-            if missing:
-                LOG.warning(
-                    "META_INPUT_MISSING symbol=%s decision_ts=%s missing=%s",
-                    symbol,
-                    decision_ts.isoformat(),
-                    ",".join(missing),
-                )
-                # treat as meta veto; do not call score() at all
+            # ---------------- Model-required feature slice (order matters) ----------------
+            required = list(getattr(self.winprob, "raw_features", None) or getattr(self.winprob, "required_keys", []) or [])
+            if not required:
+                LOG.error("META_MODEL_NO_FEATURES bundle=%s", self.bundle_id)
                 return None
 
+            # Validate REQUIRED features against meta_full before slicing
+            missing = self._missing_required_features(meta_full, required)
+            if missing:
+                LOG.error("META_SCHEMA_FAIL symbol=%s missing_or_bad=%s", symbol, missing)
+                if hasattr(self, "_append_meta_error_report"):
+                    self._append_meta_error_report(
+                        symbol=symbol,
+                        stage="meta_schema_fail",
+                        missing=missing,
+                        decision_ts=decision_ts,
+                        meta_keys=sorted(meta_full.keys()),
+                    )
+                return None
 
+            num_cols = set(getattr(self.winprob, "numeric_cols", []) or getattr(self.winprob, "raw_num_cols", []) or [])
+            cat_cols = set(getattr(self.winprob, "categorical_cols", []) or getattr(self.winprob, "raw_cat_cols", []) or [])
 
-            # --- NEW: deterministic regime/set features + S-features (offline spec)
-            self._augment_meta_with_regime_sets(meta_full)
+            # Build meta_row with correct typed defaults (exactly required keys)
+            meta_row = {}
+            for k in required:
+                v = meta_full.get(k, None)
+                if v is None:
+                    v = np.nan if k in num_cols else None
+                meta_row[k] = v
 
-            required = list(getattr(self.winprob, "raw_features", []) or [])
             req = required
             num_cols = set(getattr(self.winprob, "numeric_cols", getattr(self.winprob, "raw_num_cols", [])) or [])
             cat_cols = set(getattr(self.winprob, "cat_cols", getattr(self.winprob, "raw_cat_cols", [])) or [])
