@@ -1714,9 +1714,14 @@ class LiveTrader:
             else:
                 injected_level = float(don_upper_s.iloc[-1])
 
+            # Always publish the intended Donch window length; publish level only if finite.
+            ctx["don_break_len"] = don_days
+            ctx["donch_break_len"] = don_days  # compat key for some ops
+
             if np.isfinite(injected_level):
-                ctx["don_break_level"] = injected_level
-                ctx["don_break_len"] = don_days
+                ctx["don_break_level"] = float(injected_level)
+                ctx["donch_break_level"] = float(injected_level)
+
 
 
             verdict = self.strategy_engine.evaluate(dfs, ctx)
@@ -1733,12 +1738,25 @@ class LiveTrader:
                 ret_30d = (df1d['close'].iloc[-1] / df1d['close'].iloc[-cfg.STRUCTURAL_TREND_DAYS] - 1)
 
             tf_minutes = 5  # base timeframe minutes (used for vol_mult window)
-            # Donch breakout info
-            don_len = int(
-                getattr(verdict, "don_break_len",
+            # Donch breakout info (robust to Verdict.don_break_len being None)
+            don_len_raw = getattr(verdict, "don_break_len", None)
+            if don_len_raw is None:
+                try:
+                    don_len_raw = (
                         ((getattr(self.strategy_engine, "_spec", {}) or {}).get("params", {}) or {})
-                        .get("DONCH_PERIOD", self.cfg.get("DON_N_DAYS", 20)))
-            )
+                        .get("DONCH_PERIOD", None)
+                    )
+                except Exception:
+                    don_len_raw = None
+            if don_len_raw is None:
+                don_len_raw = self.cfg.get("DON_N_DAYS", 20)
+
+            try:
+                don_len = int(don_len_raw)
+            except Exception:
+                don_len = 20
+            don_len = max(2, don_len)
+
 
 
             don_level = None

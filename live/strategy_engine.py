@@ -91,6 +91,18 @@ class StrategyEngine:
             except Exception:
                 ln_i = None
 
+            # Compatibility: if len wasn't injected/computed, fall back to spec params / cfg
+            if ln_i is None:
+                try:
+                    fb = params.get("DONCH_PERIOD", None)
+                    if fb is None:
+                        fb = self.cfg.get("DON_N_DAYS", None)
+                    if fb is not None:
+                        ln_i = int(fb)
+                except Exception:
+                    ln_i = None
+
+
             return Verdict(bool(should_enter), str(side), list(tags), don_break_level=lvl_f, don_break_len=ln_i)
 
         # resolve template refs like "@cfg.FOO" / "@params.BAR"
