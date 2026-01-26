@@ -316,13 +316,6 @@ def load_bundle(
 
     required_paths: Dict[str, Path] = {n: (meta_dir_p / n) for n in required}
 
-    # Compute hashes for required set (+ calibrators if present) for validation and bundle id
-    to_hash: Dict[str, Path] = dict(required_paths)
-    if calib_joblib is not None:
-        to_hash[calib_joblib.name] = calib_joblib
-    if calib_json is not None:
-        to_hash[calib_json.name] = calib_json
-
     # Compute hashes for required set (+ calibrators if present) for validation and bundle id.
     # IMPORTANT: do NOT hash checksums_sha256.json itself (self-referential).
     to_hash: Dict[str, Path] = {}
@@ -353,6 +346,13 @@ def load_bundle(
     thresholds = _read_json(required_paths["thresholds.json"]) if (meta_dir_p / "thresholds.json").exists() else None
     sizing_curve_path = (meta_dir_p / "sizing_curve.csv") if (meta_dir_p / "sizing_curve.csv").exists() else None
 
+    # Initialize optional artifacts / metadata (must exist before decision extraction)
+    pstar: Optional[float] = None
+    pstar_scope: Optional[str] = None
+    calibrator: Optional[Any] = None
+    calibrator_path: Optional[Path] = None
+
+
     # Extract decision metadata (offline exporter stores p* here)
     if isinstance(deployment_config, dict):
         dec = deployment_config.get("decision")
@@ -360,19 +360,14 @@ def load_bundle(
             sc = dec.get("scope")
             if isinstance(sc, str) and sc.strip():
                 pstar_scope = sc.strip()
-            # If threshold is present here, it is the canonical p* for gating
-            if pstar is None and ("threshold" in dec):
+
+            # Canonical p* is stored as deployment_config.json["decision"]["threshold"]
+            thr = dec.get("threshold", None)
+            if pstar is None and thr is not None:
                 try:
-                    pstar = float(dec.get("threshold"))
+                    pstar = float(thr)
                 except Exception:
                     pstar = None
-
-
-    # Load model/calibrator
-    pstar: Optional[float] = None
-    pstar_scope: Optional[str] = None
-    calibrator: Optional[Any] = None
-    calibrator_path: Optional[Path] = None
 
 
     if is_pipeline:
@@ -396,14 +391,16 @@ def load_bundle(
             if calibrator is None:
                 calibrator_path = calib_json
                 calibrator = cal_obj
-            # Extract pstar if present
-            for k in ("pstar", "p_star", "p*", "pStar"):
-                if isinstance(cal_obj, dict) and k in cal_obj:
-                    try:
-                        pstar = float(cal_obj[k])
-                    except Exception:
-                        pstar = None
-                    break
+            # Extract pstar if present (only if not already set from deployment_config decision.threshold)
+            if pstar is None:
+                for k in ("pstar", "p_star", "p*", "pStar"):
+                    if isinstance(cal_obj, dict) and k in cal_obj:
+                        try:
+                            pstar = float(cal_obj[k])
+                        except Exception:
+                            pstar = None
+                        break
+
         except Exception as e:
             if strict:
                 raise BundleError(f"Failed to load/parse {calib_json.name}: {e}") from e
