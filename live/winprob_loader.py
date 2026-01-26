@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import warnings
+
 import numpy as np
 import pandas as pd
 
@@ -362,16 +364,28 @@ class WinProbScorer:
 
     def _predict_proba(self, df: pd.DataFrame) -> float:
         try:
-            if hasattr(self.model, "predict_proba"):
-                p = float(self.model.predict_proba(df)[:, 1][0])
-            else:
-                p = float(self.model.predict(df)[0])
+            with warnings.catch_warnings():
+                # LightGBM sklearn wrapper warns if it was fit with feature names but receives numpy
+                # (common when a sklearn Pipeline/transformer converts DataFrame->ndarray).
+                warnings.filterwarnings(
+                    "ignore",
+                    message=r"X does not have valid feature names, but .* was fitted with feature names",
+                    category=UserWarning,
+                )
+
+                if hasattr(self.model, "predict_proba"):
+                    p = float(self.model.predict_proba(df)[:, 1][0])
+                else:
+                    p = float(self.model.predict(df)[0])
+
         except Exception as e:
             raise BundleError(f"Model predict failed (kind={self.model_kind}): {e}") from e
 
         if not np.isfinite(p):
             raise BundleError(f"Model returned non-finite probability: {p}")
         return float(min(max(p, 0.0), 1.0))
+
+
 
     def _calibrate(self, p_raw: float) -> float:
         cal = self.calibrator

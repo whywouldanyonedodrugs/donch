@@ -393,6 +393,31 @@ def load_bundle(
     if pstar is None:
         pstar = _extract_pstar(thresholds) or _extract_pstar(deployment_config)
 
+    # Diagnostics only (no behavior change): if p* is still missing, log candidate keys
+    if pstar is None:
+        def _collect_hint_keys(obj: Any, out: List[str], prefix: str = "", depth: int = 0) -> None:
+            if depth > 4:
+                return
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    if isinstance(k, str):
+                        kl = k.lower()
+                        if any(s in kl for s in ("pstar", "p_star", "winprob", "meta_prob", "meta", "gate")):
+                            out.append(prefix + k)
+                    _collect_hint_keys(v, out, prefix + (k + ".") if isinstance(k, str) else prefix, depth + 1)
+            elif isinstance(obj, list):
+                for i, v in enumerate(obj[:50]):
+                    _collect_hint_keys(v, out, prefix + f"[{i}].", depth + 1)
+
+        hints: List[str] = []
+        _collect_hint_keys(thresholds, hints, prefix="thresholds.", depth=0)
+        _collect_hint_keys(deployment_config, hints, prefix="deployment_config.", depth=0)
+        if hints:
+            LOG.warning("p* not found; candidate keys in artifacts (subset): %s", sorted(set(hints))[:40])
+        else:
+            LOG.warning("p* not found; no obvious candidate keys (pstar/winprob/meta/gate) in thresholds/deployment_config.")
+
+
     # Defensive: keep only finite probabilities in [0, 1]
     if pstar is not None:
         try:
