@@ -1,6 +1,7 @@
 # live/parity_utils.py
 import pandas as pd
 import numpy as np
+from typing import Any, Dict, Optional, Tuple
 from . import indicators as ta
 
 def _norm_tf(tf: str) -> str:
@@ -88,3 +89,98 @@ def donchian_upper_days_no_lookahead(high_5m: pd.Series, n_days: int) -> pd.Seri
     keyed = don_daily.reindex(high_5m.index.floor("D"))
     arr = keyed.ffill().to_numpy(dtype=float)
     return pd.Series(arr, index=high_5m.index)
+
+# =============================================================================
+# META scope evaluation (pure helper; unit-testable)
+# =============================================================================
+
+def _to_float_or_none(v: Any) -> Optional[float]:
+    """
+    Best-effort parse to float. Supports ints, floats, numpy scalars, bools,
+    and numeric strings (e.g. "1", "0", "1.0", "0.0").
+    Returns None if missing/unparseable/non-finite.
+    """
+    if v is None:
+        return None
+
+    # Handle pandas/np missing
+    try:
+        if isinstance(v, (float, np.floating)) and (not np.isfinite(float(v))):
+            return None
+    except Exception:
+        pass
+
+    # Strings: accept numeric
+    if isinstance(v, str):
+        s = v.strip()
+        if s == "":
+            return None
+        try:
+            x = float(s)
+        except Exception:
+            return None
+        return float(x) if np.isfinite(float(x)) else None
+
+    # Everything else -> try float()
+    try:
+        x = float(v)
+    except Exception:
+        return None
+
+    return float(x) if np.isfinite(float(x)) else None
+
+
+def eval_meta_scope(pstar_scope: Optional[str], meta_row: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+    """
+    Evaluate meta scope with fail-closed semantics.
+
+    Supported scopes:
+      - None / ""     : scope passes (True)
+      - "RISK_ON_1"   : require risk_on_1 == 1, with alias fallback to risk_on if risk_on_1 missing/NaN.
+
+    Returns:
+      (scope_ok, info)
+    where info contains:
+      - scope: normalized scope string or None
+      - risk_on_1_raw: raw meta_row["risk_on_1"] (or None)
+      - risk_on_raw: raw meta_row["risk_on"] (or None)
+      - scope_val: numeric used for decision (after alias+parse), or None
+      - scope_src: "risk_on_1" | "risk_on" | None
+    """
+    sc = (pstar_scope or "").strip()
+    sc_u = sc.upper() if sc else ""
+
+    info: Dict[str, Any] = {
+        "scope": sc_u or None,
+        "risk_on_1_raw": meta_row.get("risk_on_1", None),
+        "risk_on_raw": meta_row.get("risk_on", None),
+        "scope_val": None,
+        "scope_src": None,
+    }
+
+    # No scope configured -> pass
+    if not sc_u:
+        return True, info
+
+    # Only supported scope (strict)
+    if sc_u != "RISK_ON_1":
+        return False, info
+
+    # Alias logic: prefer risk_on_1 if it's finite, else fallback to risk_on
+    v1 = info["risk_on_1_raw"]
+    v0 = info["risk_on_raw"]
+
+    f1 = _to_float_or_none(v1)
+    if f1 is not None:
+        info["scope_val"] = f1
+        info["scope_src"] = "risk_on_1"
+        return (f1 == 1.0), info
+
+    f0 = _to_float_or_none(v0)
+    if f0 is not None:
+        info["scope_val"] = f0
+        info["scope_src"] = "risk_on"
+        return (f0 == 1.0), info
+
+    # Missing/unparseable -> fail closed
+    return False, info

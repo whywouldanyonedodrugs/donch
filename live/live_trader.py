@@ -55,7 +55,7 @@ from pydantic_settings import BaseSettings
 from .strategy_engine import StrategyEngine
 
 from .feature_builder import FeatureBuilder
-from .parity_utils import resample_ohlcv, donchian_upper_days_no_lookahead
+from .parity_utils import resample_ohlcv, donchian_upper_days_no_lookahead, eval_meta_scope
 
 from .oi_funding import fetch_series_5m, compute_oi_funding_features
 
@@ -1999,77 +1999,103 @@ class LiveTrader:
             except Exception:
                 pstar = None
 
-            meta_gate_required = bool(self.cfg.get("META_GATE_REQUIRED", False))
+            # ---------------- META: decision (scope + threshold) ----------------
+            meta_required = bool(getattr(cfg, "META_MODEL_ENABLED", True))
 
-            # Scope (artifact-driven): offline selected p* under a particular slice (e.g., RISK_ON_1).
-            pstar_scope = getattr(self.winprob, "pstar_scope", None) if getattr(self, "winprob", None) else None
+            # Defaults (safe for later diagnostics/logging even if gate is bypassed)
+            pstar_scope = getattr(winprob, "pstar_scope", None) if winprob is not None else None
+            scope_ok, scope_info = eval_meta_scope(pstar_scope, meta_row)
 
-            if not schema_ok:
-                meta_ok = False
-                reason = f"schema_fail:{meta_err}"
-            elif required:
-                # model is expected to be present
-                if p_cal is None:
+            risk_on_1_raw = scope_info.get("risk_on_1_raw", None)
+            risk_on_raw   = scope_info.get("risk_on_raw", None)
+            scope_val     = scope_info.get("scope_val", None)   # numeric used (after alias+parse), or None
+            scope_src     = scope_info.get("scope_src", None)   # "risk_on_1" | "risk_on" | None
+
+            def _fmt_raw(x: Any) -> str:
+                if x is None:
+                    return "None"
+                try:
+                    if isinstance(x, (float, np.floating)) and (not np.isfinite(float(x))):
+                        return "nan"
+                except Exception:
+                    pass
+                try:
+                    return str(x)
+                except Exception:
+                    return repr(x)
+
+            meta_ok = False
+            reason = ""
+            err = None
+
+            # Note: threshold gating only applies when pstar is present. If absent and gate not required, pass.
+            if pstar is None:
+                if not meta_required:
+                    meta_ok = True
+                    reason = "meta_disabled"
+                else:
                     meta_ok = False
-                    reason = "no_prob"
+                    reason = "no_pstar"
+            else:
+                # pstar present -> enforce scope first, then threshold
+                if not scope_ok:
+                    meta_ok = False
+                    reason = f"scope_fail:{(pstar_scope or 'NONE')}"
                 else:
                     try:
-                        p_cal_f = float(p_cal)
+                        p_cal_f = float(p_cal) if p_cal is not None else float("nan")
                     except Exception:
                         p_cal_f = float("nan")
 
-                    if not np.isfinite(p_cal_f):
-                        meta_ok = False
-                        reason = "no_prob"
-                    elif pstar is None:
-                        meta_ok = (not meta_gate_required)
-                        reason = "missing_pstar" if meta_gate_required else "no_threshold_pass"
+                    try:
+                        pstar_f = float(pstar)
+                    except Exception:
+                        pstar_f = float("nan")
+
+                    if np.isfinite(p_cal_f) and np.isfinite(pstar_f):
+                        meta_ok = (p_cal_f >= pstar_f)
+                        reason = "ok" if meta_ok else "below_pstar"
                     else:
-                        # Apply scope if specified (offline parity)
-                        scope_ok = True
-                        if isinstance(pstar_scope, str) and pstar_scope.strip():
-                            sc = pstar_scope.strip().upper()
-                            if sc == "RISK_ON_1":
-                                v = meta_row.get("risk_on_1", meta_row.get("risk_on", None))
-                                try:
-                                    fv = float(v)
-                                    scope_ok = (np.isfinite(fv) and fv >= 0.5)
-                                except Exception:
-                                    scope_ok = (str(v) == "1")
-                            else:
-                                # Unknown scope -> fail closed (strict parity preference)
-                                scope_ok = False
+                        meta_ok = False
+                        reason = "bad_p_cal_or_pstar"
 
-                        if not scope_ok:
-                            meta_ok = False
-                            reason = f"scope_fail:{pstar_scope}"
-                        else:
-                            meta_ok = (p_cal_f >= pstar)
-                            reason = f"prob_{p_cal_f:.3f}<{pstar:.3f}" if not meta_ok else "pass"
+            # ---------------- META_DECISION log (expanded observability) ----------------
+            try:
+                p_cal_f_log = float(p_cal) if p_cal is not None else float("nan")
+            except Exception:
+                p_cal_f_log = float("nan")
+            try:
+                pstar_f_log = float(pstar) if pstar is not None else float("nan")
+            except Exception:
+                pstar_f_log = float("nan")
 
-            else:
-                # No model loaded or no required features -> neutral pass
-                meta_ok = True
-                reason = "no_model_pass"
+            pstar_scope_str = _fmt_raw(pstar_scope)
+            scope_val_str = _fmt_raw(scope_val)
+            scope_src_str = _fmt_raw(scope_src)
 
-
-            # 3. Clean Logging (strat_ok is just the current state of should_enter)
-            strat_ok = should_enter 
-
-            pstar_str = "None" if pstar is None else f"{pstar:.4f}"
             LOG.info(
-                "META_DECISION bundle=%s symbol=%s decision_ts=%s schema_ok=%s p_cal=%s pstar=%s meta_ok=%s strat_ok=%s reason=%s err=%s",
-                self.bundle_id,
+                "META_DECISION bundle=%s symbol=%s decision_ts=%s schema_ok=%s "
+                "p_cal=%s pstar=%s pstar_scope=%s "
+                "risk_on_1=%s risk_on=%s scope_val=%s scope_src=%s scope_ok=%s "
+                "meta_ok=%s strat_ok=%s reason=%s err=%s",
+                bundle_id,
                 symbol,
-                (decision_ts.isoformat() if decision_ts is not None else "None"),
+                decision_ts.isoformat(),
                 schema_ok,
-                ("None" if p_cal is None else f"{float(p_cal):.4f}"),
-                pstar_str,
-                meta_ok,
-                strat_ok,
+                f"{p_cal_f_log:.4f}" if np.isfinite(p_cal_f_log) else "nan",
+                f"{pstar_f_log:.4f}" if np.isfinite(pstar_f_log) else "nan",
+                pstar_scope_str,
+                _fmt_raw(risk_on_1_raw),
+                _fmt_raw(risk_on_raw),
+                scope_val_str,
+                scope_src_str,
+                bool(scope_ok),
+                bool(meta_ok),
+                bool(strat_ok),
                 reason,
-                ("None" if meta_err is None else str(meta_err)),
+                err,
             )
+
 
 
             # Strict safe-mode: invalid schema => no-trade; meta veto => no-trade
