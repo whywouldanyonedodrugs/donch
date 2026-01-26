@@ -1043,8 +1043,11 @@ class LiveTrader:
     def _augment_meta_with_regime_sets(self, meta_full: dict) -> None:
         """
         Mutates meta_full in-place. Adds:
-          funding_regime_code, oi_regime_code, crowd_side,
-          S1/S2/S3/S4/S6 when prerequisites are present.
+        funding_regime_code, oi_regime_code, crowd_side,
+        S1/S2/S3/S4/S6 when prerequisites are present.
+
+        Also adds:
+        risk_on, risk_on_1 (required for decision.scope == "RISK_ON_1")
 
         This is deterministic and mirrors offline logic as provided by the offline team.
         """
@@ -1085,6 +1088,59 @@ class LiveTrader:
             oic = int(float(meta_full["oi_regime_code"]))
             meta_full["S3_funding_x_oi"] = float((frc + 1) * 3 + (oic + 1))
 
+        # -----------------------------
+        # risk_on / risk_on_1 (scope feature)
+        # Offline logic:
+        #   risk_on = int((regime_up == 1) and (btc_trend_slope >= 0) and (btc_vol_level < btc_vol_hi))
+        # with fallback keys:
+        #   btc_trend_slope: btcusdt_trend_slope else btc_trend_slope
+        #   btc_vol_level:   btcusdt_vol_regime_level else btc_vol_regime_level
+        # Fail-closed if missing/NaN/unparseable.
+        # -----------------------------
+        def _first_present(*keys: str):
+            for k in keys:
+                if k in meta_full:
+                    return meta_full.get(k)
+            return None
+
+        try:
+            btc_vol_hi = float(self.regime_thresholds["btc_vol_hi"])
+        except Exception:
+            btc_vol_hi = np.nan
+
+        try:
+            regime_up = int(float(meta_full.get("regime_up", 0.0) or 0.0))
+        except Exception:
+            regime_up = 0
+
+        tr_raw = _first_present("btcusdt_trend_slope", "btc_trend_slope")
+        vl_raw = _first_present("btcusdt_vol_regime_level", "btc_vol_regime_level")
+
+        try:
+            btc_trend_slope = float(tr_raw)
+        except Exception:
+            btc_trend_slope = np.nan
+
+        try:
+            btc_vol_level = float(vl_raw)
+        except Exception:
+            btc_vol_level = np.nan
+
+        risk_on = 0
+        if (
+            regime_up == 1
+            and np.isfinite(btc_trend_slope)
+            and (btc_trend_slope >= 0.0)
+            and np.isfinite(btc_vol_level)
+            and np.isfinite(btc_vol_hi)
+            and (btc_vol_level < btc_vol_hi)
+        ):
+            risk_on = 1
+
+        # Offline note: risk_on_1 is effectively an alias used for scope gating.
+        meta_full["risk_on"] = float(risk_on)
+        meta_full["risk_on_1"] = float(risk_on)
+
         # The remaining features need regime_code_1d + markov_state_4h + vol_prob_low_1d etc.
         # Only compute them when those prereqs exist (to avoid KeyError).
         if "regime_code_1d" in meta_full:
@@ -1118,29 +1174,34 @@ class LiveTrader:
                     meta_full["S4_crowd_x_trend1d"] = float((cs + 1) * 2 + int(trc))
 
         # live/live_trader.py (inside _augment_meta_with_regime_sets), S6_fresh_x_compress section
-
         if ("days_since_prev_break" in meta_full) and ("consolidation_range_atr" in meta_full):
             try:
                 t = self._regimes_thresholds.get("S6_fresh_x_compress", {}) or {}
                 fresh_q33 = t.get("fresh_q33")
                 fresh_q66 = t.get("fresh_q66")
-                comp_q33  = t.get("compression_q33")
-                comp_q66  = t.get("compression_q66")
+                comp_q33 = t.get("compression_q33")
+                comp_q66 = t.get("compression_q66")
 
                 fresh = float(meta_full["days_since_prev_break"])
-                comp  = float(meta_full["consolidation_range_atr"])
+                comp = float(meta_full["consolidation_range_atr"])
 
                 # Match offline: only compute S6 if both inputs are finite
-                if np.isfinite(fresh) and np.isfinite(comp) and \
-                fresh_q33 is not None and fresh_q66 is not None and \
-                comp_q33 is not None and comp_q66 is not None:
+                if (
+                    np.isfinite(fresh)
+                    and np.isfinite(comp)
+                    and fresh_q33 is not None
+                    and fresh_q66 is not None
+                    and comp_q33 is not None
+                    and comp_q66 is not None
+                ):
                     fcode = self._tercile_code(fresh, float(fresh_q33), float(fresh_q66))
-                    ccode = self._tercile_code(comp,  float(comp_q33),  float(comp_q66))
+                    ccode = self._tercile_code(comp, float(comp_q33), float(comp_q66))
                     meta_full["S6_fresh_x_compress"] = float(fcode * 3 + ccode)
                 else:
                     meta_full["S6_fresh_x_compress"] = np.nan
             except Exception:
                 pass
+
 
     def _missing_required_features(self, row: dict, required: list[str]) -> list[str]:
         missing = []
