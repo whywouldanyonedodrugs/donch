@@ -2010,16 +2010,21 @@ class LiveTrader:
             eq_feats = self.feature_builder.compute_entry_quality_features(df5, decision_ts)
             meta_full.update(eq_feats)
 
-
+            # --- Strict-parity: regime-set derivations (includes risk_on / risk_on_1 for scope gating) ---
+            try:
+                self._augment_meta_with_regime_sets(meta_full)
+            except Exception as e:
+                LOG.warning("bundle=%s augment_meta_with_regime_sets failed: %s", getattr(self, "bundle_id", "no_bundle"), e)
 
             # ---------------- 10. Strict Slice & Score ----------------
             required = list(getattr(self.winprob, "raw_features", []) or [])
-            
+
             # Construct row with EXACTLY required keys (WinProbScorer expects strict input)
             if required:
                 meta_row = {k: meta_full.get(k, np.nan) for k in required}
             else:
                 meta_row = {}
+
 
             # --- Golden row injector (parity testing only) ---
             try:
