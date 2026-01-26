@@ -4,6 +4,7 @@ import numpy as np
 from typing import Any, Dict, Optional, Tuple
 from . import indicators as ta
 
+
 def _norm_tf(tf: str) -> str:
     """
     Normalize timeframe strings to pandas-safe aliases.
@@ -26,6 +27,7 @@ def _norm_tf(tf: str) -> str:
         return tf.upper()
 
     return tf
+
 
 def resample_ohlcv(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
     """
@@ -68,12 +70,14 @@ def resample_ohlcv_robust(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
     })
     return agg.dropna()
 
+
 def map_to_left_index(target_index: pd.DatetimeIndex, source_series: pd.Series) -> pd.Series:
     """
     Forward-fill source_series onto target_index.
     Matches offline indicators.map_to_left_index.
     """
     return source_series.reindex(target_index, method="ffill")
+
 
 def donchian_upper_days_no_lookahead(high_5m: pd.Series, n_days: int) -> pd.Series:
     """
@@ -90,27 +94,26 @@ def donchian_upper_days_no_lookahead(high_5m: pd.Series, n_days: int) -> pd.Seri
     arr = keyed.ffill().to_numpy(dtype=float)
     return pd.Series(arr, index=high_5m.index)
 
+
 # =============================================================================
 # META scope evaluation (pure helper; unit-testable)
 # =============================================================================
 
 def _to_float_or_none(v: Any) -> Optional[float]:
     """
-    Best-effort parse to float. Supports ints, floats, numpy scalars, bools,
-    and numeric strings (e.g. "1", "0", "1.0", "0.0").
-    Returns None if missing/unparseable/non-finite.
+    Best-effort parse to float. Returns None if missing/unparseable/non-finite.
+    This is used as the internal primitive for "to_numeric(errors='coerce')".
     """
     if v is None:
         return None
 
-    # Handle pandas/np missing
+    # pandas/np missing
     try:
         if isinstance(v, (float, np.floating)) and (not np.isfinite(float(v))):
             return None
     except Exception:
         pass
 
-    # Strings: accept numeric
     if isinstance(v, str):
         s = v.strip()
         if s == "":
@@ -121,7 +124,6 @@ def _to_float_or_none(v: Any) -> Optional[float]:
             return None
         return float(x) if np.isfinite(float(x)) else None
 
-    # Everything else -> try float()
     try:
         x = float(v)
     except Exception:
@@ -132,55 +134,60 @@ def _to_float_or_none(v: Any) -> Optional[float]:
 
 def eval_meta_scope(pstar_scope: Optional[str], meta_row: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
     """
-    Evaluate meta scope with fail-closed semantics.
+    Evaluate meta scope with offline-parity semantics and fail-closed behavior.
+
+    Offline semantics for decision.scope == "RISK_ON_1":
+      - Use risk_on_1 if the key exists in the row dict.
+      - Otherwise (only if the key is absent), fallback to risk_on.
+      - Coerce with to_numeric(errors='coerce').fillna(0), then compare == 1.
+      - If neither key exists at all, offline raises; live returns False and flags missing_cols.
 
     Supported scopes:
       - None / ""     : scope passes (True)
-      - "RISK_ON_1"   : require risk_on_1 == 1, with alias fallback to risk_on if risk_on_1 missing/NaN.
+      - "RISK_ON_1"   : described above
+      - any other     : False (fail-closed)
 
-    Returns:
-      (scope_ok, info)
-    where info contains:
-      - scope: normalized scope string or None
-      - risk_on_1_raw: raw meta_row["risk_on_1"] (or None)
-      - risk_on_raw: raw meta_row["risk_on"] (or None)
-      - scope_val: numeric used for decision (after alias+parse), or None
-      - scope_src: "risk_on_1" | "risk_on" | None
+    Returns (scope_ok, info) where info includes raw inputs and the chosen source.
     """
     sc = (pstar_scope or "").strip()
     sc_u = sc.upper() if sc else ""
+
+    has_risk_on_1 = ("risk_on_1" in meta_row)
+    has_risk_on = ("risk_on" in meta_row)
 
     info: Dict[str, Any] = {
         "scope": sc_u or None,
         "risk_on_1_raw": meta_row.get("risk_on_1", None),
         "risk_on_raw": meta_row.get("risk_on", None),
-        "scope_val": None,
-        "scope_src": None,
+        "risk_on_1_present": bool(has_risk_on_1),
+        "risk_on_present": bool(has_risk_on),
+        "scope_val": None,     # numeric value used after coercion/fillna(0)
+        "scope_src": None,     # "risk_on_1" | "risk_on" | None
+        "missing_cols": False,
     }
 
-    # No scope configured -> pass
     if not sc_u:
         return True, info
 
-    # Only supported scope (strict)
     if sc_u != "RISK_ON_1":
         return False, info
 
-    # Alias logic: prefer risk_on_1 if it's finite, else fallback to risk_on
-    v1 = info["risk_on_1_raw"]
-    v0 = info["risk_on_raw"]
-
-    f1 = _to_float_or_none(v1)
-    if f1 is not None:
-        info["scope_val"] = f1
+    # Choose column by presence only (no row-wise fallback when present-but-NaN)
+    if has_risk_on_1:
+        raw = meta_row.get("risk_on_1", None)
+        x = _to_float_or_none(raw)
+        x = 0.0 if x is None else float(x)
+        info["scope_val"] = x
         info["scope_src"] = "risk_on_1"
-        return (f1 == 1.0), info
+        return (x == 1.0), info
 
-    f0 = _to_float_or_none(v0)
-    if f0 is not None:
-        info["scope_val"] = f0
+    if has_risk_on:
+        raw = meta_row.get("risk_on", None)
+        x = _to_float_or_none(raw)
+        x = 0.0 if x is None else float(x)
+        info["scope_val"] = x
         info["scope_src"] = "risk_on"
-        return (f0 == 1.0), info
+        return (x == 1.0), info
 
-    # Missing/unparseable -> fail closed
+    info["missing_cols"] = True
     return False, info

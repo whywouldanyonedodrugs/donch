@@ -1988,7 +1988,9 @@ class LiveTrader:
 
             # --- Logic Glue: Define thresholds and gating verdict ---
             # p* source priority: bundle.pstar (artifacts) -> config META_PROB_THRESHOLD -> None (gate disabled)
-            pstar = getattr(self.winprob, "pstar", None) if getattr(self, "winprob", None) else None
+            wp = getattr(self, "winprob", None)
+
+            pstar = getattr(wp, "pstar", None) if wp is not None else None
             if pstar is None:
                 pstar = self.cfg.get("META_PROB_THRESHOLD", None)
 
@@ -2002,16 +2004,16 @@ class LiveTrader:
             # ---------------- META: decision (scope + threshold) ----------------
             meta_required = bool(getattr(cfg, "META_MODEL_ENABLED", True))
 
-            # Defaults (safe for later diagnostics/logging even if gate is bypassed)
-            pstar_scope = getattr(winprob, "pstar_scope", None) if winprob is not None else None
+            pstar_scope = getattr(wp, "pstar_scope", None) if wp is not None else None
             scope_ok, scope_info = eval_meta_scope(pstar_scope, meta_row)
 
             risk_on_1_raw = scope_info.get("risk_on_1_raw", None)
             risk_on_raw   = scope_info.get("risk_on_raw", None)
-            scope_val     = scope_info.get("scope_val", None)   # numeric used (after alias+parse), or None
-            scope_src     = scope_info.get("scope_src", None)   # "risk_on_1" | "risk_on" | None
+            scope_val     = scope_info.get("scope_val", None)
+            scope_src     = scope_info.get("scope_src", None)
+            missing_cols  = bool(scope_info.get("missing_cols", False))
 
-            def _fmt_raw(x: Any) -> str:
+            def _fmt_raw(x) -> str:
                 if x is None:
                     return "None"
                 try:
@@ -2026,40 +2028,56 @@ class LiveTrader:
 
             meta_ok = False
             reason = ""
-            err = None
+            err = meta_err  # propagate scorer error string if any
 
-            # Note: threshold gating only applies when pstar is present. If absent and gate not required, pass.
-            if pstar is None:
-                if not meta_required:
-                    meta_ok = True
-                    reason = "meta_disabled"
-                else:
-                    meta_ok = False
-                    reason = "no_pstar"
+            # Fail-closed on schema problems (no-trade)
+            if not bool(schema_ok):
+                meta_ok = False
+                reason = "schema_fail"
+                if err is None:
+                    err = "schema_fail"
             else:
-                # pstar present -> enforce scope first, then threshold
-                if not scope_ok:
-                    meta_ok = False
-                    reason = f"scope_fail:{(pstar_scope or 'NONE')}"
-                else:
-                    try:
-                        p_cal_f = float(p_cal) if p_cal is not None else float("nan")
-                    except Exception:
-                        p_cal_f = float("nan")
-
-                    try:
-                        pstar_f = float(pstar)
-                    except Exception:
-                        pstar_f = float("nan")
-
-                    if np.isfinite(p_cal_f) and np.isfinite(pstar_f):
-                        meta_ok = (p_cal_f >= pstar_f)
-                        reason = "ok" if meta_ok else "below_pstar"
+                # Note: threshold gating only applies when pstar is present.
+                if pstar is None:
+                    if not meta_required:
+                        meta_ok = True
+                        reason = "meta_disabled"
                     else:
                         meta_ok = False
-                        reason = "bad_p_cal_or_pstar"
+                        reason = "no_pstar"
+                else:
+                    # pstar present -> enforce scope first, then threshold
+                    if not bool(scope_ok):
+                        meta_ok = False
+                        if missing_cols:
+                            reason = f"scope_error:{(pstar_scope or 'NONE')}"
+                            if err is None:
+                                err = "scope_missing_cols"
+                        else:
+                            reason = f"scope_fail:{(pstar_scope or 'NONE')}"
+                    else:
+                        try:
+                            p_cal_f = float(p_cal) if p_cal is not None else float("nan")
+                        except Exception:
+                            p_cal_f = float("nan")
+
+                        try:
+                            pstar_f = float(pstar)
+                        except Exception:
+                            pstar_f = float("nan")
+
+                        if np.isfinite(p_cal_f) and np.isfinite(pstar_f):
+                            meta_ok = (p_cal_f >= pstar_f)
+                            reason = "ok" if meta_ok else "below_pstar"
+                        else:
+                            meta_ok = False
+                            reason = "bad_p_cal_or_pstar"
+                            if err is None:
+                                err = "bad_p_cal_or_pstar"
 
             # ---------------- META_DECISION log (expanded observability) ----------------
+            bundle = getattr(self, "bundle_id", None) or "no_bundle"
+
             try:
                 p_cal_f_log = float(p_cal) if p_cal is not None else float("nan")
             except Exception:
@@ -2069,37 +2087,32 @@ class LiveTrader:
             except Exception:
                 pstar_f_log = float("nan")
 
-            pstar_scope_str = _fmt_raw(pstar_scope)
-            scope_val_str = _fmt_raw(scope_val)
-            scope_src_str = _fmt_raw(scope_src)
-
             LOG.info(
                 "META_DECISION bundle=%s symbol=%s decision_ts=%s schema_ok=%s "
                 "p_cal=%s pstar=%s pstar_scope=%s "
                 "risk_on_1=%s risk_on=%s scope_val=%s scope_src=%s scope_ok=%s "
                 "meta_ok=%s strat_ok=%s reason=%s err=%s",
-                bundle_id,
+                bundle,
                 symbol,
                 decision_ts.isoformat(),
-                schema_ok,
+                bool(schema_ok),
                 f"{p_cal_f_log:.4f}" if np.isfinite(p_cal_f_log) else "nan",
                 f"{pstar_f_log:.4f}" if np.isfinite(pstar_f_log) else "nan",
-                pstar_scope_str,
+                _fmt_raw(pstar_scope),
                 _fmt_raw(risk_on_1_raw),
                 _fmt_raw(risk_on_raw),
-                scope_val_str,
-                scope_src_str,
+                _fmt_raw(scope_val),
+                _fmt_raw(scope_src),
                 bool(scope_ok),
                 bool(meta_ok),
                 bool(strat_ok),
                 reason,
-                err,
+                _fmt_raw(err),
             )
-
-
 
             # Strict safe-mode: invalid schema => no-trade; meta veto => no-trade
             should_enter = bool(should_enter) and bool(meta_ok)
+
 
 
             # Keep existing debug line if present
@@ -2125,25 +2138,9 @@ class LiveTrader:
                 g_vol = vol_mult >= vol_needed
                 g_regime = (regime_up == 1.0) or (not regime_block)
                 g_micro = (atr_pct >= float(self.cfg.get("ENTRY_MIN_ATR_PCT", 0.0)))
-                # Mirror the actual gate (including scope)
-                if pstar is None and not meta_gate_required:
-                    g_meta = True
-                else:
-                    sc_ok = True
-                    try:
-                        sc = (getattr(self.winprob, "pstar_scope", None) or "").strip().upper()
-                        if sc == "RISK_ON_1":
-                            v = meta_row.get("risk_on_1", meta_row.get("risk_on", None))
-                            try:
-                                sc_ok = (float(v) >= 0.5)
-                            except Exception:
-                                sc_ok = (str(v) == "1")
-                        elif sc:
-                            sc_ok = False
-                    except Exception:
-                        sc_ok = True
+                # Mirror the actual meta gate (already computed above)
+                g_meta = bool(meta_ok)
 
-                    g_meta = (p_cal is not None and pstar is not None and sc_ok and float(p_cal) >= float(pstar))
 
 
 
