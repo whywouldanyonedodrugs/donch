@@ -2001,6 +2001,9 @@ class LiveTrader:
             except Exception:
                 pstar = None
 
+            # Strategy verdict *before* meta veto (observability only)
+            strat_ok = bool(should_enter)
+
             # ---------------- META: decision (scope + threshold) ----------------
             meta_required = bool(getattr(cfg, "META_MODEL_ENABLED", True))
 
@@ -2028,7 +2031,7 @@ class LiveTrader:
 
             meta_ok = False
             reason = ""
-            err = meta_err  # propagate scorer error string if any
+            err = meta_err  # keep scorer error in the log if present
 
             # Fail-closed on schema problems (no-trade)
             if not bool(schema_ok):
@@ -2037,7 +2040,6 @@ class LiveTrader:
                 if err is None:
                     err = "schema_fail"
             else:
-                # Note: threshold gating only applies when pstar is present.
                 if pstar is None:
                     if not meta_required:
                         meta_ok = True
@@ -2112,7 +2114,6 @@ class LiveTrader:
 
             # Strict safe-mode: invalid schema => no-trade; meta veto => no-trade
             should_enter = bool(should_enter) and bool(meta_ok)
-
 
 
             # Keep existing debug line if present
