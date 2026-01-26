@@ -2001,6 +2001,9 @@ class LiveTrader:
 
             meta_gate_required = bool(self.cfg.get("META_GATE_REQUIRED", False))
 
+            # Scope (artifact-driven): offline selected p* under a particular slice (e.g., RISK_ON_1).
+            pstar_scope = getattr(self.winprob, "pstar_scope", None) if getattr(self, "winprob", None) else None
+
             if not schema_ok:
                 meta_ok = False
                 reason = f"schema_fail:{meta_err}"
@@ -2022,8 +2025,28 @@ class LiveTrader:
                         meta_ok = (not meta_gate_required)
                         reason = "missing_pstar" if meta_gate_required else "no_threshold_pass"
                     else:
-                        meta_ok = (p_cal_f >= pstar)
-                        reason = f"prob_{p_cal_f:.3f}<{pstar:.3f}" if not meta_ok else "pass"
+                        # Apply scope if specified (offline parity)
+                        scope_ok = True
+                        if isinstance(pstar_scope, str) and pstar_scope.strip():
+                            sc = pstar_scope.strip().upper()
+                            if sc == "RISK_ON_1":
+                                v = meta_row.get("risk_on_1", meta_row.get("risk_on", None))
+                                try:
+                                    fv = float(v)
+                                    scope_ok = (np.isfinite(fv) and fv >= 0.5)
+                                except Exception:
+                                    scope_ok = (str(v) == "1")
+                            else:
+                                # Unknown scope -> fail closed (strict parity preference)
+                                scope_ok = False
+
+                        if not scope_ok:
+                            meta_ok = False
+                            reason = f"scope_fail:{pstar_scope}"
+                        else:
+                            meta_ok = (p_cal_f >= pstar)
+                            reason = f"prob_{p_cal_f:.3f}<{pstar:.3f}" if not meta_ok else "pass"
+
             else:
                 # No model loaded or no required features -> neutral pass
                 meta_ok = True
@@ -2076,7 +2099,26 @@ class LiveTrader:
                 g_vol = vol_mult >= vol_needed
                 g_regime = (regime_up == 1.0) or (not regime_block)
                 g_micro = (atr_pct >= float(self.cfg.get("ENTRY_MIN_ATR_PCT", 0.0)))
-                g_meta = True if (pstar is None and not meta_gate_required) else (p_cal is not None and float(p_cal) >= float(pstar))
+                # Mirror the actual gate (including scope)
+                if pstar is None and not meta_gate_required:
+                    g_meta = True
+                else:
+                    sc_ok = True
+                    try:
+                        sc = (getattr(self.winprob, "pstar_scope", None) or "").strip().upper()
+                        if sc == "RISK_ON_1":
+                            v = meta_row.get("risk_on_1", meta_row.get("risk_on", None))
+                            try:
+                                sc_ok = (float(v) >= 0.5)
+                            except Exception:
+                                sc_ok = (str(v) == "1")
+                        elif sc:
+                            sc_ok = False
+                    except Exception:
+                        sc_ok = True
+
+                    g_meta = (p_cal is not None and pstar is not None and sc_ok and float(p_cal) >= float(pstar))
+
 
 
 

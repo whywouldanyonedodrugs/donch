@@ -39,6 +39,7 @@ class ArtifactBundle:
     calibrator: Optional[Any]
     calibrator_path: Optional[Path]
     pstar: Optional[float]
+    pstar_scope: Optional[str]  # e.g. "RISK_ON_1"
 
     # optional extras (used by other live components)
     thresholds: Optional[dict]
@@ -47,6 +48,7 @@ class ArtifactBundle:
 
     # verification info
     file_hashes: Dict[str, str]
+
 
 
 def sha256_file(path: Path, chunk_bytes: int = 1024 * 1024) -> str:
@@ -188,10 +190,11 @@ def _extract_pstar(obj) -> float | None:
         return None
 
     candidate_dicts = [obj]
-    for k in ("meta", "gating", "thresholds", "meta_thresholds", "meta_gate"):
+    for k in ("meta", "gating", "thresholds", "meta_thresholds", "meta_gate", "decision"):
         v = obj.get(k)
         if isinstance(v, dict):
             candidate_dicts.append(v)
+
 
     keys = (
         "pstar", "p_star", "p*", "meta_pstar", "meta_threshold",
@@ -350,10 +353,27 @@ def load_bundle(
     thresholds = _read_json(required_paths["thresholds.json"]) if (meta_dir_p / "thresholds.json").exists() else None
     sizing_curve_path = (meta_dir_p / "sizing_curve.csv") if (meta_dir_p / "sizing_curve.csv").exists() else None
 
+    # Extract decision metadata (offline exporter stores p* here)
+    if isinstance(deployment_config, dict):
+        dec = deployment_config.get("decision")
+        if isinstance(dec, dict):
+            sc = dec.get("scope")
+            if isinstance(sc, str) and sc.strip():
+                pstar_scope = sc.strip()
+            # If threshold is present here, it is the canonical p* for gating
+            if pstar is None and ("threshold" in dec):
+                try:
+                    pstar = float(dec.get("threshold"))
+                except Exception:
+                    pstar = None
+
+
     # Load model/calibrator
     pstar: Optional[float] = None
+    pstar_scope: Optional[str] = None
     calibrator: Optional[Any] = None
     calibrator_path: Optional[Path] = None
+
 
     if is_pipeline:
         model = _joblib_load_guarded(model_joblib, strict_versions=strict)
@@ -402,7 +422,7 @@ def load_bundle(
                 for k, v in obj.items():
                     if isinstance(k, str):
                         kl = k.lower()
-                        if any(s in kl for s in ("pstar", "p_star", "winprob", "meta_prob", "meta", "gate")):
+                        if any(s in kl for s in ("pstar", "p_star", "winprob", "meta_prob", "meta", "gate", "decision", "threshold", "scope")):
                             out.append(prefix + k)
                     _collect_hint_keys(v, out, prefix + (k + ".") if isinstance(k, str) else prefix, depth + 1)
             elif isinstance(obj, list):
@@ -444,8 +464,10 @@ def load_bundle(
         calibrator=calibrator,
         calibrator_path=calibrator_path,
         pstar=pstar,
+        pstar_scope=pstar_scope,
         thresholds=thresholds,
         sizing_curve_path=sizing_curve_path,
         deployment_config=deployment_config,
         file_hashes=file_hashes,
     )
+

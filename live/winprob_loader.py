@@ -241,6 +241,7 @@ class WinProbScorer:
         self.model_kind = bundle.model_kind
         self.calibrator = bundle.calibrator
         self.pstar = bundle.pstar
+        self.pstar_scope = getattr(bundle, "pstar_scope", None)        
         self.strict_schema = bool(strict_schema)
 
         # Parse manifest → raw feature specs
