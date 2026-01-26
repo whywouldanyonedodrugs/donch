@@ -1738,8 +1738,18 @@ class LiveTrader:
                 ret_30d = (df1d['close'].iloc[-1] / df1d['close'].iloc[-cfg.STRUCTURAL_TREND_DAYS] - 1)
 
             tf_minutes = 5  # base timeframe minutes (used for vol_mult window)
+
             # Donch breakout info (robust to Verdict.don_break_len being None)
             don_len_raw = getattr(verdict, "don_break_len", None)
+
+            # Prefer what we injected into ctx (strict-parity source of truth), if present
+            if don_len_raw is None:
+                try:
+                    don_len_raw = ctx.get("don_break_len", ctx.get("donch_break_len", None))
+                except Exception:
+                    don_len_raw = None
+
+            # Fallback to YAML param
             if don_len_raw is None:
                 try:
                     don_len_raw = (
@@ -1748,6 +1758,8 @@ class LiveTrader:
                     )
                 except Exception:
                     don_len_raw = None
+
+            # Final fallback to cfg / hard default
             if don_len_raw is None:
                 don_len_raw = self.cfg.get("DON_N_DAYS", 20)
 
@@ -1755,11 +1767,11 @@ class LiveTrader:
                 don_len = int(don_len_raw)
             except Exception:
                 don_len = 20
+
             don_len = max(2, don_len)
 
-
-
             don_level = None
+
 
             # Strict-parity: prefer the injected Donchian breakout level (computed upstream with
             # no-lookahead daily construction). We keep it as the canonical value for diagnostics
