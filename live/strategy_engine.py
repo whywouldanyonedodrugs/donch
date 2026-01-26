@@ -13,6 +13,12 @@ class Verdict:
     should_enter: bool
     side: str                  # "long" | "short"
     reason_tags: List[str]
+    # Optional: carry Donch breakout details downstream (used by live_trader diagnostics/meta-row).
+    # These may be injected by the caller via ctx["don_break_level"] / ctx["don_break_len"],
+    # or computed by donch_breakout_daily_confirm.
+    don_break_level: Optional[float] = None
+    don_break_len: Optional[int] = None
+
 
 class StrategyEngine:
     """
@@ -60,6 +66,33 @@ class StrategyEngine:
         tfs = spec.get("timeframes", {}) or {}
         params = spec.get("params", {}) or {}
 
+        # We mutate context in ops (to store intermediate values like donch_break_level).
+        ctx = context
+
+        def _mk_verdict(should_enter: bool, side: str, tags: List[str]) -> Verdict:
+            """Create a Verdict and propagate any Donch breakout details from context."""
+            lvl = ctx.get("don_break_level", ctx.get("donch_break_level", None))
+            ln = ctx.get("don_break_len", ctx.get("donch_break_len", None))
+
+            lvl_f: Optional[float]
+            try:
+                if lvl is None:
+                    lvl_f = None
+                else:
+                    lvl_f = float(lvl)
+                    if not np.isfinite(lvl_f):
+                        lvl_f = None
+            except Exception:
+                lvl_f = None
+
+            ln_i: Optional[int]
+            try:
+                ln_i = int(ln) if ln is not None else None
+            except Exception:
+                ln_i = None
+
+            return Verdict(bool(should_enter), str(side), list(tags), don_break_level=lvl_f, don_break_len=ln_i)
+
         # resolve template refs like "@cfg.FOO" / "@params.BAR"
         def _resolve(x):
             if isinstance(x, str) and x.startswith("@"):
@@ -81,16 +114,16 @@ class StrategyEngine:
         veto = spec.get("veto", {}) or {}
         veto_any = veto.get("any", []) or []
         for op in veto_any:
-            ok, t = _eval_one(op, dfs, tfs, context, _resolve, self._ops)
+            ok, t = _eval_one(op, dfs, tfs, ctx, _resolve, self._ops)
             if not ok:
                 tags.append(f"veto:{t or list(op.keys())[0]}")
-                return Verdict(False, side, tags)
+                return _mk_verdict(False, side, tags)
 
         # "all" ops must all pass
         for op in all_ops:
-            ok, t = _eval_one(op, dfs, tfs, context, _resolve, self._ops)
+            ok, t = _eval_one(op, dfs, tfs, ctx, _resolve, self._ops)
             if not ok:
-                return Verdict(False, side, tags + [t or list(op.keys())[0]])
+                return _mk_verdict(False, side, tags + [t or list(op.keys())[0]])
             tags.append(t or list(op.keys())[0])
 
         # optional "any" block (if present, at least one must pass)
@@ -98,15 +131,16 @@ class StrategyEngine:
             passed_any = False
             temp_tags = []
             for op in any_ops:
-                ok, t = _eval_one(op, dfs, tfs, context, _resolve, self._ops)
+                ok, t = _eval_one(op, dfs, tfs, ctx, _resolve, self._ops)
                 if ok:
                     passed_any = True
                     temp_tags.append(t or list(op.keys())[0])
             if not passed_any:
-                return Verdict(False, side, tags + temp_tags)
+                return _mk_verdict(False, side, tags + temp_tags)
             tags.extend(temp_tags)
 
-        return Verdict(True, side, tags)
+        return _mk_verdict(True, side, tags)
+
 
     # --- internals ---
     def _load(self):
@@ -294,32 +328,72 @@ def _op_donch_breakout_daily_confirm(args, dfs, tfs, ctx, resolve):
     Require CLOSE above the upper band on the breakout bar.
     Args: { donch_tf: '1d', period: 20 }
     Returns (ok, meta) and stores ctx['donch_break_level'] for later ops.
-    """
-    # BEFORE:
-    # donch_tf = str(resolve(args.get("donch_tf", "1d")))
-    # n = int(resolve(args.get("period", 20)))
-    # ddf = dfs.get(donch_tf)
-    # if ddf is None or len(ddf) < n + 2:
-    #     return False, "donch_daily:insufficient"
 
-    # AFTER (alias-safe):
+    Strict-parity rule:
+      - If caller injected ctx["don_break_level"] (finite), use it and DO NOT recompute from 1d bars.
+    """
     donch_tf = str(resolve(args.get("donch_tf", "1d")))
     n = int(resolve(args.get("period", 20)))
+
+    # --- Prefer injected strict-parity breakout level ---
+    injected = ctx.get("don_break_level", None)
+    if injected is None:
+        injected = ctx.get("donch_break_level", None)
+
+    upper_inj: Optional[float] = None
+    try:
+        if injected is not None:
+            upper_inj = float(injected)
+            if not np.isfinite(upper_inj):
+                upper_inj = None
+    except Exception:
+        upper_inj = None
+
+    # Base close (decision bar close) avoids daily-bar ambiguity.
+    df_base = _get_tf_df(dfs, tfs, "base")
+    base_close = None
+    try:
+        if df_base is not None and (not df_base.empty):
+            base_close = float(df_base["close"].iloc[-1])
+    except Exception:
+        base_close = None
+
+    if upper_inj is not None:
+        if base_close is None or (not np.isfinite(base_close)):
+            # Injection present but no reliable decision close -> fail closed (no recompute).
+            return False, "donch_inj:missing_base_close"
+
+        # Publish both key variants for backward/forward compatibility.
+        ctx["don_break_level"] = float(upper_inj)
+        ctx["donch_break_level"] = float(upper_inj)
+        if "don_break_len" not in ctx:
+            ctx["don_break_len"] = int(ctx.get("donch_break_len", n) or n)
+        if "donch_break_len" not in ctx:
+            ctx["donch_break_len"] = int(ctx.get("don_break_len", n) or n)
+
+        ok = bool(base_close > upper_inj)
+        ctx["donch_dist_pct"] = (base_close - upper_inj) / upper_inj if upper_inj > 0 else 0.0
+        return ok, f"donch{int(ctx.get('don_break_len', n))}_inj_close>{upper_inj:.6f}"
+
+    # --- Fallback: recompute from daily bars only if injection is unavailable ---
     ddf = _get_tf_df(dfs, tfs, donch_tf)
     if ddf is None or len(ddf) < n + 2:
         return False, "donch_daily:insufficient"
 
-    # Use prior N full days (exclude the current unfinished/most recent day)
     dd = ddf.copy().sort_index()
-    highs = dd["high"].rolling(n).max().shift(1)  # prior full day
+    highs = dd["high"].rolling(n).max().shift(1)  # prior N full days
     last_close = float(dd["close"].iloc[-1])
     upper = float(highs.iloc[-1])
     ok = last_close > upper and np.isfinite(upper)
 
-    if ok:
-        ctx["donch_break_level"] = upper
-        ctx["donch_dist_pct"] = (last_close - upper) / upper if upper > 0 else 0.0
+    # Publish both key variants so downstream ops can consume either.
+    ctx["donch_break_level"] = upper
+    ctx["don_break_level"] = upper
+    ctx["donch_break_len"] = n
+    ctx["don_break_len"] = n
+    ctx["donch_dist_pct"] = (last_close - upper) / upper if upper > 0 else 0.0
     return ok, f"donch{n}_close>{upper:.6f}"
+
 
 def _op_micro_vol_filter(args, dfs, tfs, ctx, resolve):
     """
@@ -351,9 +425,14 @@ def _op_pullback_retest_close_above_break(args, dfs, tfs, ctx, resolve):
       - current close above the break.
     Args: { tf: '5m', eps_pct: 0.003, lookback_bars: 288 }
     """
-    level = ctx.get("donch_break_level", None)
-    if level is None or not np.isfinite(level):
+    level = ctx.get("don_break_level", ctx.get("donch_break_level", None))
+    try:
+        level = float(level) if level is not None else None
+    except Exception:
+        level = None
+    if level is None or (not np.isfinite(level)):
         return False, "retest:no_break_ctx"
+
 
     tf = str(resolve(args.get("tf", "5m")))
     eps = float(resolve(args.get("eps_pct", 0.003)))

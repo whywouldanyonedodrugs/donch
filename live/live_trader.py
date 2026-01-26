@@ -1742,16 +1742,44 @@ class LiveTrader:
 
 
             don_level = None
+
+            # Strict-parity: prefer the injected Donchian breakout level (computed upstream with
+            # no-lookahead daily construction). We keep it as the canonical value for diagnostics
+            # and for any downstream consumers.
             try:
-                if df1d is not None and len(df1d) >= (don_len + 2):
-                    don_upper = df1d['high'].rolling(don_len).max().shift(1)  # prior N full days
-                    don_level = float(don_upper.iloc[-1])
+                if np.isfinite(injected_level):
+                    don_level = float(injected_level)
             except Exception:
                 pass
-            if getattr(verdict, "don_break_level", None) is not None:
-                don_level = float(verdict.don_break_level)
+
+            # If the StrategyEngine returns its own don_break_level, log any divergence for triage,
+            # but do not override the injected level (injected is strict-parity source of truth).
+            if bool(self.cfg.get("DEBUG_SIGNAL_DIAG", False)):
+                try:
+                    v = getattr(verdict, "don_break_level", None)
+                    if v is not None:
+                        v_f = float(v)
+                        if np.isfinite(v_f) and don_level is not None and abs(v_f - don_level) > 1e-9:
+                            LOG.warning(
+                                "[STRICT-PAR] StrategyEngine don_break_level differs from injected level: "
+                                "engine=%.8f injected=%.8f symbol=%s ts=%s",
+                                v_f, don_level, symbol, str(decision_ts),
+                            )
+                except Exception:
+                    pass
+
+            # Fallback (should be rarely hit): compute from df1d with shift(1)
+            if don_level is None:
+                try:
+                    if df1d is not None and len(df1d) >= (don_len + 2):
+                        don_upper = df1d['high'].rolling(don_len).max().shift(1)  # prior N full days
+                        don_level = float(don_upper.iloc[-1])
+                except Exception:
+                    pass
+
             if don_level is None:
                 don_level = float(last['close'])
+
 
             # volume multiple: current 5m volume / rolling ~30d median
             try:
@@ -1769,12 +1797,15 @@ class LiveTrader:
             eth_above = 1.0 if float((eth_macd or {}).get("macd", 0.0)) > float((eth_macd or {}).get("signal", 0.0)) else 0.0
             regime_up = 1.0 if (eth_hist > 0 and eth_above == 1.0) else 0.0
 
-            # time cyclicals
-            now_utc = datetime.now(timezone.utc)
-            hour_of_day = now_utc.hour
-            day_of_week = now_utc.weekday()
+            # time cyclicals (strict-parity): derive from the decision timestamp, not wall-clock now()
+            ts_utc = decision_ts if decision_ts is not None else df5.index[-1].to_pydatetime()
+            if getattr(ts_utc, "tzinfo", None) is None:
+                ts_utc = ts_utc.replace(tzinfo=timezone.utc)
+            hour_of_day = ts_utc.hour
+            day_of_week = ts_utc.weekday()
             hour_sin = math.sin(2 * math.pi * hour_of_day / 24.0)
             hour_cos = math.cos(2 * math.pi * hour_of_day / 24.0)
+
 
             # derived distances
             atr_pct = (last['atr_1h'] / last['close']) if last['close'] > 0 else 0.0
@@ -1926,37 +1957,67 @@ class LiveTrader:
                 meta_err = "no_model_features"
 
             # --- Logic Glue: Define thresholds and gating verdict ---
-            # 1. Get Threshold
-            pstar = float(getattr(self.winprob, "pstar", 0.0) or self.cfg.get("META_PROB_THRESHOLD", 0.0) or 0.0)
+            # p* source priority: bundle.pstar (artifacts) -> config META_PROB_THRESHOLD -> None (gate disabled)
+            pstar = getattr(self.winprob, "pstar", None) if getattr(self, "winprob", None) else None
+            if pstar is None:
+                pstar = self.cfg.get("META_PROB_THRESHOLD", None)
 
-            # 2. Determine meta_ok
+            try:
+                pstar = float(pstar) if pstar is not None else None
+                if pstar is not None and ((not np.isfinite(pstar)) or pstar < 0.0 or pstar > 1.0):
+                    pstar = None
+            except Exception:
+                pstar = None
+
+            meta_gate_required = bool(self.cfg.get("META_GATE_REQUIRED", False))
+
             if not schema_ok:
                 meta_ok = False
                 reason = f"schema_fail:{meta_err}"
-            elif p_cal is not None:
-                meta_ok = (float(p_cal) >= pstar)
-                reason = f"prob_{p_cal:.3f}<{pstar:.3f}" if not meta_ok else "pass"
+            elif required:
+                # model is expected to be present
+                if p_cal is None:
+                    meta_ok = False
+                    reason = "no_prob"
+                else:
+                    try:
+                        p_cal_f = float(p_cal)
+                    except Exception:
+                        p_cal_f = float("nan")
+
+                    if not np.isfinite(p_cal_f):
+                        meta_ok = False
+                        reason = "no_prob"
+                    elif pstar is None:
+                        meta_ok = (not meta_gate_required)
+                        reason = "missing_pstar" if meta_gate_required else "no_threshold_pass"
+                    else:
+                        meta_ok = (p_cal_f >= pstar)
+                        reason = f"prob_{p_cal_f:.3f}<{pstar:.3f}" if not meta_ok else "pass"
             else:
-                # No model or empty requirements -> Pass (neutral)
+                # No model loaded or no required features -> neutral pass
                 meta_ok = True
                 reason = "no_model_pass"
+
 
             # 3. Clean Logging (strat_ok is just the current state of should_enter)
             strat_ok = should_enter 
 
+            pstar_str = "None" if pstar is None else f"{pstar:.4f}"
             LOG.info(
-                "META_DECISION bundle=%s symbol=%s decision_ts=%s schema_ok=%s p_cal=%s pstar=%.4f meta_ok=%s strat_ok=%s reason=%s err=%s",
+                "META_DECISION bundle=%s symbol=%s decision_ts=%s schema_ok=%s p_cal=%s pstar=%s meta_ok=%s strat_ok=%s reason=%s err=%s",
                 self.bundle_id,
                 symbol,
                 (decision_ts.isoformat() if decision_ts is not None else "None"),
                 schema_ok,
                 ("None" if p_cal is None else f"{float(p_cal):.4f}"),
-                pstar,
+                pstar_str,
                 meta_ok,
                 strat_ok,
                 reason,
                 ("None" if meta_err is None else str(meta_err)),
             )
+
 
             # Strict safe-mode: invalid schema => no-trade; meta veto => no-trade
             should_enter = bool(should_enter) and bool(meta_ok)
@@ -1985,7 +2046,8 @@ class LiveTrader:
                 g_vol = vol_mult >= vol_needed
                 g_regime = (regime_up == 1.0) or (not regime_block)
                 g_micro = (atr_pct >= float(self.cfg.get("ENTRY_MIN_ATR_PCT", 0.0)))
-                g_meta = (p_cal is not None and p_cal >= pstar)
+                g_meta = True if (pstar is None and not meta_gate_required) else (p_cal is not None and float(p_cal) >= float(pstar))
+
 
 
                 # Try to expose "why" from StrategyEngine when present
@@ -2074,6 +2136,8 @@ class LiveTrader:
                     LOG.debug("— %s vetoed by local entry heuristics.", symbol)
                 return None
 
+
+            
             # -------------- Compose Signal object ----------------
             signal_obj = Signal(
                 symbol=symbol,
@@ -2140,6 +2204,9 @@ class LiveTrader:
             setattr(signal_obj, "don_break_level", meta_full.get("don_break_level"))
             setattr(signal_obj, "don_dist_atr", meta_full.get("don_dist_atr"))
             setattr(signal_obj, "don_break_len", meta_full.get("don_break_len"))
+
+            setattr(signal_obj, "meta_pstar", pstar)
+
 
             return signal_obj
 

@@ -378,11 +378,23 @@ class WinProbScorer:
         if cal is None:
             return p_raw
 
+        # If the calibrator was fit on a pandas DataFrame, it may carry feature names
+        # (feature_names_in_) and emit sklearn's "X does not have valid feature names"
+        # warning when passed a bare ndarray/list. Prefer a 1-col DataFrame when possible.
         try:
-            if hasattr(cal, "predict_proba"):
-                return float(cal.predict_proba(np.array([[p_raw]], dtype=float))[:, 1][0])
-            if hasattr(cal, "predict"):
-                return float(cal.predict([p_raw])[0])
+            if hasattr(cal, "predict_proba") or hasattr(cal, "predict"):
+                in_feats = _infer_model_input_features(cal)
+                if in_feats and len(in_feats) == 1:
+                    df_in = pd.DataFrame([{in_feats[0]: float(p_raw)}], columns=list(in_feats))
+                    if hasattr(cal, "predict_proba"):
+                        return float(cal.predict_proba(df_in)[:, 1][0])
+                    return float(cal.predict(df_in)[0])
+
+                x = np.array([[float(p_raw)]], dtype=float)
+                if hasattr(cal, "predict_proba"):
+                    return float(cal.predict_proba(x)[:, 1][0])
+                if hasattr(cal, "predict"):
+                    return float(cal.predict(x)[0])
         except Exception:
             pass
 
@@ -391,15 +403,16 @@ class WinProbScorer:
             if ctype == "platt":
                 a = float(cal.get("a", 1.0))
                 b = float(cal.get("b", 0.0))
-                z = a * p_raw + b
+                z = a * float(p_raw) + b
                 return float(1.0 / (1.0 + np.exp(-z)))
             if ctype == "isotonic":
                 xs = cal.get("xs") or cal.get("x")
                 ys = cal.get("ys") or cal.get("y")
                 if isinstance(xs, list) and isinstance(ys, list) and len(xs) == len(ys) and len(xs) >= 2:
-                    return float(np.interp(p_raw, np.asarray(xs, dtype=float), np.asarray(ys, dtype=float)))
+                    return float(np.interp(float(p_raw), np.asarray(xs, dtype=float), np.asarray(ys, dtype=float)))
 
         return p_raw
+
 
     def _diag(self, vec_hash: str) -> None:
         if not self._diag_once:

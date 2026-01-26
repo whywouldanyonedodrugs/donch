@@ -11,6 +11,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import joblib
 
+import math
+
 LOG = logging.getLogger("bundle")
 
 
@@ -171,6 +173,64 @@ def _joblib_load_guarded(path: Path, *, strict_versions: bool) -> Any:
 
     return obj
 
+def _extract_pstar(obj) -> float | None:
+    """Best-effort extraction of the meta gating threshold p* from an artifacts json dict.
+
+    Supports common shapes:
+      - {"pstar": 0.62} or {"meta_prob_threshold": 0.62}
+      - {"meta": {"pstar": 0.62}}
+      - {"gating": {"pstar": 0.62}}
+      - {"pstar": {"default": 0.62}} (fallback to first numeric)
+
+    Returns None if nothing usable found.
+    """
+    if not isinstance(obj, dict):
+        return None
+
+    candidate_dicts = [obj]
+    for k in ("meta", "gating", "thresholds", "meta_thresholds", "meta_gate"):
+        v = obj.get(k)
+        if isinstance(v, dict):
+            candidate_dicts.append(v)
+
+    keys = (
+        "pstar", "p_star", "p*", "meta_pstar", "meta_threshold",
+        "meta_prob_threshold", "META_PROB_THRESHOLD", "prob_threshold", "threshold",
+        "min_winprob", "min_winprob_to_trade", "MIN_WINPROB_TO_TRADE",
+    )
+
+    def _coerce_num(x):
+        try:
+            fx = float(x)
+            if not math.isfinite(fx):
+                return None
+            if 0.0 <= fx <= 1.0:
+                return fx
+            return None
+        except Exception:
+            return None
+
+    for d in candidate_dicts:
+        for k in keys:
+            if k in d:
+                v = d.get(k)
+                if isinstance(v, dict):
+                    for kk in ("default", "value", "pstar", "threshold"):
+                        if kk in v:
+                            out = _coerce_num(v.get(kk))
+                            if out is not None:
+                                return out
+                    for vv in v.values():
+                        out = _coerce_num(vv)
+                        if out is not None:
+                            return out
+                else:
+                    out = _coerce_num(v)
+                    if out is not None:
+                        return out
+
+    return None
+
 
 def load_bundle(
     meta_dir: Union[str, Path],
@@ -328,6 +388,22 @@ def load_bundle(
             if strict:
                 raise BundleError(f"Failed to load/parse {calib_json.name}: {e}") from e
             LOG.warning("Could not parse %s: %s", calib_json.name, e)
+
+    # If p* wasn't found in calibration.json, fall back to other artifacts
+    if pstar is None:
+        pstar = _extract_pstar(thresholds) or _extract_pstar(deployment_config)
+
+    # Defensive: keep only finite probabilities in [0, 1]
+    if pstar is not None:
+        try:
+            pstar_f = float(pstar)
+            if (not math.isfinite(pstar_f)) or pstar_f < 0.0 or pstar_f > 1.0:
+                pstar = None
+            else:
+                pstar = pstar_f
+        except Exception:
+            pstar = None
+
 
     # Log what we validated (useful in systemd logs)
     LOG.info("Loaded bundle: dir=%s id=%s kind=%s", str(meta_dir_p), bid, model_kind)
