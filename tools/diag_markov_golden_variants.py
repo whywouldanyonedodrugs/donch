@@ -1,66 +1,68 @@
-#!/usr/bin/env python3
-"""
-Diagnostic: brute-force a small set of MarkovRegression variants and compare to golden parquet.
-
-This is for STRICT-PARITY debugging: we do not use wall-clock; everything is "as-of ts".
-We map as-of ts to the last completed 4h bar (bar close <= ts) from fixtures.
-
-Usage example:
-  python tools/diag_markov_golden_variants.py \
-    --golden /root/apps/donch/results/meta_export/golden_features.parquet \
-    --fixtures-dir /root/apps/donch/tests/fixtures/regime \
-    --symbol BTCUSDT \
-    --max-ts 60 \
-    --min-obs 80 \
-    --golden-markov-prob-col markov_prob_up_4h \
-    --golden-markov-state-col markov_state_4h
-"""
-
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from statsmodels.tsa.regime_switching.markov_regression import MarkovRegression
+import statsmodels.api as sm
+
+
+def _to_utc_ts(ts: Any) -> pd.Timestamp:
+    t = pd.to_datetime(ts, utc=True, errors="coerce")
+    if pd.isna(t):
+        raise ValueError(f"invalid timestamp: {ts}")
+    return t
 
 
 def _load_golden(path: Path) -> pd.DataFrame:
     g = pd.read_parquet(path)
     if "timestamp" in g.columns:
         ts = pd.to_datetime(g["timestamp"], utc=True, errors="coerce")
-        g = g.assign(timestamp=ts).dropna(subset=["timestamp"]).set_index("timestamp")
-    elif not isinstance(g.index, pd.DatetimeIndex):
-        raise ValueError("Golden parquet must have 'timestamp' column or DatetimeIndex.")
+        g = g.assign(timestamp=ts).dropna(subset=["timestamp"]).sort_values("timestamp")
+        g = g.set_index("timestamp", drop=True)
     else:
-        g = g.copy()
-        g.index = pd.to_datetime(g.index, utc=True, errors="coerce")
-        g = g.dropna().sort_index()
-    if "symbol" not in g.columns:
-        raise ValueError("Golden parquet missing required column: 'symbol'")
-    return g.sort_index()
+        if not isinstance(g.index, pd.DatetimeIndex):
+            raise ValueError("golden has no timestamp column and index is not DatetimeIndex")
+        if g.index.tz is None:
+            g.index = g.index.tz_localize("UTC")
+        else:
+            g.index = g.index.tz_convert("UTC")
+        g = g.sort_index()
+    return g
 
 
-def _load_fixture_4h(fixtures_dir: Path, symbol: str) -> pd.DataFrame:
-    p = fixtures_dir / f"{symbol.upper()}_4H.parquet"
+def _load_fixture(fixtures_dir: Path, symbol: str, tf: str) -> pd.DataFrame:
+    p = fixtures_dir / f"{symbol}_{tf}.parquet"
     if not p.exists():
-        raise FileNotFoundError(str(p))
+        raise FileNotFoundError(f"missing fixture: {p}")
+
     df = pd.read_parquet(p)
-    if "timestamp" not in df.columns:
-        raise ValueError(f"{p.name} missing 'timestamp' column")
-    ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
-    df = df.assign(timestamp=ts).dropna(subset=["timestamp"]).sort_values("timestamp")
-    df = df.set_index("timestamp", drop=True)
+    if "timestamp" in df.columns:
+        ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+        df = df.assign(timestamp=ts).dropna(subset=["timestamp"]).sort_values("timestamp")
+        df = df.set_index("timestamp", drop=True)
+    else:
+        if not isinstance(df.index, pd.DatetimeIndex):
+            raise ValueError(f"fixture {p} missing timestamp column and index is not DatetimeIndex")
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC")
+        else:
+            df.index = df.index.tz_convert("UTC")
+        df = df.sort_index()
+
     for c in ["open", "high", "low", "close", "volume"]:
-        if c not in df.columns:
-            raise ValueError(f"{p.name} missing required col {c!r}")
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df.dropna(subset=["close"])
-    return df.sort_index()
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    if "close" not in df.columns:
+        raise ValueError(f"fixture {p} missing required 'close' column")
+
+    df = df.dropna(subset=["close"]).sort_index()
+    return df
 
 
-def _exp_at_ts(g: pd.DataFrame, ts: pd.Timestamp, col: str) -> Optional[float]:
+def _first_nonnull_at_ts(g: pd.DataFrame, ts: pd.Timestamp, col: str) -> Optional[float]:
     if col not in g.columns:
         return None
     if ts not in g.index:
@@ -73,210 +75,271 @@ def _exp_at_ts(g: pd.DataFrame, ts: pd.Timestamp, col: str) -> Optional[float]:
         v = v.iloc[0]
     if pd.isna(v):
         return None
-    return float(v)
-
-
-def _exp_state_at_ts(g: pd.DataFrame, ts: pd.Timestamp, col: str) -> Optional[int]:
-    v = _exp_at_ts(g, ts, col)
-    if v is None:
+    try:
+        x = float(v)
+        if not np.isfinite(x):
+            return None
+        return float(x)
+    except Exception:
         return None
-    return int(v)
 
 
-def _returns_from_closes(df4h: pd.DataFrame, asof_ts: pd.Timestamp, kind: str, scale: float) -> Optional[pd.Series]:
-    # last completed 4h close <= asof_ts
-    cut = df4h.loc[df4h.index <= asof_ts]
-    if len(cut) < 3:
-        return None
-    close = cut["close"].astype(float)
-    if kind == "log":
-        ret = np.log(close).diff()
-    elif kind == "pct":
-        ret = close.pct_change()
-    else:
-        raise ValueError(f"unknown returns kind={kind!r}")
-    ret = (ret * float(scale)).dropna()
-    return ret
-
-
-def _fit_markov(ret: pd.Series, trend: str, switching_variance: bool) -> MarkovRegression:
-    # 2-regime Markov Regression, Gaussian innovations (statsmodels default)
-    mod = MarkovRegression(
-        ret.values,
-        k_regimes=2,
-        trend=trend,
-        switching_variance=switching_variance,
-    )
-    # Use a deterministic fit configuration
-    res = mod.fit(disp=False)
-    return res
-
-
-def _pick_up_regime(res: MarkovRegression) -> int:
-    # Identify "up" as regime with higher mean return.
-    # trend='c' -> there is a constant per regime.
-    params = res.params
-    # Statsmodels packs regime-specific intercepts first; safest is to read regime means via expected_value if present.
-    # For MarkovRegression, params ordering for trend='c': [const[0], const[1], (variance params...)]
-    if len(params) >= 2:
-        mu0 = float(params[0])
-        mu1 = float(params[1])
-        return 1 if mu1 > mu0 else 0
-    return 0
+def _floor_bucket_close(asof_ts: pd.Timestamp, tf: str) -> pd.Timestamp:
+    tf = str(tf).strip().lower()
+    if tf in ("4h", "4hour", "h4"):
+        return asof_ts.floor("4h")
+    if tf in ("1d", "1day", "d", "day"):
+        return asof_ts.floor("D")
+    raise ValueError(f"unsupported tf: {tf}")
 
 
 @dataclass(frozen=True)
-class Variant:
-    name: str
-    ret_kind: str              # 'log' or 'pct'
-    ret_scale: float           # 1.0 or 100.0
-    trend: str                 # 'c' or 'n'
-    switching_variance: bool   # True/False
-    probs_source: str          # 'filtered' or 'smoothed'
-    prob_mapping: str          # 'up' or 'state1'
-    state_mapping: str         # 'raw' or 'up01'
+class MarkovVariant:
+    ret_kind: str                 # "log" | "pct"
+    prob_kind: str                # "filtered" | "smoothed"
+    trend: str                    # "c" | "n"
+    switching_variance: bool      # True/False
+    ewma_alpha: float             # 0 => no smoothing, else EWM(alpha, adjust=False)
+    state_rule: str               # "prob>0.5" | "argmax"
 
 
-def _compute_variant(df4h: pd.DataFrame, asof_ts: pd.Timestamp, v: Variant, min_obs: int) -> Optional[Tuple[float, int]]:
-    ret = _returns_from_closes(df4h, asof_ts, v.ret_kind, v.ret_scale)
-    if ret is None or len(ret) < int(min_obs):
+def _compute_variant(
+    df4h: pd.DataFrame,
+    asof_ts: pd.Timestamp,
+    tf: str,
+    limit: int,
+    min_obs: int,
+    var: MarkovVariant,
+) -> Optional[Tuple[float, int]]:
+    """
+    Strict as-of (no future leakage):
+    - Slice bars by close_ts <= floor_bucket_close(asof_ts)
+    - Use last `limit` bars (if limit>0)
+    - Fit MarkovRegression on returns in that truncated window only
+    """
+    asof_ts = _to_utc_ts(asof_ts)
+    cutoff = _floor_bucket_close(asof_ts, tf)
+
+    df_use = df4h.loc[df4h.index <= cutoff]
+    if df_use.empty:
+        return None
+    if limit and limit > 0:
+        df_use = df_use.tail(int(limit))
+
+    if len(df_use) < int(min_obs):
         return None
 
-    res = _fit_markov(ret, trend=v.trend, switching_variance=v.switching_variance)
-
-    if v.probs_source == "filtered":
-        probs = res.filtered_marginal_probabilities
-    elif v.probs_source == "smoothed":
-        probs = res.smoothed_marginal_probabilities
+    close = df_use["close"].astype(float)
+    if var.ret_kind == "log":
+        ret = np.log(close).diff().dropna()
+    elif var.ret_kind == "pct":
+        ret = close.pct_change().dropna()
     else:
-        raise ValueError(f"bad probs_source={v.probs_source!r}")
+        raise ValueError(f"unknown ret_kind: {var.ret_kind}")
 
-    # probs is (T x k_regimes)
-    p_last = probs.iloc[-1].astype(float).values
-    state_raw = int(np.argmax(p_last))
-    up_regime = _pick_up_regime(res)
+    if len(ret) < max(50, int(min_obs) - 1):
+        return None
 
-    if v.prob_mapping == "up":
-        prob = float(p_last[up_regime])
-    elif v.prob_mapping == "state1":
-        prob = float(p_last[1])
+    try:
+        mod = sm.tsa.MarkovRegression(
+            ret,
+            k_regimes=2,
+            switching_variance=bool(var.switching_variance),
+            trend=str(var.trend),
+        )
+        res = mod.fit(disp=False, maxiter=200)
+    except Exception:
+        return None
+
+    if var.prob_kind == "filtered":
+        probs = [res.filtered_marginal_probabilities[i] for i in range(2)]
+    elif var.prob_kind == "smoothed":
+        probs = [res.smoothed_marginal_probabilities[i] for i in range(2)]
     else:
-        raise ValueError(f"bad prob_mapping={v.prob_mapping!r}")
+        raise ValueError(f"unknown prob_kind: {var.prob_kind}")
 
-    if v.state_mapping == "raw":
-        state = state_raw
-    elif v.state_mapping == "up01":
-        state = 1 if state_raw == up_regime else 0
+    # Identify UP regime by higher weighted mean return under the chosen prob kind
+    means: List[float] = []
+    r = ret.reindex(probs[0].index).values
+    for p in probs:
+        w = p.values
+        denom = max(float(np.sum(w)), 1e-12)
+        mu = float(np.sum(w * r) / denom)
+        means.append(mu)
+
+    up_idx = int(np.argmax(means))
+    p_up = probs[up_idx].clip(0.0, 1.0)
+
+    if float(var.ewma_alpha) > 0.0:
+        p_up = p_up.ewm(alpha=float(var.ewma_alpha), adjust=False).mean().clip(0.0, 1.0)
+
+    last_prob = float(p_up.iloc[-1])
+
+    if var.state_rule == "prob>0.5":
+        last_state = int(last_prob > 0.5)
+    elif var.state_rule == "argmax":
+        # Most probable regime at last time; map to {0,1} via whether UP regime is more probable
+        p0 = float(probs[0].iloc[-1])
+        p1 = float(probs[1].iloc[-1])
+        last_state = int((up_idx == 1 and p1 >= p0) or (up_idx == 0 and p0 >= p1))
     else:
-        raise ValueError(f"bad state_mapping={v.state_mapping!r}")
+        raise ValueError(f"unknown state_rule: {var.state_rule}")
 
-    return prob, state
+    return last_prob, int(last_state)
+
+
+def _build_variants(alpha_grid: List[float]) -> List[MarkovVariant]:
+    vars: List[MarkovVariant] = []
+    for ret_kind in ["log", "pct"]:
+        for prob_kind in ["filtered", "smoothed"]:
+            for trend in ["c", "n"]:
+                for sv in [True, False]:
+                    for a in alpha_grid:
+                        for state_rule in ["prob>0.5", "argmax"]:
+                            vars.append(
+                                MarkovVariant(
+                                    ret_kind=ret_kind,
+                                    prob_kind=prob_kind,
+                                    trend=trend,
+                                    switching_variance=sv,
+                                    ewma_alpha=float(a),
+                                    state_rule=state_rule,
+                                )
+                            )
+    return vars
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--golden", required=True)
-    ap.add_argument("--fixtures-dir", required=True)
-    ap.add_argument("--symbol", required=True, help="Fixture symbol to use (usually BTCUSDT for macro Markov)")
-    ap.add_argument("--max-ts", type=int, default=60)
-    ap.add_argument("--min-obs", type=int, default=80)
-    ap.add_argument("--golden-markov-prob-col", default="markov_prob_4h")
-    ap.add_argument("--golden-markov-state-col", default="markov_state_4h")
+    ap.add_argument("--golden", required=True, type=str, help="Path to golden_features.parquet")
+    ap.add_argument("--fixtures-dir", required=True, type=str, help="Path to tests/fixtures/regime")
+    ap.add_argument("--symbol", required=True, type=str, help="Symbol, e.g. BTCUSDT")
+    ap.add_argument("--tf", default="4H", type=str, help="Fixture TF (default: 4H)")
+    ap.add_argument("--max-ts", default=60, type=int, help="Max timestamps to evaluate (default: 60)")
+    ap.add_argument("--min-obs", default=80, type=int, help="Minimum bars required in window (default: 80)")
+    ap.add_argument("--limit", default=500, type=int, help="Lookback bars per fit (default: 500)")
+    ap.add_argument("--top", default=20, type=int, help="How many top variants to print (default: 20)")
+    ap.add_argument("--golden-markov-prob-col", required=True, type=str, help="Golden prob column (e.g. markov_prob_up_4h)")
+    ap.add_argument("--golden-markov-state-col", required=True, type=str, help="Golden state column (e.g. markov_state_4h)")
+    ap.add_argument("--alpha-grid", default="0,0.1,0.2,0.3", type=str, help="Comma grid for EWMA alpha (default: 0,0.1,0.2,0.3)")
+
     args = ap.parse_args()
 
-    golden_path = Path(args.golden).expanduser().resolve()
-    fixtures_dir = Path(args.fixtures_dir).expanduser().resolve()
+    golden_path = Path(args.golden)
+    fixtures_dir = Path(args.fixtures_dir)
+    symbol = str(args.symbol).upper()
+    tf = str(args.tf).upper()
+    prob_col = str(args.golden_markov_prob_col)
+    state_col = str(args.golden_markov_state_col)
 
     g = _load_golden(golden_path)
-    df4h = _load_fixture_4h(fixtures_dir, args.symbol)
+    df4h = _load_fixture(fixtures_dir, symbol, tf)
 
-    prob_col = args.golden_markov_prob_col
-    state_col = args.golden_markov_state_col
-
-    if prob_col not in g.columns:
-        raise ValueError(f"golden missing column {prob_col!r}. Available: {sorted(g.columns)[:60]}")
-    if state_col not in g.columns:
-        raise ValueError(f"golden missing column {state_col!r}. Available: {sorted(g.columns)[:60]}")
-
-    # Candidate timestamps: any timestamp with non-null expected prob (first non-null across symbols).
+    # Build candidate timestamps from golden (macro context => first non-null across symbols)
     cand: List[pd.Timestamp] = []
     for ts in g.index.unique():
-        exp_prob = _exp_at_ts(g, ts, prob_col)
-        exp_state = _exp_state_at_ts(g, ts, state_col)
-        if exp_prob is None or exp_state is None:
+        tsu = _to_utc_ts(ts)
+        exp_p = _first_nonnull_at_ts(g, tsu, prob_col)
+        exp_s = _first_nonnull_at_ts(g, tsu, state_col)
+        if exp_p is None or exp_s is None:
             continue
-        # must be in fixture coverage (allow a small tail because asof can be slightly after last 4h close)
-        if ts < df4h.index.min():
+        if tsu < df4h.index.min():
             continue
-        if ts > df4h.index.max() + pd.Timedelta("4h"):
+        if tsu > df4h.index.max() + pd.Timedelta("4h"):
             continue
-        cand.append(ts)
+        cand.append(tsu)
 
     cand = sorted(cand)[: int(args.max_ts)]
     if not cand:
-        raise AssertionError("No comparable timestamps found between golden and fixture 4h window.")
+        raise SystemExit("No comparable golden timestamps found in fixture window.")
 
-    # Small but meaningful variant grid (keep runtime bounded).
-    variants: List[Variant] = []
-    for ret_kind in ["log", "pct"]:
-        for probs_source in ["filtered", "smoothed"]:
-            for switching_variance in [True, False]:
-                for trend in ["c", "n"]:
-                    for ret_scale in [1.0, 100.0]:
-                        for prob_mapping in ["up", "state1"]:
-                            for state_mapping in ["raw", "up01"]:
-                                name = f"{ret_kind}|{ret_scale:g}|{trend}|sv={int(switching_variance)}|{probs_source}|p={prob_mapping}|s={state_mapping}"
-                                variants.append(
-                                    Variant(
-                                        name=name,
-                                        ret_kind=ret_kind,
-                                        ret_scale=ret_scale,
-                                        trend=trend,
-                                        switching_variance=switching_variance,
-                                        probs_source=probs_source,
-                                        prob_mapping=prob_mapping,
-                                        state_mapping=state_mapping,
-                                    )
-                                )
+    alpha_grid = []
+    for s in str(args.alpha_grid).split(","):
+        s = s.strip()
+        if s == "":
+            continue
+        alpha_grid.append(float(s))
 
-    results: List[Tuple[str, int, float, float]] = []
-    # tuple: (name, n, mean_abs_prob_err, state_acc)
+    variants = _build_variants(alpha_grid)
 
-    for v in variants:
-        abs_errs: List[float] = []
-        state_hits = 0
-        n = 0
+    results: List[Tuple[float, float, int, int, MarkovVariant]] = []
+    # tuple: (prob_mae, 1-state_acc, n_eval, n_fitfail, variant)
+
+    for var in variants:
+        abs_err: List[float] = []
+        ok_state = 0
+        n_eval = 0
+        n_fitfail = 0
+
         for ts in cand:
-            exp_prob = _exp_at_ts(g, ts, prob_col)
-            exp_state = _exp_state_at_ts(g, ts, state_col)
-            if exp_prob is None or exp_state is None:
+            exp_p = _first_nonnull_at_ts(g, ts, prob_col)
+            exp_s = _first_nonnull_at_ts(g, ts, state_col)
+            if exp_p is None or exp_s is None:
                 continue
 
-            out = _compute_variant(df4h, ts, v, min_obs=int(args.min_obs))
+            out = _compute_variant(
+                df4h=df4h,
+                asof_ts=ts,
+                tf="4h",
+                limit=int(args.limit),
+                min_obs=int(args.min_obs),
+                var=var,
+            )
             if out is None:
+                n_fitfail += 1
                 continue
-            prob, state = out
-            abs_errs.append(abs(prob - float(exp_prob)))
-            state_hits += int(state == int(exp_state))
-            n += 1
 
-        if n >= 5:
-            mean_abs = float(np.mean(abs_errs)) if abs_errs else float("inf")
-            acc = float(state_hits / n)
-            results.append((v.name, n, mean_abs, acc))
+            got_p, got_s = out
+            abs_err.append(abs(float(got_p) - float(exp_p)))
+            ok_state += int(int(got_s) == int(round(float(exp_s))))
+            n_eval += 1
+
+        if n_eval == 0:
+            continue
+
+        prob_mae = float(np.mean(abs_err)) if abs_err else float("inf")
+        state_acc = float(ok_state) / float(n_eval)
+        results.append((prob_mae, 1.0 - state_acc, n_eval, n_fitfail, var))
 
     if not results:
-        raise AssertionError("No variant produced >=5 comparable cases. Try lowering --min-obs or increasing --max-ts.")
+        raise SystemExit("All variants produced zero evaluated points; relax --min-obs/--limit or check fixtures.")
 
-    # Rank by prob error then by state accuracy.
-    results.sort(key=lambda x: (x[2], -x[3], -x[1]))
+    results.sort(key=lambda t: (t[0], t[1], -t[2]))
 
-    print("Top 15 variants by (mean_abs_prob_err asc, state_acc desc):")
-    for name, n, mean_abs, acc in results[:15]:
-        print(f"  n={n:3d} mean_abs_prob_err={mean_abs:.6f} state_acc={acc:.3f} :: {name}")
+    print(f"Evaluated timestamps: {len(cand)}")
+    print(f"Variants with >=1 eval: {len(results)}")
+    print("")
+    print("TOP VARIANTS (sorted by prob MAE, then (1-acc), then n_eval desc):")
+    print("prob_mae | state_acc | n_eval | n_fitfail | variant")
+    for i, (mae, inv_acc, n_eval, n_fitfail, var) in enumerate(results[: int(args.top)]):
+        print(
+            f"{mae:9.6f} | {1.0-inv_acc:9.4f} | {n_eval:5d} | {n_fitfail:8d} | "
+            f"ret={var.ret_kind} prob={var.prob_kind} trend={var.trend} "
+            f"switch_var={var.switching_variance} alpha={var.ewma_alpha} state={var.state_rule}"
+        )
 
-    best = results[0]
-    print("\nBEST:", best[0], "n=", best[1], "mean_abs_prob_err=", best[2], "state_acc=", best[3])
+    # Print some mismatch examples for the best variant
+    best = results[0][-1]
+    print("\nBEST VARIANT DETAIL:")
+    print(best)
+
+    rows: List[Tuple[pd.Timestamp, float, float, int, int]] = []
+    for ts in cand:
+        exp_p = _first_nonnull_at_ts(g, ts, prob_col)
+        exp_s = _first_nonnull_at_ts(g, ts, state_col)
+        if exp_p is None or exp_s is None:
+            continue
+        out = _compute_variant(df4h, ts, "4h", int(args.limit), int(args.min_obs), best)
+        if out is None:
+            continue
+        got_p, got_s = out
+        rows.append((ts, float(exp_p), float(got_p), int(round(float(exp_s))), int(got_s)))
+
+    rows.sort(key=lambda r: abs(r[2] - r[1]), reverse=True)
+    print("\nWorst 10 prob errors under BEST variant:")
+    for ts, ep, gp, es, gs in rows[:10]:
+        print(f"{ts} exp_p={ep:.6f} got_p={gp:.6f} | exp_s={es} got_s={gs} | abs_err={abs(gp-ep):.6f}")
+
     return 0
 
 

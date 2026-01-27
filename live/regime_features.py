@@ -61,8 +61,19 @@ def triangular_moving_average(series: pd.Series, period: int) -> pd.Series:
 
 def drop_incomplete_last_bar(df: pd.DataFrame, tf: str, asof_ts: pd.Timestamp) -> pd.DataFrame:
     """
-    Exclude bars whose OPEN timestamp is >= floor(tf) of asof_ts.
-    This removes the currently-forming bar under CCXT open-timestamp convention.
+    Exclude bars that are not fully closed as-of `asof_ts`.
+
+    IMPORTANT SEMANTICS (Strict-Parity):
+    - All OHLCV frames passed into live regime computations are assumed to be indexed by BAR CLOSE
+      timestamps (right-labeled, closed='right').
+    - Deterministic as-of slicing: keep only bars with close_ts <= last completed bucket close.
+
+    Examples:
+    - 4h bars close at ... 04:00, 08:00, 12:00, ...
+      asof_ts=12:35 -> last completed 4h close is 12:00 -> keep <= 12:00
+      asof_ts=12:00 -> keep <= 12:00 (the bar that just closed is usable)
+    - 1d bars close at 00:00 UTC (end-of-day)
+      asof_ts=2023-04-15 11:00 -> last completed daily close is 2023-04-15 00:00 -> keep <= that
     """
     if df is None or df.empty:
         return df
@@ -70,15 +81,17 @@ def drop_incomplete_last_bar(df: pd.DataFrame, tf: str, asof_ts: pd.Timestamp) -
     asof_ts = _to_utc_ts(asof_ts)
     df = _ensure_utc_index(df)
 
-    if tf.lower() in ("1d", "1day", "d", "day"):
-        floor = asof_ts.floor("D")
-    elif tf.lower() in ("4h", "4hour", "h4"):
-        floor = asof_ts.floor("4h")
+    tfl = str(tf).strip().lower()
+    if tfl in ("1d", "1day", "d", "day"):
+        cutoff = asof_ts.floor("D")
+    elif tfl in ("4h", "4hour", "h4"):
+        cutoff = asof_ts.floor("4h")
     else:
         raise ValueError(f"Unsupported tf for drop_incomplete_last_bar: {tf}")
 
-    # strict exclusion: anything opening at/after the current bucket is incomplete
-    return df.loc[df.index < floor].copy()
+    # Close-labeled bars: fully closed if close_ts <= cutoff
+    return df.loc[df.index <= cutoff].copy()
+
 
 
 def compute_daily_regime_snapshot(
