@@ -2355,6 +2355,54 @@ class LiveTrader:
             LOG.warning("ETH barometer unavailable: %s", e)
             return None
 
+    async def _get_eth_macd_barometer_asof(self, asof_ts: pd.Timestamp) -> Optional[dict]:
+        """
+        Deterministic ETHUSDT 4h MACD dict computed strictly as-of `asof_ts` (decision_ts semantics).
+        Returns: {'macd','signal','hist'} for the latest fully-closed 4h bar as-of asof_ts.
+        """
+        try:
+            asof_ts = pd.to_datetime(asof_ts, utc=True, errors="coerce")
+            if pd.isna(asof_ts):
+                raise ValueError("asof_ts is invalid")
+
+            eth_ohlcv = await self.exchange.fetch_ohlcv("ETHUSDT", "4h", limit=210)
+            if not eth_ohlcv:
+                return None
+
+            df = pd.DataFrame(eth_ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
+            df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+            df = df.set_index("ts").sort_index()
+            df = df[~df.index.duplicated(keep="last")]
+
+            # Drop the currently-forming 4h bar strictly as-of `asof_ts`
+            df = drop_incomplete_last_bar(df, "4h", asof_ts)
+            if df is None or df.empty:
+                return None
+
+            macd_df = ta.macd(df["close"])
+            if macd_df is None or macd_df.empty:
+                return None
+
+            latest = macd_df.iloc[-1]
+            out = {
+                "macd": float(latest["macd"]),
+                "signal": float(latest["signal"]),
+                "hist": float(latest["hist"]),
+            }
+
+            # Fail-closed on non-finite
+            for k, v in out.items():
+                if v is None or not math.isfinite(float(v)):
+                    return None
+
+            return out
+
+        except Exception as e:
+            LOG.warning("ETH barometer unavailable (asof): %s", e)
+            return None
+
+
+
     # ───────────────────── Entry & position lifecycle ─────────────────────
 
     async def _open_position(self, sig: Signal) -> None:
@@ -3258,7 +3306,6 @@ class LiveTrader:
 
 
     # ───────────────────── Loops & commands ─────────────────────
-
     async def _main_signal_loop(self):
         LOG.info("Starting main signal scan loop.")
         while True:
@@ -3267,13 +3314,44 @@ class LiveTrader:
                     await asyncio.sleep(5)
                     continue
 
-                gov_ctx = {}
-                decision
+                # ── Cycle-level deterministic context (no per-symbol lookahead) ──
+                gov_ctx = await self._get_gov_ctx()
+                decision_ts_gov = gov_ctx.get("decision_ts_gov")
+                if decision_ts_gov is None or pd.isna(pd.to_datetime(decision_ts_gov, utc=True, errors="coerce")):
+                    raise RuntimeError("GOV_CTX: missing/invalid decision_ts_gov")
 
+                decision_ts_gov = pd.to_datetime(decision_ts_gov, utc=True)
+
+                # Daily regime as-of decision_ts_gov
+                current_market_regime = await self.regime_detector.get_current_regime(decision_ts_gov)
+                gov_ctx.update(self.regime_detector.get_latest_meta_features())
+
+                # ETH 4h MACD barometer as-of decision_ts_gov (for scan-time features)
+                eth_macd_data = await self._get_eth_macd_barometer_asof(decision_ts_gov)
+                if eth_macd_data:
+                    try:
+                        LOG.info(
+                            "ETH MACD(4h asof %s): macd=%.2f, hist=%.2f",
+                            str(decision_ts_gov),
+                            float(eth_macd_data.get("macd", 0.0) or 0.0),
+                            float(eth_macd_data.get("hist", 0.0) or 0.0),
+                        )
+                    except Exception:
+                        pass
+
+                # Optional: load universe context from cache once (non-fatal)
+                try:
+                    if not (getattr(self, "_universe_ctx", None) or {}):
+                        cached = self._load_universe_cache_if_fresh()
+                        if cached:
+                            self._universe_ctx = cached
+                            LOG.info("Universe context loaded from cache (%d symbols).", len(cached))
+                except Exception as e:
+                    LOG.warning("Universe cache load failed (non-fatal): %s", e)
 
                 equity = await self.db.latest_equity() or 0.0
                 open_positions_count = len(self.open_positions)
-                open_symbols = {p['symbol'] for p in self.open_positions.values()}
+                open_symbols = {p["symbol"] for p in self.open_positions.values()}
 
                 for sym in self.symbols:
                     if self.paused or not self.risk.can_trade():
@@ -3281,7 +3359,7 @@ class LiveTrader:
                     if sym in open_symbols:
                         continue
 
-                    # Cooldown fast-skip
+                    # Cooldown fast-skip (existing behavior kept as-is)
                     cd_h = self.cfg.get("SYMBOL_COOLDOWN_HOURS", cfg.SYMBOL_COOLDOWN_HOURS)
                     last_x = self.last_exit.get(sym)
                     if last_x and datetime.now(timezone.utc) - last_x < timedelta(hours=cd_h):
@@ -3291,7 +3369,7 @@ class LiveTrader:
                         # Pre-flight: skip if exchange already has a position
                         try:
                             positions = await self.exchange.fetch_positions(symbols=[sym])
-                            if positions and positions[0] and float(positions[0].get('info', {}).get('size', 0)) > 0:
+                            if positions and positions[0] and float(positions[0].get("info", {}).get("size", 0)) > 0:
                                 LOG.info("Skipping scan for %s, pre-flight position exists.", sym)
                                 if sym not in open_symbols:
                                     LOG.warning("ORPHAN POSITION DETECTED for %s! Reconcile later.", sym)
@@ -3308,13 +3386,14 @@ class LiveTrader:
                             gov_ctx=gov_ctx,
                         )
 
-
                         if signal:
                             # Optional meta probability gate
                             pstar = self.cfg.get("META_PROB_THRESHOLD", None)
                             if pstar is not None and float(signal.win_probability) < float(pstar):
-                                LOG.info("Signal %s gated by meta p=%.3f < p*=%.3f",
-                                         sym, float(signal.win_probability), float(pstar))
+                                LOG.info(
+                                    "Signal %s gated by meta p=%.3f < p*=%.3f",
+                                    sym, float(signal.win_probability), float(pstar)
+                                )
                                 await asyncio.sleep(0.2)
                                 continue
 
@@ -3341,6 +3420,7 @@ class LiveTrader:
 
             LOG.info("Scan cycle complete. Sleeping…")
             await asyncio.sleep(self.cfg.get("SCAN_INTERVAL_SEC", 60))
+
 
     async def _equity_loop(self):
         while True:
