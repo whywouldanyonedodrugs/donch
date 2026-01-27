@@ -5,6 +5,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+def _pick_col_by_suffix(df, suffixes):
+    cols = list(df.columns)
+    for suf in suffixes:
+        cands = [c for c in cols if c.endswith(suf)]
+        if cands:
+            return sorted(cands, key=len)[0]
+    return None
 
 class TestDailyRegimeAndMarkovGolden(unittest.TestCase):
     def _golden_path(self) -> Path:
@@ -128,14 +135,16 @@ class TestDailyRegimeAndMarkovGolden(unittest.TestCase):
         df = self._load_golden()
 
         # Golden column aliases (export formats vary)
-        col_code = self._pick_col(df, ["regime_code_1d", "regime_code"])
-        col_str = self._pick_col(df, ["daily_regime_str_1d", "market_regime", "regime"])
-        col_tr  = self._pick_col(df, ["trend_regime_1d", "trend_regime"])
-        col_vr  = self._pick_col(df, ["vol_regime_1d", "vol_regime"])
-        col_vpl = self._pick_col(df, ["vol_prob_low_1d", "vol_prob_low"])
+        col_code = _pick_col_by_suffix(g, ["regime_code_1d"])
+        col_volp = _pick_col_by_suffix(g, ["vol_prob_low_1d"])
+        col_trend = _pick_col_by_suffix(g, ["trend_regime_1d"])
+        col_volreg = _pick_col_by_suffix(g, ["vol_regime_1d"])
+        col_regime = _pick_col_by_suffix(g, ["daily_regime_1d", "regime_1d"])  # optional, only if you store string regime
 
-        if col_code is None and col_str is None and col_tr is None and col_vr is None and col_vpl is None:
-            self.skipTest("Golden export has no daily regime columns (1d family)")
+
+        if all(x is None for x in [col_code, col_volp, col_trend, col_volreg, col_regime]):
+            self.skipTest("golden has no daily regime columns (skipping)")
+
 
         bench = str(getattr(cfg, "REGIME_BENCHMARK_SYMBOL", "BTCUSDT")).upper()
         df_daily = self._load_fixture_ohlcv_as_open_ts(bench, "1D")
@@ -201,6 +210,11 @@ class TestDailyRegimeAndMarkovGolden(unittest.TestCase):
                     )
 
         if tested == 0:
+            if bad:
+                raise AssertionError(
+                    "Daily regime test could not compute any timestamps. "
+                    f"First failures:\n{msg}"
+                )
             raise AssertionError("Daily regime test did not evaluate any timestamps (no comparable rows)")
 
         if bad:
@@ -212,11 +226,11 @@ class TestDailyRegimeAndMarkovGolden(unittest.TestCase):
 
         df = self._load_golden()
 
-        col_prob = self._pick_col(df, ["markov_prob_up_4h", "prob_up_4h", "markov4h_prob_up"])
-        col_state = self._pick_col(df, ["markov_state_4h", "state_up_4h", "markov4h_state_up"])
-
+        col_prob = _pick_col_by_suffix(g, ["markov_prob_up_4h", "markov_prob_4h"])
+        col_state = _pick_col_by_suffix(g, ["markov_state_up_4h", "markov_state_4h"])
         if col_prob is None and col_state is None:
-            self.skipTest("Golden export has no Markov 4h columns")
+            self.skipTest("golden has no Markov(4h) columns (skipping)")
+
 
         markov_asset = str(os.environ.get("DONCH_MARKOV4H_ASSET", "ETHUSDT")).upper()
         alpha = float(os.environ.get("DONCH_MARKOV4H_ALPHA", "0.2"))

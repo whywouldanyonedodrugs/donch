@@ -8,6 +8,20 @@ import pandas as pd
 
 from statsmodels.tsa.regime_switching.markov_regression import MarkovRegression
 
+def _pick_col_by_suffix(cols, suffixes):
+    for suf in suffixes:
+        cands = [c for c in cols if c.endswith(suf)]
+        if cands:
+            # shortest tends to pick non-prefixed before long variants, but still finds S1_*
+            return sorted(cands, key=len)[0]
+    return None
+
+def _pick_col(cols, candidates):
+    for c in candidates:
+        if c in cols:
+            return c
+    return None
+
 
 def _load_fixture_as_open_ts(fixtures_dir: Path, symbol: str, tf_tag: str) -> pd.DataFrame:
     """
@@ -55,7 +69,8 @@ def _fit_markov(ret: pd.Series, min_obs: int) -> Tuple[Optional[object], Dict[st
     ret = pd.to_numeric(ret, errors="coerce").dropna()
     info: Dict[str, float] = {"nobs": float(len(ret))}
     if len(ret) < min_obs:
-        return None, info
+        return None, None  # caller should skip this ts
+
 
     mod = MarkovRegression(ret, k_regimes=2, trend="c", switching_variance=True)
 
@@ -139,6 +154,29 @@ def main() -> int:
     else:
         raise ValueError("golden parquet must have timestamp column or DatetimeIndex")
 
+    cols = list(g.columns)
+
+    # Prefer explicit canonical names, but fall back to suffix search.
+    gold_prob_col = _pick_col(cols, [args.golden_markov_prob_col]) if args.golden_markov_prob_col else None
+    if gold_prob_col is None:
+        gold_prob_col = _pick_col(cols, ["markov_prob_up_4h", "markov_prob_4h"])
+    if gold_prob_col is None:
+        gold_prob_col = _pick_col_by_suffix(cols, ["markov_prob_up_4h", "markov_prob_4h"])
+
+    gold_state_col = _pick_col(cols, [args.golden_markov_state_col]) if args.golden_markov_state_col else None
+    if gold_state_col is None:
+        gold_state_col = _pick_col(cols, ["markov_state_up_4h", "markov_state_4h"])
+    if gold_state_col is None:
+        gold_state_col = _pick_col_by_suffix(cols, ["markov_state_up_4h", "markov_state_4h"])
+
+    if gold_prob_col is None:
+        raise ValueError(
+            "Could not find Markov prob column in golden. "
+            "Expected something like markov_prob_up_4h. "
+            f"Available (sample): {sorted(cols)[:60]}"
+        )
+
+
     if "symbol" in g.columns:
         g = g[g["symbol"].astype(str).str.upper() == sym]
 
@@ -170,9 +208,10 @@ def main() -> int:
         print("\nTS:", ts, "| exp_prob=", f"{exp_prob:.6f}", "| 4h_bars=", len(h4_use), "log_ret_n=", len(ret_log), "pct_ret_n=", len(ret_pct))
 
         for ret_name, ret in [("log", ret_log), ("pct", ret_pct)]:
-            res, info = _fit_markov(ret, args.min_obs)
+            res, params = _fit_markov(ret, min_obs=args.min_obs)
             if res is None:
-                print(f"  {ret_name}: INSUFFICIENT nobs={int(info['nobs'])} (<{args.min_obs})")
+                return {"skip": f"insufficient returns: {len(ret)} (<{args.min_obs})"}
+
                 continue
 
             params = _extract_params(res)
