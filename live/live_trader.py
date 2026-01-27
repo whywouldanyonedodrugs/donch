@@ -662,12 +662,12 @@ class LiveTrader:
     async def _compute_cross_asset_daily_ctx(self, asset: str, asof_ts: pd.Timestamp) -> dict:
         """
         Offline-parity cross-asset DAILY context (scout.py logic):
-          - vol_regime_level: (ATR20/close) / expanding_median(min_periods=50), then shift(1)
-          - trend_slope: diff( MA20 - MA50 ), then shift(1)
+        - vol_regime_level: (ATR20/close) / expanding_median(min_periods=50), then shift(1)
+        - trend_slope: diff( MA20 - MA50 ), then shift(1)
 
         IMPORTANT:
-          - Do NOT drop today's (forming) 1D candle, because shift(1) makes today's value depend only on yesterday.
-          - As-of mapping uses last index <= decision_ts (intraday).
+        - Do NOT drop today's (forming) 1D candle, because shift(1) makes today's value depend only on yesterday.
+        - As-of mapping uses last index <= decision_ts (intraday).
         """
         out: dict = {}
         asset = str(asset).upper()
@@ -692,7 +692,8 @@ class LiveTrader:
                 return out
 
             # Compute daily ATR% and vol_regime_level (shift(1) is the no-lookahead guard)
-            atr1d = ta.atr(df[["open", "high", "low", "close"]], length=20)
+            # IMPORTANT: call ATR with positional period to avoid keyword incompatibilities across ta/indicator impls.
+            atr1d = ta.atr(df[["open", "high", "low", "close"]], 20)
             close = df["close"].astype(float).replace(0.0, np.nan)
             atr_pct = (atr1d.astype(float) / close)
 
@@ -711,8 +712,6 @@ class LiveTrader:
         except Exception as e:
             LOG.warning("Cross-asset daily ctx failed for %s: %s", asset, e)
             return out
-
-
 
     async def _get_gov_ctx(self) -> dict:
         """
@@ -1010,8 +1009,6 @@ class LiveTrader:
 
         return v
 
-
-
     def _augment_meta_with_regime_sets(self, meta_full: dict) -> None:
         """
         Mutates meta_full in-place. Adds:
@@ -1145,19 +1142,19 @@ class LiveTrader:
                     cs = int(float(meta_full["crowd_side"]))
                     meta_full["S4_crowd_x_trend1d"] = float((cs + 1) * 2 + int(trc))
 
-        # live/live_trader.py (inside _augment_meta_with_regime_sets), S6_fresh_x_compress section
+        # S6_fresh_x_compress prereqs: days_since_prev_break, consolidation_range_atr
         if ("days_since_prev_break" in meta_full) and ("consolidation_range_atr" in meta_full):
             try:
-                t = self.regimes_thresholds.get("S6_fresh_x_compress", {}) or {}
-                fresh_q33 = t.get("fresh_q33")
-                fresh_q66 = t.get("fresh_q66")
-                comp_q33 = t.get("compression_q33")
-                comp_q66 = t.get("compression_q66")
+                # Offline semantics: thresholds are stored at top-level in regimes_report.json thresholds dict
+                fresh_q33 = self.regime_thresholds.get("fresh_q33")
+                fresh_q66 = self.regime_thresholds.get("fresh_q66")
+                comp_q33 = self.regime_thresholds.get("compression_q33")
+                comp_q66 = self.regime_thresholds.get("compression_q66")
 
                 fresh = float(meta_full["days_since_prev_break"])
                 comp = float(meta_full["consolidation_range_atr"])
 
-                # Match offline: only compute S6 if both inputs are finite
+                # Match offline: only compute S6 if both inputs are finite AND thresholds exist
                 if (
                     np.isfinite(fresh)
                     and np.isfinite(comp)
@@ -1173,6 +1170,7 @@ class LiveTrader:
                     meta_full["S6_fresh_x_compress"] = np.nan
             except Exception:
                 pass
+
 
 
     def _missing_required_features(self, row: dict, required: list[str]) -> list[str]:
