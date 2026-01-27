@@ -139,6 +139,8 @@ def main() -> int:
     ap.add_argument("--min-obs", type=int, default=200, help="Minimum returns required to fit Markov")
     ap.add_argument("--alpha", type=float, default=0.20, help="EWM alpha for smoothing (0 disables)")
     ap.add_argument("--golden-markov-prob-col", default="markov_prob_4h")
+    ap.add_argument("--golden-markov-state-col", default="markov_state_4h")
+
     args = ap.parse_args()
 
     golden_p = Path(args.golden).expanduser().resolve()
@@ -181,7 +183,7 @@ def main() -> int:
         g = g[g["symbol"].astype(str).str.upper() == sym]
 
     g = g.sort_index()
-    if args.golden_markov_prob_col not in g.columns:
+    if args.gold_prob_col not in g.columns:
         raise ValueError(f"golden missing column {args.golden_markov_prob_col!r}. Available: {sorted(g.columns)[:50]}")
 
     ts_list = list(g.index[: int(args.max_ts)])
