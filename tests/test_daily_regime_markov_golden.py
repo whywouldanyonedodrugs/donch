@@ -7,6 +7,9 @@ from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
 import pandas as pd
 
+import config as cfg
+
+
 from live.regime_features import compute_daily_regime_snapshot, compute_markov4h_snapshot
 
 
@@ -199,45 +202,68 @@ def _load_regimes_report(repo_root: Path) -> Dict[str, Any]:
     return out
 
 
-def _call_compute_daily_snapshot(daily: pd.DataFrame, asof_ts: pd.Timestamp, repo_root: Path) -> Dict[str, object]:
+def _call_compute_daily_snapshot(df_daily: pd.DataFrame, asof_ts: pd.Timestamp, repo_root: Path) -> Dict[str, Any]:
     """
-    Call compute_daily_regime_snapshot respecting its actual signature.
-    If the function requires ma_period/atr_period/atr_mult and they are not defaulted,
-    attempt to source them from regimes_report/deployment_config.
+    Call compute_daily_regime_snapshot with "as-of asof_ts" semantics (no wall-clock).
+    If the function requires (ma_period, atr_period, atr_mult) and has no defaults,
+    source them deterministically: regimes_report.json -> deployment_config.json -> config.py constants.
     """
     sig = inspect.signature(compute_daily_regime_snapshot)
-    kwargs: Dict[str, Any] = {"df_daily": daily, "asof_ts": asof_ts}
 
-    need_params = []
-    for name in ["ma_period", "atr_period", "atr_mult"]:
-        if name in sig.parameters and sig.parameters[name].default is inspect._empty:
-            need_params.append(name)
+    kwargs: Dict[str, Any] = {"df_daily": df_daily, "asof_ts": asof_ts}
 
-    if need_params:
-        rep = _load_regimes_report(repo_root)
-        flat: List[Tuple[str, Any]] = []
-        if rep.get("regimes_report") is not None:
-            flat.extend(_flatten_json(rep["regimes_report"]))
-        if rep.get("deployment_config") is not None:
-            flat.extend(_flatten_json(rep["deployment_config"]))
+    required = {"ma_period", "atr_period", "atr_mult"}
+    if required.issubset(sig.parameters.keys()):
+        needs: List[str] = []
+        for k in sorted(required):
+            if sig.parameters[k].default is inspect._empty:
+                needs.append(k)
 
-        # Look for these parameters anywhere in the JSONs (deterministic heuristic)
-        ma = _find_first_numeric(flat, ["ma_period", "tma_period", "ma_len", "trend_ma"])
-        atr_p = _find_first_numeric(flat, ["atr_period", "atr_len", "atr_window"])
-        atr_m = _find_first_numeric(flat, ["atr_mult", "keltner_mult", "atr_k", "band_mult"])
+        if needs:
+            regimes_report = repo_root / "results" / "meta_export" / "regimes_report.json"
+            deployment_config = repo_root / "deployment_config.json"
 
-        if ma is None or atr_p is None or atr_m is None:
-            raise AssertionError(
-                "compute_daily_regime_snapshot requires (ma_period, atr_period, atr_mult) with no defaults, "
-                "but they could not be found in results/meta_export/regimes_report.json or deployment_config.json. "
-                "Add these values or provide defaults in live/regime_features.py."
+            flat: Dict[str, Any] = {}
+            for p in (regimes_report, deployment_config):
+                if p.exists():
+                    try:
+                        flat.update(_flatten_json(_load_json(p)))
+                    except Exception:
+                        # Fail-closed later if still missing; do not mask silent corruption
+                        pass
+
+            ma_period = _find_first_numeric(flat, ["ma_period", "regime_ma_period", "REGIME_MA_PERIOD"])
+            atr_period = _find_first_numeric(flat, ["atr_period", "regime_atr_period", "atr_len", "REGIME_ATR_PERIOD"])
+            atr_mult = _find_first_numeric(flat, ["atr_mult", "regime_atr_mult", "atr_multiplier", "REGIME_ATR_MULT"])
+
+            # Deterministic fallback to repo config constants
+            if ma_period is None:
+                ma_period = getattr(cfg, "REGIME_MA_PERIOD", None)
+            if atr_period is None:
+                atr_period = getattr(cfg, "REGIME_ATR_PERIOD", None)
+            if atr_mult is None:
+                atr_mult = getattr(cfg, "REGIME_ATR_MULT", None)
+
+            if ma_period is None or atr_period is None or atr_mult is None:
+                raise AssertionError(
+                    "compute_daily_regime_snapshot requires (ma_period, atr_period, atr_mult) with no defaults, "
+                    "but they could not be found in results/meta_export/regimes_report.json, deployment_config.json, "
+                    "or config.py (REGIME_MA_PERIOD/REGIME_ATR_PERIOD/REGIME_ATR_MULT)."
+                )
+
+            kwargs.update(
+                {
+                    "ma_period": int(ma_period),
+                    "atr_period": int(atr_period),
+                    "atr_mult": float(atr_mult),
+                }
             )
 
-        kwargs["ma_period"] = int(ma)
-        kwargs["atr_period"] = int(atr_p)
-        kwargs["atr_mult"] = float(atr_m)
+    snap = compute_daily_regime_snapshot(**kwargs)
+    if not isinstance(snap, dict):
+        raise AssertionError(f"compute_daily_regime_snapshot returned non-dict: {type(snap)}")
+    return snap
 
-    return compute_daily_regime_snapshot(**kwargs)
 
 
 def _call_compute_markov_snapshot(df4h: pd.DataFrame, asof_ts: pd.Timestamp, repo_root: Path) -> Dict[str, object]:
@@ -257,9 +283,10 @@ def _call_compute_markov_snapshot(df4h: pd.DataFrame, asof_ts: pd.Timestamp, rep
         if rep.get("regimes_report") is not None:
             flat.extend(_flatten_json(rep["regimes_report"]))
 
-        alpha = _find_first_numeric(flat, ["markov4h_prob_ewma_alpha", "prob_ewma_alpha", "ewma_alpha", "markov_alpha"])
+        alpha = _find_first_numeric(flat, ["markov4h_prob_ewma_alpha", "MARKOV4H_PROB_EWMA_ALPHA"])
         if alpha is None:
-            alpha = 0.2  # deterministic fallback (matches live_trader default)
+            alpha = getattr(cfg, "MARKOV4H_PROB_EWMA_ALPHA", 0.2)
+
         kwargs["alpha"] = float(alpha)
 
     return compute_markov4h_snapshot(**kwargs)
