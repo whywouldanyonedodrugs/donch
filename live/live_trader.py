@@ -47,6 +47,8 @@ from .database import DB
 from .telegram import TelegramBot
 from .winprob_loader import WinProbScorer
 from .golden_features import GoldenFeatureStore
+from .regime_features import compute_daily_regime_snapshot, compute_markov4h_snapshot, drop_incomplete_last_bar
+
 
 from .artifact_bundle import load_bundle, BundleError, SchemaError
 
@@ -222,45 +224,30 @@ class RiskManager:
 
 class RegimeDetector:
     """
-    Computes a daily combined regime on a benchmark symbol and exposes:
-      - trend_regime_1d (str)
-      - vol_regime_1d (str)
-      - vol_prob_low_1d (float)
-      - regime_code_1d (int)
-      - markov_state_4h (int)
-      - markov_prob_up_4h (float)
+    Daily combined regime detector (trend + volatility) computed strictly as-of an explicit timestamp.
 
-    These are intended to be injected into gov_ctx so the meta feature builder
-    can satisfy the feature_manifest schema.
+    - No wall-clock time.
+    - Cache key is deterministic: asof_ts.floor('D') (daily regime only changes when a full day closes).
+    - Markov 4h is NOT computed here to avoid overwriting ETH-based Markov features owned by _get_gov_ctx().
     """
 
-    def __init__(self, exchange, benchmark_symbol="BTCUSDT", cache_minutes: int = 60):
+    def __init__(self, exchange, benchmark_symbol: str = "BTCUSDT", cache_minutes: int = 60):
         self.exchange = exchange
-        self.benchmark_symbol = benchmark_symbol
-        self.cache_minutes = cache_minutes
-        self.markov4h_alpha = float(getattr(cfg, "MARKOV4H_PROB_EWMA_ALPHA", 0.2)) if "cfg" in globals() else 0.2
+        self.benchmark_symbol = str(benchmark_symbol).upper()
 
-        self.last_update = None
-        self.cached_regime = None
+        # deterministic cache
+        self._cached_day_key: Optional[pd.Timestamp] = None
+        self._cached_regime: Optional[str] = None
 
-        # Latest primitives (populated on successful recompute)
         self.latest_meta = {
             "trend_regime_1d": None,
             "vol_regime_1d": None,
             "vol_prob_low_1d": None,
             "regime_code_1d": None,
-            "markov_state_4h": None,
-            "markov_prob_up_4h": None,
             "daily_regime_str_1d": None,
         }
 
-    def _cache_expired(self) -> bool:
-        if self.last_update is None:
-            return True
-        return (datetime.now(timezone.utc) - self.last_update).total_seconds() > (self.cache_minutes * 60)
-
     def get_latest_meta_features(self) -> dict:
-        # Return a shallow copy so callers can safely update() it.
         return dict(self.latest_meta)
 
     def _to_ohlcv_df(self, ohlcv) -> pd.DataFrame:
@@ -270,199 +257,59 @@ class RegimeDetector:
         df = df[~df.index.duplicated(keep="last")]
         return df
 
-    def _drop_incomplete_last_bar(self, df: pd.DataFrame, tf: str, asof_ts: pd.Timestamp) -> pd.DataFrame:
+    async def get_current_regime(self, asof_ts: pd.Timestamp) -> str:
         """
-        CCXT candles are typically timestamped at bar OPEN.
-        If the last bar open is >= floor(tf) of asof_ts, it is the currently-forming bar and should be excluded.
+        Returns combined daily regime string (e.g., 'BEAR_HIGH_VOL') for the latest fully-closed daily bar
+        as-of `asof_ts` (decision_ts semantics).
         """
-        if df.empty:
-            return df
-        if tf == "1d":
-            floor = asof_ts.floor("D")
-        elif tf == "4h":
-            floor = asof_ts.floor("4h")
+        asof_ts = pd.to_datetime(asof_ts, utc=True, errors="coerce")
+        if pd.isna(asof_ts):
+            raise ValueError("RegimeDetector requires a valid asof_ts (UTC)")
+
+        day_key = asof_ts.floor("D")
+        if day_key.tz is None:
+            day_key = day_key.tz_localize("UTC")
         else:
-            return df
-        if df.index[-1] >= floor:
-            return df.iloc[:-1]
-        return df
+            day_key = day_key.tz_convert("UTC")
 
-    def _calculate_trend_regime(self, df_daily: pd.DataFrame) -> pd.Series:
-        """
-        Offline parity: no RANGE state. Set BULL/BEAR only when price breaches channel,
-        otherwise NaN, then ffill/bfill.
-        """
-        close = df_daily["close"].astype(float)
-        high = df_daily["high"].astype(float)
-        low = df_daily["low"].astype(float)
+        if self._cached_day_key is not None and self._cached_day_key == day_key and self._cached_regime is not None:
+            return self._cached_regime
 
-        mid = (high + low) / 2.0
-        tma20 = triangular_moving_average(mid, 20)
-
-        atr20 = ta.atr(df_daily, 20)
-        upper = tma20 + (1.5 * atr20)
-        lower = tma20 - (1.5 * atr20)
-
-        trend = pd.Series(index=df_daily.index, dtype="object")
-        trend.loc[close > upper] = "BULL"
-        trend.loc[close < lower] = "BEAR"
-        trend = trend.ffill().bfill()
-        return trend
-
-
-    def _calculate_vol_regime_and_prob(self, daily_returns: pd.Series) -> tuple[pd.Series, pd.Series]:
-        """
-        Fits MarkovRegression(k_regimes=2, switching_variance=True) and returns:
-          - vol_regime: LOW_VOL / HIGH_VOL (by low-prob > 0.5)
-          - vol_prob_low: P(low-vol regime), smoothed
-        Uses weighted variance to identify which regime is "low vol" (robust).
-        """
-        rets = daily_returns.dropna()
-        if len(rets) < 200:
-            # Too little data for stable 2-state regime; return NaNs aligned to rets
-            vol_regime = pd.Series(index=rets.index, data=np.nan, name="vol_regime")
-            vol_prob_low = pd.Series(index=rets.index, data=np.nan, name="vol_prob_low")
-            return vol_regime, vol_prob_low
-
-        model = sm.tsa.MarkovRegression(rets, k_regimes=2, switching_variance=True, trend="c")
-        res = model.fit(disp=False, maxiter=200)
-
-        probs = res.smoothed_marginal_probabilities
-        if not isinstance(probs, pd.DataFrame) or probs.shape[1] != 2:
-            vol_regime = pd.Series(index=rets.index, data=np.nan, name="vol_regime")
-            vol_prob_low = pd.Series(index=rets.index, data=np.nan, name="vol_prob_low")
-            return vol_regime, vol_prob_low
-
-        # Weighted variance per regime to decide which state is low-vol
-        var_est = []
-        r = rets.values
-        for i in range(2):
-            p = probs[i].reindex(rets.index).fillna(0.0).values
-            denom = np.sum(p)
-            if denom <= 0:
-                var_est.append(np.inf)
-                continue
-            mu = float(np.sum(p * r) / denom)
-            v = float(np.sum(p * (r - mu) ** 2) / denom)
-            var_est.append(v)
-
-        low_idx = int(np.argmin(var_est))
-        low_prob = probs[low_idx].reindex(rets.index).astype(float).clip(0.0, 1.0)
-
-        vol_regime = pd.Series(
-            index=rets.index,
-            data=np.where(low_prob.values > 0.5, "LOW_VOL", "HIGH_VOL"),
-            name="vol_regime",
-        )
-        vol_prob_low = pd.Series(index=rets.index, data=low_prob.values, name="vol_prob_low")
-        return vol_regime, vol_prob_low
-
-    def _calculate_markov_4h_state_and_prob(self, df4h: pd.DataFrame) -> tuple[int | None, float | None]:
-        """
-        Offline parity: 2-state Markov on 4h close-to-close LOG returns.
-        Use FILTERED (past-only) probabilities and apply light EWM smoothing.
-        Returns: (markov_state_4h, markov_prob_up_4h).
-        """
-        if df4h is None or df4h.empty or len(df4h) < 200:
-            return None, None
-
-        close = df4h["close"].astype(float)
-        ret = np.log(close).diff().dropna()
-        if len(ret) < 150:
-            return None, None
-
-        alpha = float(getattr(self, "markov4h_alpha", None) or 0.2)
         try:
-            mod = sm.tsa.MarkovRegression(ret, k_regimes=2, switching_variance=True, trend="c")
-            res = mod.fit(disp=False, maxiter=200)
+            # Fetch daily candles and drop the currently-forming day
+            ohlcv_d = await self.exchange.fetch_ohlcv(self.benchmark_symbol, timeframe="1d", limit=900)
+            df_d = self._to_ohlcv_df(ohlcv_d)
+            df_d = drop_incomplete_last_bar(df_d, "1d", asof_ts)
 
-            # FILTERED probs (past-only)
-            filt_probs = [res.filtered_marginal_probabilities[i] for i in range(2)]
+            ma_period = int(getattr(cfg, "REGIME_MA_PERIOD", 100))
+            atr_period = int(getattr(cfg, "REGIME_ATR_PERIOD", 20))
+            atr_mult = float(getattr(cfg, "REGIME_ATR_MULT", 2.0))
 
-            # Identify "UP" state as higher weighted mean return
-            means = []
-            for p in filt_probs:
-                w = p.values
-                r = ret.reindex(p.index).values
-                mu = float(np.sum(w * r) / max(float(np.sum(w)), 1e-12))
-                means.append(mu)
-            up_idx = int(np.argmax(means))
+            snap = compute_daily_regime_snapshot(
+                df_d,
+                asof_ts=asof_ts,
+                ma_period=ma_period,
+                atr_period=atr_period,
+                atr_mult=atr_mult,
+            )
 
-            prob_up = filt_probs[up_idx].clip(0.0, 1.0)
-            prob_up = prob_up.ewm(alpha=alpha, adjust=False).mean().clip(0.0, 1.0)
+            self._cached_regime = str(snap["daily_regime_str_1d"])
+            self._cached_day_key = day_key
 
-            last_prob = float(prob_up.iloc[-1])
-            last_state = int(last_prob > 0.5)
-            return last_state, last_prob
+            self.latest_meta["trend_regime_1d"] = snap["trend_regime_1d"]
+            self.latest_meta["vol_regime_1d"] = snap["vol_regime_1d"]
+            self.latest_meta["vol_prob_low_1d"] = float(snap["vol_prob_low_1d"])
+            self.latest_meta["daily_regime_str_1d"] = snap["daily_regime_str_1d"]
+            self.latest_meta["regime_code_1d"] = int(snap["regime_code_1d"])
+
+            return self._cached_regime
 
         except Exception:
-            return None, None
+            LOG.exception("Regime detector error (daily)")
+            if self._cached_regime is None:
+                self._cached_regime = "UNKNOWN"
+            return self._cached_regime
 
-
-    async def get_current_regime(self, asof_ts: pd.Timestamp | None = None) -> str:
-        if asof_ts is None:
-            asof_ts = pd.Timestamp(datetime.now(timezone.utc))
-
-        if not self._cache_expired() and self.cached_regime is not None:
-            return self.cached_regime
-
-        LOG.info("Regime cache expired/empty. Recomputing…")
-        try:
-            # DAILY
-            ohlcv_d = await self.exchange.fetch_ohlcv(self.benchmark_symbol, timeframe="1d", limit=600)
-            df_d = self._to_ohlcv_df(ohlcv_d)
-            df_d = self._drop_incomplete_last_bar(df_d, "1d", asof_ts)
-
-            if len(df_d) < 250:
-                raise RuntimeError(f"Not enough daily bars for regime ({len(df_d)})")
-
-            df_d["trend_regime"] = self._calculate_trend_regime(df_d)
-
-            daily_returns = df_d["close"].pct_change()
-            vol_regime, vol_prob_low = self._calculate_vol_regime_and_prob(daily_returns.dropna())
-
-            df_d.loc[vol_regime.index, "vol_regime"] = vol_regime
-            df_d.loc[vol_prob_low.index, "vol_prob_low"] = vol_prob_low
-
-            df_d["combined_regime"] = df_d["trend_regime"].astype(str) + "_" + df_d["vol_regime"].astype(str)
-
-            df_ok = df_d.dropna(subset=["trend_regime", "vol_regime", "vol_prob_low", "combined_regime"])
-            if df_ok.empty:
-                raise RuntimeError("No valid daily regime rows after dropna")
-
-            last = df_ok.iloc[-1]
-            combined = str(last["combined_regime"])
-
-            code_map = {"BEAR_HIGH_VOL": 0, "BEAR_LOW_VOL": 1, "BULL_HIGH_VOL": 2, "BULL_LOW_VOL": 3}
-            regime_code = code_map.get(combined, None)
-
-            # 4H Markov (benchmark)
-            ohlcv_4h = await self.exchange.fetch_ohlcv(self.benchmark_symbol, timeframe="4h", limit=900)
-            df4h = self._to_ohlcv_df(ohlcv_4h)
-            df4h = self._drop_incomplete_last_bar(df4h, "4h", asof_ts)
-            m_state, m_prob = self._calculate_markov_4h_state_and_prob(df4h)
-
-            # Publish cache
-            self.cached_regime = combined
-            self.last_update = datetime.now(timezone.utc)
-
-            self.latest_meta["trend_regime_1d"] = str(last["trend_regime"])
-            self.latest_meta["vol_regime_1d"] = str(last["vol_regime"])
-            self.latest_meta["vol_prob_low_1d"] = float(last["vol_prob_low"])
-            self.latest_meta["daily_regime_str_1d"] = combined
-            self.latest_meta["regime_code_1d"] = int(regime_code) if regime_code is not None else None
-            self.latest_meta["markov_state_4h"] = int(m_state) if m_state is not None else None
-            self.latest_meta["markov_prob_up_4h"] = float(m_prob) if m_prob is not None else None
-
-            LOG.info(f"New market regime: {self.cached_regime}")
-            return self.cached_regime
-
-        except Exception as e:
-            LOG.exception("Regime detector error")
-            # Do not update cached_regime on failure; keep previous if any.
-            if self.cached_regime is None:
-                self.cached_regime = "UNKNOWN"
-            return self.cached_regime
 
 
 ###############################################################################
@@ -780,29 +627,21 @@ class LiveTrader:
         """
         Cycle-level context needed by the meta model.
 
-        MUST populate any manifest-required "global" features, including Markov 4h regime probability.
-        Uses as-of semantics: only fully closed bars (our fetch helper drops last partial bar).
-        Cached to avoid per-symbol recomputation.
+        Deterministic caching:
+        - Computed once per scan cycle and reused across symbols.
+        - Cache key is the cycle's `decision_ts_gov` (min last-closed 5m ts among BTC/ETH frames).
+        - No wall-clock TTL.
+
+        Owns Markov 4h (ETH by default) to match canonical offline semantics.
         """
-        ttl_sec = int(self.cfg.get("GOV_CTX_TTL_SEC", 60) or 60)
-        now = datetime.now(timezone.utc)
-
-        if hasattr(self, "_gov_ctx_cache") and hasattr(self, "_gov_ctx_cache_ts"):
-            age = (now - self._gov_ctx_cache_ts).total_seconds()
-            if age < ttl_sec:
-                return dict(self._gov_ctx_cache)
-
-        # Fetch 5m OHLCV for BTC/ETH (same limit pattern as base tf elsewhere)
+        # Fetch 5m OHLCV for BTC/ETH
         df_btc, df_eth = await asyncio.gather(
             self._fetch_ohlcv_df_simple("BTCUSDT", "5m", limit=1500),
             self._fetch_ohlcv_df_simple("ETHUSDT", "5m", limit=1500),
             return_exceptions=False,
         )
 
-        ctx: dict = {}
-
-        # Choose a conservative "as-of" timestamp for gov features:
-        # use the earliest available last-closed 5m timestamp among BTC/ETH so we do not look ahead vs either.
+        # Determine decision_ts_gov (min last-closed ts across BTC/ETH) to avoid cross-asset lookahead
         decision_ts_gov = None
         try:
             candidates = []
@@ -815,7 +654,21 @@ class LiveTrader:
         except Exception:
             decision_ts_gov = None
 
-        if df_btc is not None:
+        if decision_ts_gov is None or pd.isna(pd.to_datetime(decision_ts_gov, utc=True, errors="coerce")):
+            raise RuntimeError("GOV_CTX: cannot determine decision_ts_gov (BTC/ETH 5m frames empty)")
+
+        decision_ts_gov = pd.to_datetime(decision_ts_gov, utc=True)
+
+        # Deterministic per-cycle cache
+        if hasattr(self, "_gov_ctx_cache_key") and hasattr(self, "_gov_ctx_cache"):
+            if getattr(self, "_gov_ctx_cache_key") == decision_ts_gov:
+                return dict(self._gov_ctx_cache)
+
+        ctx: dict = {}
+        ctx["decision_ts_gov"] = decision_ts_gov  # for downstream as-of usage/logging
+
+        # OI/Funding (existing behavior)
+        if df_btc is not None and not df_btc.empty:
             btc_feats = await self._build_oi_funding_features("BTCUSDT", df_btc)
             if btc_feats:
                 if "funding_rate" in btc_feats:
@@ -823,7 +676,7 @@ class LiveTrader:
                 if "oi_z_7d" in btc_feats:
                     ctx["btc_oi_z_7d"] = float(btc_feats["oi_z_7d"])
 
-        if df_eth is not None:
+        if df_eth is not None and not df_eth.empty:
             eth_feats = await self._build_oi_funding_features("ETHUSDT", df_eth)
             if eth_feats:
                 if "funding_rate" in eth_feats:
@@ -831,58 +684,50 @@ class LiveTrader:
                 if "oi_z_7d" in eth_feats:
                     ctx["eth_oi_z_7d"] = float(eth_feats["oi_z_7d"])
 
-        # ------------------------------------------------------------------
-        # Markov 4h regime probability on ETH close-to-close returns
-        # Required by manifest: markov_prob_up_4h (numeric, finite)
-        # Also provide markov_state_up_4h (categorical/int) if present in manifests.
-        # ------------------------------------------------------------------
+        # Markov 4h regime probability (ETH by default; configurable)
         try:
+            markov_asset = str(self.cfg.get("MARKOV4H_ASSET", "ETHUSDT") or "ETHUSDT").upper()
             markov_limit = int(self.cfg.get("MARKOV4H_LIMIT", 500) or 500)
-            df4 = await self._fetch_ohlcv_df_simple("ETHUSDT", "4h", limit=markov_limit)
+            alpha = float(self.cfg.get("MARKOV4H_PROB_EWMA_ALPHA", 0.2) or 0.2)
 
-            if df4 is not None and not df4.empty and len(df4) >= 60:
-                if decision_ts_gov is not None:
-                    df4 = df4.loc[df4.index <= decision_ts_gov]
-                if len(df4) >= 60:
-                    close = df4["close"].astype(float)
-                    ret = np.log(close).diff().dropna()
+            # deterministic sub-cache keyed by 4h bucket to avoid refit every 5m
+            key4 = decision_ts_gov.floor("4h")
+            if hasattr(self, "_markov_cache_key") and hasattr(self, "_markov_cache_val"):
+                if getattr(self, "_markov_cache_key") == key4:
+                    ctx.update(dict(self._markov_cache_val))
+                else:
+                    raise KeyError("markov_cache_miss")
+            else:
+                raise KeyError("markov_cache_missing")
 
-                    if len(ret) >= 50:
-                        alpha = float(self.cfg.get("MARKOV4H_PROB_EWMA_ALPHA", 0.2) or 0.2)
+        except KeyError:
+            # compute markov
+            try:
+                df4 = await self._fetch_ohlcv_df_simple(markov_asset, "4h", limit=markov_limit)
+                if df4 is None or df4.empty:
+                    raise RuntimeError("empty 4h frame")
 
-                        mod = sm.tsa.MarkovRegression(ret, k_regimes=2, switching_variance=True, trend="c")
-                        res = mod.fit(disp=False, maxiter=200)
+                df4 = drop_incomplete_last_bar(df4, "4h", decision_ts_gov)
+                snap = compute_markov4h_snapshot(df4, asof_ts=decision_ts_gov, alpha=alpha)
+                ctx["markov_prob_up_4h"] = float(snap["markov_prob_up_4h"])
+                ctx["markov_state_4h"] = int(snap["markov_state_4h"])
+                ctx.setdefault("markov_state_up_4h", int(snap["markov_state_4h"]))
 
-                        # FILTERED (past-only) probs
-                        filt_probs = [res.filtered_marginal_probabilities[i] for i in range(2)]
+                # store deterministic sub-cache
+                self._markov_cache_key = decision_ts_gov.floor("4h")
+                self._markov_cache_val = {
+                    "markov_prob_up_4h": ctx["markov_prob_up_4h"],
+                    "markov_state_4h": ctx["markov_state_4h"],
+                    "markov_state_up_4h": ctx["markov_state_up_4h"],
+                }
 
-                        # identify UP state as higher weighted mean return
-                        means = []
-                        for p in filt_probs:
-                            w = p.values
-                            r = ret.reindex(p.index).values
-                            denom = float(np.sum(w))
-                            mu = float(np.sum(w * r) / (denom if denom > 1e-12 else 1.0))
-                            means.append(mu)
+            except Exception as e:
+                LOG.warning("GOV_CTX: Markov 4h computation failed: %s", e)
 
-                        up_idx = int(np.argmax(means))
-                        prob_up = filt_probs[up_idx].clip(0.0, 1.0)
-                        prob_up = prob_up.ewm(alpha=alpha, adjust=False).mean().clip(0.0, 1.0)
-
-                        pu = float(prob_up.iloc[-1])
-                        if np.isfinite(pu):
-                            ctx["markov_prob_up_4h"] = pu
-                            ctx["markov_state_up_4h"] = int(pu > 0.5)
-                            # Some older variants use this name:
-                            ctx.setdefault("markov_state_4h", int(pu > 0.5))
-
-        except Exception as e:
-            LOG.warning("GOV_CTX: Markov 4h computation failed: %s", e)
-
+        # store per-cycle cache
+        self._gov_ctx_cache_key = decision_ts_gov
         self._gov_ctx_cache = dict(ctx)
-        self._gov_ctx_cache_ts = now
-        return ctx
-
+        return dict(ctx)
 
 
     # ──────────────────────────────────────────────────────────────────────
@@ -3422,43 +3267,8 @@ class LiveTrader:
                     await asyncio.sleep(5)
                     continue
 
-                current_market_regime = await self.regime_detector.get_current_regime()
-                LOG.info("New scan cycle for %d symbols | regime: %s", len(self.symbols), current_market_regime)
-
-                uc = self._load_universe_cache_if_fresh()
-                if uc is not None:
-                    self._universe_ctx = uc
-                    LOG.info("Universe context loaded from cache (%d symbols).", len(self._universe_ctx))
-                else:
-                    try:
-                        self._universe_ctx = await self._build_universe_context()
-                        LOG.info("Universe context ready (%d symbols).", len(self._universe_ctx))
-                        self._save_universe_cache(self._universe_ctx)
-                    except Exception as e:
-                        LOG.warning("Universe context failed: %s (continuing with empty).", e)
-                        self._universe_ctx = {}
-
-                # ETH MACD Barometer (4h)
-                eth_macd_data = None
-                try:
-                    eth_ohlcv = await self.exchange.fetch_ohlcv('ETHUSDT', '4h', limit=100)
-                    if eth_ohlcv:
-                        df_eth = pd.DataFrame(eth_ohlcv, columns=['timestamp','open','high','low','close','volume'])
-                        macd_df = ta.macd(df_eth['close'])
-                        latest_macd = macd_df.iloc[-1]
-                        eth_macd_data = {"macd": latest_macd['macd'], "signal": latest_macd['signal'], "hist": latest_macd['hist']}
-                        LOG.info("ETH MACD(4h): macd=%.2f, hist=%.2f", latest_macd['macd'], latest_macd['hist'])
-                except Exception as e:
-                    LOG.warning("ETH MACD barometer failed: %s", e)
-
                 gov_ctx = {}
-                try:
-                    gov_ctx = await self._get_gov_ctx()
-                    gov_ctx.update(self.regime_detector.get_latest_meta_features())
-
-                except Exception as e:
-                    LOG.warning("Gov context build failed: %s", e)
-                    gov_ctx = {}
+                decision
 
 
                 equity = await self.db.latest_equity() or 0.0
@@ -4230,7 +4040,7 @@ class LiveTrader:
         self._listing_dates_cache = await self._load_listing_dates()
 
         await self._resume()
-        await self.tg.send("DONCH v2.4b started successfully.")
+        await self.tg.send("DONCH v2.1.2 (sprint 2) started successfully.")
 
         try:
             async with asyncio.TaskGroup() as tg:
