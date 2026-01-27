@@ -622,6 +622,97 @@ class LiveTrader:
             LOG.debug("OHLCV fetch failed %s %s: %s", symbol, tf, e)
             return None
 
+    def _asof_series_value(self, s: pd.Series, ts: pd.Timestamp) -> float:
+        """
+        Deterministic as-of lookup: last finite value with index <= ts.
+        Returns np.nan if none.
+        """
+        try:
+            ts = pd.to_datetime(ts, utc=True, errors="coerce")
+            if pd.isna(ts):
+                return float(np.nan)
+
+            if s is None or len(s) == 0:
+                return float(np.nan)
+
+            if not isinstance(s.index, pd.DatetimeIndex):
+                return float(np.nan)
+
+            idx = s.index
+            if idx.tz is None:
+                idx = idx.tz_localize("UTC")
+                s = s.copy()
+                s.index = idx
+            else:
+                s = s.copy()
+                s.index = idx.tz_convert("UTC")
+
+            s = s.sort_index()
+            s = s.replace([np.inf, -np.inf], np.nan).dropna()
+            if s.empty:
+                return float(np.nan)
+
+            pos = int(s.index.searchsorted(ts, side="right") - 1)
+            if pos < 0:
+                return float(np.nan)
+            return float(s.iloc[pos])
+        except Exception:
+            return float(np.nan)
+
+    async def _compute_cross_asset_daily_ctx(self, asset: str, asof_ts: pd.Timestamp) -> dict:
+        """
+        Offline-parity cross-asset DAILY context (scout.py logic):
+          - vol_regime_level: (ATR20/close) / expanding_median(min_periods=50), then shift(1)
+          - trend_slope: diff( MA20 - MA50 ), then shift(1)
+
+        IMPORTANT:
+          - Do NOT drop today's (forming) 1D candle, because shift(1) makes today's value depend only on yesterday.
+          - As-of mapping uses last index <= decision_ts (intraday).
+        """
+        out: dict = {}
+        asset = str(asset).upper()
+        prefix = asset.lower()  # "btcusdt" / "ethusdt"
+
+        asof_ts = pd.to_datetime(asof_ts, utc=True, errors="coerce")
+        if pd.isna(asof_ts):
+            return out
+
+        try:
+            ohlcv_d = await self.exchange.fetch_ohlcv(asset, timeframe="1d", limit=650)
+            if not ohlcv_d:
+                return out
+
+            df = pd.DataFrame(ohlcv_d, columns=["ts", "open", "high", "low", "close", "volume"])
+            df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+            df = df.set_index("ts").sort_index()
+            df = df[~df.index.duplicated(keep="last")]
+
+            needed = ("open", "high", "low", "close")
+            if any(c not in df.columns for c in needed):
+                return out
+
+            # Compute daily ATR% and vol_regime_level (shift(1) is the no-lookahead guard)
+            atr1d = ta.atr(df[["open", "high", "low", "close"]], length=20)
+            close = df["close"].astype(float).replace(0.0, np.nan)
+            atr_pct = (atr1d.astype(float) / close)
+
+            base = atr_pct.expanding(min_periods=50).median().replace(0.0, np.nan)
+            vol_regime_level = (atr_pct / (base + 1e-12)).shift(1)
+
+            # Trend slope (shift(1) is the no-lookahead guard)
+            ma20 = close.rolling(20, min_periods=20).mean()
+            ma50 = close.rolling(50, min_periods=50).mean()
+            trend_slope = (ma20 - ma50).diff().shift(1)
+
+            out[f"{prefix}_vol_regime_level"] = self._asof_series_value(vol_regime_level, asof_ts)
+            out[f"{prefix}_trend_slope"] = self._asof_series_value(trend_slope, asof_ts)
+            return out
+
+        except Exception as e:
+            LOG.warning("Cross-asset daily ctx failed for %s: %s", asset, e)
+            return out
+
+
 
     async def _get_gov_ctx(self) -> dict:
         """
@@ -666,6 +757,42 @@ class LiveTrader:
 
         ctx: dict = {}
         ctx["decision_ts_gov"] = decision_ts_gov  # for downstream as-of usage/logging
+
+        # Cross-asset DAILY context (scout parity): btcusdt_/ethusdt_ vol_regime_level + trend_slope
+        # Deterministic day-cache: values only change when a new day opens (shift(1) features).
+        try:
+            day_key = decision_ts_gov.floor("D")
+            if day_key.tz is None:
+                day_key = day_key.tz_localize("UTC")
+            else:
+                day_key = day_key.tz_convert("UTC")
+
+            if hasattr(self, "_cross_asset_daily_cache_key") and hasattr(self, "_cross_asset_daily_cache_val"):
+                if getattr(self, "_cross_asset_daily_cache_key") == day_key:
+                    ctx.update(dict(getattr(self, "_cross_asset_daily_cache_val") or {}))
+                else:
+                    raise KeyError("cross_asset_daily_cache_miss")
+            else:
+                raise KeyError("cross_asset_daily_cache_missing")
+
+        except KeyError:
+            try:
+                btc_ctx, eth_ctx = await asyncio.gather(
+                    self._compute_cross_asset_daily_ctx("BTCUSDT", decision_ts_gov),
+                    self._compute_cross_asset_daily_ctx("ETHUSDT", decision_ts_gov),
+                    return_exceptions=False,
+                )
+                merged = {}
+                merged.update(btc_ctx or {})
+                merged.update(eth_ctx or {})
+                ctx.update(merged)
+
+                self._cross_asset_daily_cache_key = day_key
+                self._cross_asset_daily_cache_val = dict(merged)
+
+            except Exception as e:
+                LOG.warning("GOV_CTX: cross-asset daily ctx computation failed: %s", e)
+
 
         # OI/Funding (existing behavior)
         if df_btc is not None and not df_btc.empty:
@@ -1021,7 +1148,7 @@ class LiveTrader:
         # live/live_trader.py (inside _augment_meta_with_regime_sets), S6_fresh_x_compress section
         if ("days_since_prev_break" in meta_full) and ("consolidation_range_atr" in meta_full):
             try:
-                t = self._regimes_thresholds.get("S6_fresh_x_compress", {}) or {}
+                t = self.regimes_thresholds.get("S6_fresh_x_compress", {}) or {}
                 fresh_q33 = t.get("fresh_q33")
                 fresh_q66 = t.get("fresh_q66")
                 comp_q33 = t.get("compression_q33")
