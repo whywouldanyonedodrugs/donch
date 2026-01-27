@@ -17,11 +17,18 @@ class TestRegimeSetsGolden(unittest.TestCase):
         with open(report_path, "r", encoding="utf-8") as f:
             j = json.load(f)
 
-        # live code uses self.regime_thresholds dict directly; report stores thresholds under "thresholds"
         thr = dict(j.get("thresholds", {}) or {})
 
         # Some exports may place certain keys at top-level; merge for compatibility
-        for k in ("crowd_z_high", "crowd_z_low", "btc_vol_hi", "fresh_q33", "fresh_q66", "compression_q33", "compression_q66"):
+        for k in (
+            "crowd_z_high",
+            "crowd_z_low",
+            "btc_vol_hi",
+            "fresh_q33",
+            "fresh_q66",
+            "compression_q33",
+            "compression_q66",
+        ):
             if k in j and k not in thr:
                 thr[k] = j[k]
         return thr
@@ -33,8 +40,7 @@ class TestRegimeSetsGolden(unittest.TestCase):
         )
         if not os.path.exists(p):
             raise FileNotFoundError(f"Missing golden_features.parquet at {p}")
-        df = pd.read_parquet(p)
-        return df
+        return pd.read_parquet(p)
 
     @staticmethod
     def _to_finite_or_nan(v):
@@ -44,8 +50,48 @@ class TestRegimeSetsGolden(unittest.TestCase):
         except Exception:
             return np.nan
 
+    @staticmethod
+    def _to_bool01(v) -> float:
+        """
+        Robustly coerce a bool-ish value to 0.0/1.0.
+        Accepts: bool, int/float, numpy scalars, and strings like 'True'/'False'/'1'/'0'/'yes'/'no'.
+        Fail-closed -> 0.0.
+        """
+        try:
+            if v is None:
+                return 0.0
+            if isinstance(v, (bool, np.bool_)):
+                return 1.0 if bool(v) else 0.0
+
+            if isinstance(v, (int, np.integer)):
+                return 1.0 if int(v) != 0 else 0.0
+
+            if isinstance(v, (float, np.floating)):
+                if not np.isfinite(float(v)):
+                    return 0.0
+                return 1.0 if float(v) != 0.0 else 0.0
+
+            if isinstance(v, str):
+                s = v.strip().lower()
+                if s in ("true", "t", "yes", "y", "1"):
+                    return 1.0
+                if s in ("false", "f", "no", "n", "0", ""):
+                    return 0.0
+                # last resort: numeric parse
+                x = float(s)
+                if not np.isfinite(x):
+                    return 0.0
+                return 1.0 if x != 0.0 else 0.0
+
+            # last resort: try numeric
+            x = float(v)
+            if not np.isfinite(x):
+                return 0.0
+            return 1.0 if x != 0.0 else 0.0
+        except Exception:
+            return 0.0
+
     def test_risk_on_matches_golden(self):
-        # Import here so test fails loudly if package wiring is broken
         from live.live_trader import LiveTrader
 
         thr = self._load_thresholds()
@@ -69,9 +115,8 @@ class TestRegimeSetsGolden(unittest.TestCase):
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
         df = df.dropna(subset=["timestamp"]).sort_values("timestamp")
 
-        # Deterministic sample: first/last 10 in-scope rows and first/last 10 out-of-scope rows
-        in_scope = df[df["risk_on_1"].astype(float) == 1.0]
-        out_scope = df[df["risk_on_1"].astype(float) == 0.0]
+        in_scope = df[df["risk_on_1"].apply(self._to_bool01) == 1.0]
+        out_scope = df[df["risk_on_1"].apply(self._to_bool01) == 0.0]
 
         sample = pd.concat(
             [
@@ -83,15 +128,13 @@ class TestRegimeSetsGolden(unittest.TestCase):
             axis=0,
         ).drop_duplicates(subset=["timestamp"])
 
-        # Lightweight instance: bypass __init__
         trader = LiveTrader.__new__(LiveTrader)
         trader.regime_thresholds = thr
 
         bad = []
         for _, r in sample.iterrows():
-            meta_full = {"regime_up": float(r["regime_up"])}
+            meta_full = {"regime_up": self._to_bool01(r["regime_up"])}
 
-            # Provide whichever naming convention exists in the golden export.
             for c in trend_cols:
                 if c in df.columns:
                     meta_full[c] = self._to_finite_or_nan(r[c])
@@ -101,10 +144,10 @@ class TestRegimeSetsGolden(unittest.TestCase):
 
             trader._augment_meta_with_regime_sets(meta_full)
 
-            got_ro = int(float(meta_full.get("risk_on", 0.0) or 0.0))
-            got_ro1 = int(float(meta_full.get("risk_on_1", 0.0) or 0.0))
-            exp_ro = int(float(r["risk_on"]))
-            exp_ro1 = int(float(r["risk_on_1"]))
+            got_ro = int(self._to_bool01(meta_full.get("risk_on", 0.0)))
+            got_ro1 = int(self._to_bool01(meta_full.get("risk_on_1", 0.0)))
+            exp_ro = int(self._to_bool01(r["risk_on"]))
+            exp_ro1 = int(self._to_bool01(r["risk_on_1"]))
 
             if (got_ro != exp_ro) or (got_ro1 != exp_ro1):
                 bad.append((str(r["timestamp"]), exp_ro, got_ro, exp_ro1, got_ro1))
@@ -149,7 +192,6 @@ class TestRegimeSetsGolden(unittest.TestCase):
             got = meta_full.get("S6_fresh_x_compress", np.nan)
             exp = r["S6_fresh_x_compress"]
 
-            # Both may be NaN; treat NaN==NaN as pass here
             if (pd.isna(got) and pd.isna(exp)):
                 continue
             if pd.isna(got) != pd.isna(exp):
