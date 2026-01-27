@@ -151,10 +151,26 @@ def compute_daily_regime_snapshot(
     upper = tma + float(atr_mult) * atr_d
     lower = tma - float(atr_mult) * atr_d
 
-    trend = pd.Series(index=df_use.index, dtype="object")
-    trend.loc[close > upper] = "BULL"
-    trend.loc[close < lower] = "BEAR"
-    trend = trend.ffill().bfill()
+    # --- BEGIN: robust trend fill (prevents all-NaN trend) ---
+    # If trend never crossed upper/lower bands, ffill/bfill cannot fill anything.
+    # Fail-closed is handled later by the snapshot validation, but we should still produce
+    # a deterministic trend label to match offline behavior and avoid NaN propagation.
+    if trend.notna().any():
+        # Ensure object dtype to avoid pandas silent downcasting warnings.
+        trend = trend.astype("object").ffill().bfill()
+    else:
+        # Deterministic fallback: classify by position vs midline (TMA).
+        # This is still "as-of" and uses no future information.
+        import numpy as np
+        trend = pd.Series(
+            np.where(daily["close"].to_numpy() >= tma.to_numpy(), "BULL", "BEAR"),
+            index=daily.index,
+            dtype="object",
+        )
+
+    daily["trend_regime"] = trend
+    # --- END: robust trend fill ---
+
 
     # Snapshot at last fully-closed day
     last_idx = df_use.index[-1]
