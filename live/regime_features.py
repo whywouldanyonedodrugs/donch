@@ -151,6 +151,24 @@ def compute_daily_regime_snapshot(
     upper = tma + float(atr_mult) * atr_d
     lower = tma - float(atr_mult) * atr_d
 
+    # Robust trend fill:
+    # - if the upstream trend detector produced at least one non-NaN, ffill/bfill as before
+    # - if it produced all-NaN (common early / edge windows), fall back to a deterministic proxy
+    #   so the daily snapshot is always defined.
+    if isinstance(trend, pd.Series) and trend.notna().any():
+        trend = trend.astype("object").ffill().bfill()
+    else:
+        # Fallback: classify trend by close vs a rolling mean (deterministic, no model-fit).
+        # This is only used when the primary trend series is entirely undefined.
+        _close = pd.to_numeric(daily["close"], errors="coerce")  # assumes `daily` is the daily OHLCV frame in scope
+        _tma = _close.rolling(window=200, min_periods=1).mean()
+        trend = pd.Series(
+            np.where(_close >= _tma, "BULL", "BEAR"),
+            index=daily.index,
+            dtype="object",
+        )
+
+
     # --- BEGIN: robust trend fill (prevents all-NaN trend) ---
     # If trend never crossed upper/lower bands, ffill/bfill cannot fill anything.
     # Fail-closed is handled later by the snapshot validation, but we should still produce
