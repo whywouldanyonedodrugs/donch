@@ -1,97 +1,183 @@
-"""
-regime_features.py
-
-Deterministic, "as-of" regime feature computations for live trading.
-
-Constraints:
-- All outputs are computed strictly as-of an explicit `asof_ts` (UTC, tz-aware).
-- No wall-clock time is used.
-- Bars are assumed timestamped at bar OPEN (CCXT convention). The currently-forming bar is excluded.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple, Dict
+from typing import Dict, Optional, Tuple, Any
 
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 
-from . import indicators as ta
+import indicators as ta
 
 
-REGIME_CODE_MAP: Dict[str, int] = {
-    "BEAR_HIGH_VOL": 0,
-    "BEAR_LOW_VOL": 1,
-    "BULL_HIGH_VOL": 2,
-    "BULL_LOW_VOL": 3,
-}
+# ----------------------------
+# Config
+# ----------------------------
+
+@dataclass(frozen=True)
+class DailyRegimeConfig:
+    ma_period: int = 200
+    atr_period: int = 20
+    atr_mult: float = 2.0
+    maxiter: int = 200
+    min_obs: int = 80  # keep consistent with your tests/tooling; offline code effectively needs "enough" data
 
 
-def _to_utc_ts(ts: pd.Timestamp) -> pd.Timestamp:
-    ts = pd.to_datetime(ts, utc=True, errors="coerce")
-    if pd.isna(ts):
-        raise ValueError("asof_ts is not a valid timestamp")
-    return ts
+@dataclass(frozen=True)
+class Markov4hConfig:
+    maxiter: int = 200
+    ewma_alpha: float = 0.2
+    min_obs: int = 80
 
+
+# ----------------------------
+# Internal helpers
+# ----------------------------
 
 def _ensure_utc_index(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-    out = df.copy()
-    if not isinstance(out.index, pd.DatetimeIndex):
-        raise ValueError("DataFrame must be indexed by timestamps")
-    if out.index.tz is None:
-        out.index = out.index.tz_localize("UTC")
+    if not isinstance(df.index, pd.DatetimeIndex):
+        raise TypeError("DataFrame index must be a DatetimeIndex")
+    if df.index.tz is None:
+        df = df.copy()
+        df.index = df.index.tz_localize("UTC")
     else:
-        out.index = out.index.tz_convert("UTC")
-    out = out.sort_index()
-    out = out[~out.index.duplicated(keep="last")]
-    return out
+        df = df.copy()
+        df.index = df.index.tz_convert("UTC")
+    return df
 
 
 def triangular_moving_average(series: pd.Series, period: int) -> pd.Series:
-    series = series.astype(float)
+    # TMA = SMA(SMA(price, period), period)
+    return series.rolling(period).mean().rolling(period).mean()
+
+
+def _asof_row(df: pd.DataFrame, asof_ts: pd.Timestamp) -> Optional[pd.Series]:
+    if df.empty:
+        return None
+    ts = pd.to_datetime(asof_ts, utc=True, errors="coerce")
+    if ts is pd.NaT:
+        return None
+    sub = df.loc[:ts]
+    if sub.empty:
+        return None
+    return sub.iloc[-1]
+
+
+# ----------------------------
+# Caches (fit-once per input window)
+# ----------------------------
+
+_DAILY_SERIES_CACHE: Dict[Tuple[Any, ...], pd.DataFrame] = {}
+_MARKOV4H_SERIES_CACHE: Dict[Tuple[Any, ...], pd.DataFrame] = {}
+
+
+def _daily_cache_key(df_daily: pd.DataFrame, cfg: DailyRegimeConfig) -> Tuple[Any, ...]:
+    # Key by identity + shape + bounds + params (good enough for tests/live snapshots)
     return (
-        series.rolling(window=period, min_periods=period).mean()
-        .rolling(window=period, min_periods=period).mean()
+        id(df_daily),
+        int(df_daily.shape[0]),
+        str(df_daily.index[0]),
+        str(df_daily.index[-1]),
+        int(cfg.ma_period),
+        int(cfg.atr_period),
+        float(cfg.atr_mult),
+        int(cfg.maxiter),
+        int(cfg.min_obs),
     )
 
 
-def drop_incomplete_last_bar(df: pd.DataFrame, tf: str, asof_ts: pd.Timestamp) -> pd.DataFrame:
-    """
-    Exclude bars that are not fully closed as-of `asof_ts`.
+def _markov4h_cache_key(df4h: pd.DataFrame, cfg: Markov4hConfig) -> Tuple[Any, ...]:
+    return (
+        id(df4h),
+        int(df4h.shape[0]),
+        str(df4h.index[0]),
+        str(df4h.index[-1]),
+        int(cfg.maxiter),
+        float(cfg.ewma_alpha),
+        int(cfg.min_obs),
+    )
 
-    IMPORTANT SEMANTICS (Strict-Parity):
-    - All OHLCV frames passed into live regime computations are assumed to be indexed by BAR CLOSE
-      timestamps (right-labeled, closed='right').
-    - Deterministic as-of slicing: keep only bars with close_ts <= last completed bucket close.
 
-    Examples:
-    - 4h bars close at ... 04:00, 08:00, 12:00, ...
-      asof_ts=12:35 -> last completed 4h close is 12:00 -> keep <= 12:00
-      asof_ts=12:00 -> keep <= 12:00 (the bar that just closed is usable)
-    - 1d bars close at 00:00 UTC (end-of-day)
-      asof_ts=2023-04-15 11:00 -> last completed daily close is 2023-04-15 00:00 -> keep <= that
-    """
-    if df is None or df.empty:
-        return df
+# ----------------------------
+# Daily regime (trend + daily vol Markov)
+# Offline semantics:
+# - model fit ONCE over full window
+# - volatility uses smoothed probs
+# - low-vol state chosen by weighted variance under smoothed probs
+# - as-of lookup is done by selecting the last daily row <= decision ts
+# ----------------------------
 
-    asof_ts = _to_utc_ts(asof_ts)
-    df = _ensure_utc_index(df)
+def compute_daily_regime_series(df_daily: pd.DataFrame, cfg: DailyRegimeConfig) -> pd.DataFrame:
+    df = _ensure_utc_index(df_daily)
 
-    tfl = str(tf).strip().lower()
-    if tfl in ("1d", "1day", "d", "day"):
-        cutoff = asof_ts.floor("D")
-    elif tfl in ("4h", "4hour", "h4"):
-        cutoff = asof_ts.floor("4h")
+    required = {"open", "high", "low", "close"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"df_daily missing columns: {sorted(missing)}")
+
+    close = df["close"].astype(float)
+
+    # --- Trend intermediates ---
+    tma = triangular_moving_average(close, int(cfg.ma_period))
+    atr = ta.atr(df[["open", "high", "low", "close"]], length=int(cfg.atr_period))
+    atr = atr.reindex(df.index, method="ffill")
+
+    upper = tma + float(cfg.atr_mult) * atr
+    lower = tma - float(cfg.atr_mult) * atr
+
+    trend = pd.Series(index=df.index, dtype="object")
+    trend[close > upper] = "BULL"
+    trend[close < lower] = "BEAR"
+    trend = trend.ffill().bfill()
+
+    # --- Volatility regime (global fit; smoothed probs) ---
+    ret = close.pct_change().dropna()
+    vol_regime = pd.Series("UNKNOWN", index=df.index, dtype="object")
+    vol_prob_low = pd.Series(np.nan, index=df.index, dtype=float)
+
+    if ret.shape[0] >= int(cfg.min_obs):
+        model = sm.tsa.MarkovRegression(ret, k_regimes=2, switching_variance=True, trend="c")
+        res = model.fit(disp=False, maxiter=int(cfg.maxiter))
+
+        probs = [res.smoothed_marginal_probabilities[i].clip(0, 1) for i in range(2)]
+        r = ret.reindex(probs[0].index)
+
+        var_est = []
+        for p in probs:
+            w = p.values
+            denom = np.sum(w)
+            if denom <= 0:
+                var_est.append(np.inf)
+                continue
+            mu = np.sum(w * r.values) / denom
+            var = np.sum(w * (r.values - mu) ** 2) / denom
+            var_est.append(var)
+
+        low_idx = int(np.argmin(var_est))
+        low_prob = probs[low_idx].clip(0, 1)
+
+        vol_prob_low.loc[low_prob.index] = low_prob.values
+        vol_regime.loc[low_prob.index] = np.where(low_prob > 0.5, "LOW_VOL", "HIGH_VOL")
     else:
-        raise ValueError(f"Unsupported tf for drop_incomplete_last_bar: {tf}")
+        # Not enough observations; keep UNKNOWN / NaN
+        pass
 
-    # Close-labeled bars: fully closed if close_ts <= cutoff
-    return df.loc[df.index <= cutoff].copy()
+    regime = (trend.fillna("NA") + "_" + vol_regime.fillna("UNKNOWN")).astype(str)
+    code_map = {"BEAR_HIGH_VOL": 0, "BEAR_LOW_VOL": 1, "BULL_HIGH_VOL": 2, "BULL_LOW_VOL": 3}
+    regime_code = regime.map(code_map).astype("Int64")
 
+    out = pd.DataFrame(
+        {
+            "trend_regime_1d": trend.astype("object"),
+            "vol_regime_1d": vol_regime.astype("object"),
+            "vol_prob_low_1d": vol_prob_low.astype(float),
+            "regime_1d": regime.astype(str),
+            "regime_code_1d": regime_code,
+        },
+        index=df.index,
+    )
+    out.index.name = "timestamp"
+    return out
 
 
 def compute_daily_regime_snapshot(
@@ -100,156 +186,118 @@ def compute_daily_regime_snapshot(
     ma_period: int,
     atr_period: int,
     atr_mult: float,
+    maxiter: int = 200,
+    min_obs: int = 80,
 ) -> Dict[str, object]:
-    """
-    Canonical daily combined regime (MATCH OFFLINE `regime_detector.compute_daily_combined_regime`):
+    cfg = DailyRegimeConfig(
+        ma_period=int(ma_period),
+        atr_period=int(atr_period),
+        atr_mult=float(atr_mult),
+        maxiter=int(maxiter),
+        min_obs=int(min_obs),
+    )
 
-      - Vol: 2-state MarkovRegression on daily pct returns with SMOOTHED probs;
-             identify low-vol state by weighted variance; vol_prob_low is that state's prob.
-
-      - Trend: TMA(close, ma_period) with Keltner bands using ATR(atr_period) * atr_mult.
-               Trend is set only when close crosses upper/lower; then ffill/bfill.
-
-    Returns snapshot for the latest fully-closed daily bar as-of `asof_ts`:
-      trend_regime_1d, vol_regime_1d, vol_prob_low_1d, daily_regime_str_1d, regime_code_1d
-    """
-    asof_ts = _to_utc_ts(asof_ts)
     df_daily = _ensure_utc_index(df_daily)
-    df_use = drop_incomplete_last_bar(df_daily, "1d", asof_ts)
+    key = _daily_cache_key(df_daily, cfg)
+    if key not in _DAILY_SERIES_CACHE:
+        _DAILY_SERIES_CACHE[key] = compute_daily_regime_series(df_daily, cfg)
 
-    if df_use is None or df_use.empty:
-        raise ValueError("No daily bars available as-of asof_ts")
+    series = _DAILY_SERIES_CACHE[key]
+    row = _asof_row(series, asof_ts)
+    if row is None:
+        return {
+            "trend_regime_1d": None,
+            "vol_regime_1d": None,
+            "vol_prob_low_1d": np.nan,
+            "regime_1d": None,
+            "regime_code_1d": None,
+        }
 
-    for c in ("open", "high", "low", "close"):
-        if c not in df_use.columns:
-            raise ValueError(f"df_daily missing required column: {c}")
-
-    close = df_use["close"].astype(float)
-
-    # ----------------------------
-    # Vol regime (OFFLINE semantics)
-    # ----------------------------
-    ret = close.pct_change().dropna()
-
-    vol_regime = pd.Series(index=df_use.index, data="UNKNOWN", dtype="object")
-    vol_prob_low = pd.Series(index=df_use.index, data=np.nan, dtype=float)
-
-    try:
-        model = sm.tsa.MarkovRegression(ret, k_regimes=2, switching_variance=True, trend="c")
-        results = model.fit(disp=False, maxiter=200)
-        probs = [results.smoothed_marginal_probabilities[i] for i in range(2)]
-
-        r = ret.reindex(probs[0].index)
-        var_est = []
-        for p in probs:
-            w = p.values.astype(float)
-            denom = float(np.sum(w))
-            if denom <= 1e-12:
-                var_est.append(np.inf)
-                continue
-            mu = float(np.sum(w * r.values) / denom)
-            var = float(np.sum(w * (r.values - mu) ** 2) / denom)
-            var_est.append(var)
-
-        low_idx = int(np.argmin(var_est))
-        low_prob = probs[low_idx].clip(0.0, 1.0)
-
-        vol_reg = np.where(low_prob > 0.5, "LOW_VOL", "HIGH_VOL")
-        vol_regime.loc[ret.index] = vol_reg
-        vol_prob_low.loc[ret.index] = low_prob.values
-    except Exception:
-        # Match offline: keep UNKNOWN and NaNs; snapshot validation will fail-closed if not defined.
-        pass
-
-    # ----------------------------
-    # Trend regime (OFFLINE semantics)
-    # ----------------------------
-    tma = triangular_moving_average(close, int(ma_period))
-    atr_d = ta.atr(df_use, int(atr_period)).reindex(df_use.index, method="ffill")
-    upper = tma + float(atr_mult) * atr_d
-    lower = tma - float(atr_mult) * atr_d
-
-    trend = pd.Series(index=df_use.index, dtype="object")
-    trend[close > upper] = "BULL"
-    trend[close < lower] = "BEAR"
-    trend = trend.ffill().bfill()
-
-    # ----------------------------
-    # Snapshot at last fully-closed day
-    # ----------------------------
-    last_idx = df_use.index[-1]
-    tr_last = trend.loc[last_idx]
-    vr_last = vol_regime.loc[last_idx]
-    vpl_last = vol_prob_low.loc[last_idx]
-
-    combined = f"{str(tr_last)}_{str(vr_last)}"
-    code = REGIME_CODE_MAP.get(combined, None)
-
-    # Fail-closed if not fully defined
-    if code is None:
-        raise ValueError(f"Daily regime snapshot not fully defined (combined={combined})")
-    if not np.isfinite(float(vpl_last)):
-        raise ValueError(f"Daily regime snapshot not fully defined (vol_prob_low_1d={vpl_last})")
+    regime_code = row.get("regime_code_1d")
+    vol_prob_low = row.get("vol_prob_low_1d")
 
     return {
-        "trend_regime_1d": str(tr_last),
-        "vol_regime_1d": str(vr_last),
-        "vol_prob_low_1d": float(vpl_last),
-        "daily_regime_str_1d": str(combined),
-        "regime_code_1d": int(code),
+        "trend_regime_1d": row.get("trend_regime_1d"),
+        "vol_regime_1d": row.get("vol_regime_1d"),
+        "vol_prob_low_1d": float(vol_prob_low) if pd.notna(vol_prob_low) else np.nan,
+        "regime_1d": row.get("regime_1d"),
+        "regime_code_1d": int(regime_code) if pd.notna(regime_code) else None,
     }
 
+
+# ----------------------------
+# 4h Markov regime
+# Offline semantics:
+# - log returns
+# - model fit ONCE over full window
+# - filtered probs (past-only)
+# - UP state chosen by higher prob-weighted mean return (filtered probs)
+# - EWMA smoothing on prob_up (adjust=False)
+# - as-of lookup via last row <= decision ts
+# ----------------------------
+
+def compute_markov4h_series(df4h: pd.DataFrame, cfg: Markov4hConfig) -> pd.DataFrame:
+    df = _ensure_utc_index(df4h)
+
+    if "close" not in df.columns:
+        raise ValueError("df4h missing required column: close")
+
+    close = df["close"].astype(float)
+    ret = np.log(close).diff().dropna()
+    if ret.shape[0] < int(cfg.min_obs):
+        out = pd.DataFrame(columns=["markov_prob_up_4h", "markov_state_4h"], index=pd.DatetimeIndex([], tz="UTC"))
+        out.index.name = "timestamp"
+        return out
+
+    mod = sm.tsa.MarkovRegression(ret, k_regimes=2, switching_variance=True, trend="c")
+    res = mod.fit(disp=False, maxiter=int(cfg.maxiter))
+
+    fp = [res.filtered_marginal_probabilities[i].clip(0, 1) for i in range(2)]
+
+    means = []
+    for p in fp:
+        w = p.values
+        r = ret.reindex(p.index).values
+        denom = max(np.sum(w), 1e-12)
+        mu = np.sum(w * r) / denom
+        means.append(mu)
+
+    up_idx = int(np.argmax(means))
+
+    prob_up_raw = fp[up_idx].clip(0, 1)
+    prob_up = prob_up_raw.ewm(alpha=float(cfg.ewma_alpha), adjust=False).mean().clip(0, 1)
+    state_up = (prob_up > 0.5).astype(int)
+
+    out = pd.DataFrame(
+        {"markov_prob_up_4h": prob_up.astype(float), "markov_state_4h": state_up.astype(int)},
+        index=prob_up.index,
+    )
+    out.index.name = "timestamp"
+    return out
 
 
 def compute_markov4h_snapshot(
     df4h: pd.DataFrame,
     asof_ts: pd.Timestamp,
-    alpha: float,
+    ewma_alpha: float = 0.2,
+    maxiter: int = 200,
+    min_obs: int = 80,
 ) -> Dict[str, object]:
-    """
-    Canonical 4h Markov:
-      - 2-state MarkovRegression on log returns.
-      - FILTERED (past-only) marginal probabilities.
-      - Identify UP state by higher weighted mean return.
-      - EWM smoothing with alpha.
-    Snapshot is last available probability as-of the last fully-closed 4h bar.
-    """
-    asof_ts = _to_utc_ts(asof_ts)
+    cfg = Markov4hConfig(maxiter=int(maxiter), ewma_alpha=float(ewma_alpha), min_obs=int(min_obs))
+
     df4h = _ensure_utc_index(df4h)
-    df_use = drop_incomplete_last_bar(df4h, "4h", asof_ts)
+    key = _markov4h_cache_key(df4h, cfg)
+    if key not in _MARKOV4H_SERIES_CACHE:
+        _MARKOV4H_SERIES_CACHE[key] = compute_markov4h_series(df4h, cfg)
 
-    if df_use is None or df_use.empty or len(df_use) < 60:
-        raise ValueError("Insufficient 4h bars for Markov snapshot")
+    series = _MARKOV4H_SERIES_CACHE[key]
+    row = _asof_row(series, asof_ts)
+    if row is None:
+        return {"markov_prob_up_4h": np.nan, "markov_state_4h": None}
 
-    if "close" not in df_use.columns:
-        raise ValueError("df4h missing required column: close")
-
-    close = df_use["close"].astype(float)
-    ret = np.log(close).diff().dropna()
-    if len(ret) < 50:
-        raise ValueError("Insufficient 4h returns for Markov snapshot")
-
-    mod = sm.tsa.MarkovRegression(ret, k_regimes=2, switching_variance=True, trend="c")
-    res = mod.fit(disp=False, maxiter=200)
-
-    filt_probs = [res.filtered_marginal_probabilities[i] for i in range(2)]
-
-    means = []
-    for p in filt_probs:
-        w = p.values
-        r = ret.reindex(p.index).values
-        denom = max(float(np.sum(w)), 1e-12)
-        mu = float(np.sum(w * r) / denom)
-        means.append(mu)
-
-    up_idx = int(np.argmax(means))
-    prob_up = filt_probs[up_idx].clip(0.0, 1.0)
-    prob_up = prob_up.ewm(alpha=float(alpha), adjust=False).mean().clip(0.0, 1.0)
-
-    last_prob = float(prob_up.iloc[-1])
-    last_state = int(last_prob > 0.5)
-
+    p = row.get("markov_prob_up_4h")
+    s = row.get("markov_state_4h")
     return {
-        "markov_prob_up_4h": float(last_prob),
-        "markov_state_4h": int(last_state),
+        "markov_prob_up_4h": float(p) if pd.notna(p) else np.nan,
+        "markov_state_4h": int(s) if pd.notna(s) else None,
     }
