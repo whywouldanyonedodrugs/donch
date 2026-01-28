@@ -102,10 +102,13 @@ def compute_daily_regime_snapshot(
     atr_mult: float,
 ) -> Dict[str, object]:
     """
-    Canonical daily combined regime:
-      - Trend: TMA(close, ma_period) with Keltner bands using ATR(atr_period) * atr_mult.
-      - Vol: 2-state MarkovRegression on daily pct returns with smoothed probs;
+    Canonical daily combined regime (MATCH OFFLINE `regime_detector.compute_daily_combined_regime`):
+
+      - Vol: 2-state MarkovRegression on daily pct returns with SMOOTHED probs;
              identify low-vol state by weighted variance; vol_prob_low is that state's prob.
+
+      - Trend: TMA(close, ma_period) with Keltner bands using ATR(atr_period) * atr_mult.
+               Trend is set only when close crosses upper/lower; then ffill/bfill.
 
     Returns snapshot for the latest fully-closed daily bar as-of `asof_ts`:
       trend_regime_1d, vol_regime_1d, vol_prob_low_1d, daily_regime_str_1d, regime_code_1d
@@ -117,31 +120,29 @@ def compute_daily_regime_snapshot(
     if df_use is None or df_use.empty:
         raise ValueError("No daily bars available as-of asof_ts")
 
-    # Require required columns
     for c in ("open", "high", "low", "close"):
         if c not in df_use.columns:
             raise ValueError(f"df_daily missing required column: {c}")
 
     close = df_use["close"].astype(float)
 
-    # Vol regime (Markov on pct returns)
+    # ----------------------------
+    # Vol regime (OFFLINE semantics)
+    # ----------------------------
     ret = close.pct_change().dropna()
+
     vol_regime = pd.Series(index=df_use.index, data="UNKNOWN", dtype="object")
     vol_prob_low = pd.Series(index=df_use.index, data=np.nan, dtype=float)
 
-    if len(ret) < 50:
-        # Too little for stable Markov; fail closed at snapshot extraction time
-        pass
-    else:
+    try:
         model = sm.tsa.MarkovRegression(ret, k_regimes=2, switching_variance=True, trend="c")
         results = model.fit(disp=False, maxiter=200)
-
         probs = [results.smoothed_marginal_probabilities[i] for i in range(2)]
 
         r = ret.reindex(probs[0].index)
         var_est = []
         for p in probs:
-            w = p.values
+            w = p.values.astype(float)
             denom = float(np.sum(w))
             if denom <= 1e-12:
                 var_est.append(np.inf)
@@ -156,54 +157,26 @@ def compute_daily_regime_snapshot(
         vol_reg = np.where(low_prob > 0.5, "LOW_VOL", "HIGH_VOL")
         vol_regime.loc[ret.index] = vol_reg
         vol_prob_low.loc[ret.index] = low_prob.values
+    except Exception:
+        # Match offline: keep UNKNOWN and NaNs; snapshot validation will fail-closed if not defined.
+        pass
 
-    # Trend regime (TMA + ATR bands)
+    # ----------------------------
+    # Trend regime (OFFLINE semantics)
+    # ----------------------------
     tma = triangular_moving_average(close, int(ma_period))
     atr_d = ta.atr(df_use, int(atr_period)).reindex(df_use.index, method="ffill")
-
     upper = tma + float(atr_mult) * atr_d
     lower = tma - float(atr_mult) * atr_d
 
-    # Robust trend fill:
-    # - if the upstream trend detector produced at least one non-NaN, ffill/bfill as before
-    # - if it produced all-NaN (common early / edge windows), fall back to a deterministic proxy
-    #   so the daily snapshot is always defined.
-    if isinstance(trend, pd.Series) and trend.notna().any():
-        trend = trend.astype("object").ffill().bfill()
-    else:
-        # Fallback: classify trend by close vs a rolling mean (deterministic, no model-fit).
-        # This is only used when the primary trend series is entirely undefined.
-        _close = pd.to_numeric(daily["close"], errors="coerce")  # assumes `daily` is the daily OHLCV frame in scope
-        _tma = _close.rolling(window=200, min_periods=1).mean()
-        trend = pd.Series(
-            np.where(_close >= _tma, "BULL", "BEAR"),
-            index=daily.index,
-            dtype="object",
-        )
+    trend = pd.Series(index=df_use.index, dtype="object")
+    trend[close > upper] = "BULL"
+    trend[close < lower] = "BEAR"
+    trend = trend.ffill().bfill()
 
-
-    # --- BEGIN: robust trend fill (prevents all-NaN trend) ---
-    # If trend never crossed upper/lower bands, ffill/bfill cannot fill anything.
-    # Fail-closed is handled later by the snapshot validation, but we should still produce
-    # a deterministic trend label to match offline behavior and avoid NaN propagation.
-    if trend.notna().any():
-        # Ensure object dtype to avoid pandas silent downcasting warnings.
-        trend = trend.astype("object").ffill().bfill()
-    else:
-        # Deterministic fallback: classify by position vs midline (TMA).
-        # This is still "as-of" and uses no future information.
-        import numpy as np
-        trend = pd.Series(
-            np.where(daily["close"].to_numpy() >= tma.to_numpy(), "BULL", "BEAR"),
-            index=daily.index,
-            dtype="object",
-        )
-
-    daily["trend_regime"] = trend
-    # --- END: robust trend fill ---
-
-
+    # ----------------------------
     # Snapshot at last fully-closed day
+    # ----------------------------
     last_idx = df_use.index[-1]
     tr_last = trend.loc[last_idx]
     vr_last = vol_regime.loc[last_idx]
@@ -212,8 +185,11 @@ def compute_daily_regime_snapshot(
     combined = f"{str(tr_last)}_{str(vr_last)}"
     code = REGIME_CODE_MAP.get(combined, None)
 
-    if code is None or not np.isfinite(float(vpl_last)):
-        raise ValueError(f"Daily regime snapshot not fully defined (combined={combined}, vol_prob={vpl_last})")
+    # Fail-closed if not fully defined
+    if code is None:
+        raise ValueError(f"Daily regime snapshot not fully defined (combined={combined})")
+    if not np.isfinite(float(vpl_last)):
+        raise ValueError(f"Daily regime snapshot not fully defined (vol_prob_low_1d={vpl_last})")
 
     return {
         "trend_regime_1d": str(tr_last),
@@ -222,6 +198,7 @@ def compute_daily_regime_snapshot(
         "daily_regime_str_1d": str(combined),
         "regime_code_1d": int(code),
     }
+
 
 
 def compute_markov4h_snapshot(
