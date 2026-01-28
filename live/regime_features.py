@@ -167,7 +167,7 @@ def compute_markov4h_series(df_4h: pd.DataFrame, cfg: Markov4hConfig) -> pd.Data
     if "close" not in df.columns:
         raise AssertionError("4h OHLC missing required column: close")
 
-    shift = pd.Timedelta("4H")
+    shift = pd.Timedelta("4h")
     if cfg.assume_right_labeled_input:
         df_fit = df.copy()
         df_fit.index = df_fit.index - shift
