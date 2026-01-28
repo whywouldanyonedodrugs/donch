@@ -7,7 +7,15 @@ import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 
-import indicators as ta
+# Import indicators module from this repo. Layout differs between environments.
+try:
+    import indicators as ta  # type: ignore
+except ModuleNotFoundError:
+    try:
+        from donch import indicators as ta  # type: ignore
+    except ModuleNotFoundError:
+        from live import indicators as ta  # type: ignore
+
 
 
 # ----------------------------
