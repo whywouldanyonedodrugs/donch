@@ -7,14 +7,21 @@ import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 
-# Import indicators module from this repo. Layout differs between environments.
+# Import indicators from THIS repo deterministically.
+# We must avoid accidentally importing a third-party "indicators" module from site-packages.
 try:
-    import indicators as ta  # type: ignore
-except ModuleNotFoundError:
+    # When running as package "live.*"
+    from . import indicators as ta  # type: ignore
+except Exception:
     try:
-        from donch import indicators as ta  # type: ignore
-    except ModuleNotFoundError:
-        from live import indicators as ta  # type: ignore
+        # When repo root is on PYTHONPATH and indicators.py is at repo root
+        import indicators as ta  # type: ignore
+    except Exception as e:
+        raise ImportError(
+            "Could not import repo indicators module. Ensure you run from repo root "
+            "or set PYTHONPATH=/root/apps/donch."
+        ) from e
+
 
 
 
@@ -127,7 +134,9 @@ def compute_daily_regime_series(df_daily: pd.DataFrame, cfg: DailyRegimeConfig) 
 
     # --- Trend intermediates ---
     tma = triangular_moving_average(close, int(cfg.ma_period))
-    atr = ta.atr(df[["open", "high", "low", "close"]], length=int(cfg.atr_period))
+    # Call ATR positionally to be compatible with both our repo ATR and any legacy signatures.
+    atr = ta.atr(df[["open", "high", "low", "close"]], int(cfg.atr_period))
+
     atr = atr.reindex(df.index, method="ffill")
 
     upper = tma + float(cfg.atr_mult) * atr
@@ -285,27 +294,48 @@ def compute_markov4h_series(df4h: pd.DataFrame, cfg: Markov4hConfig) -> pd.DataF
 
 
 def compute_markov4h_snapshot(
-    df4h: pd.DataFrame,
-    asof_ts: pd.Timestamp,
-    ewma_alpha: float = 0.2,
+    df4h,
+    asof_ts,
+    *,
+    # canonical name
+    ewma_alpha: float | None = None,
+    # backward-compatible alias used by callers/tests
+    alpha: float | None = None,
     maxiter: int = 200,
     min_obs: int = 80,
-) -> Dict[str, object]:
-    cfg = Markov4hConfig(maxiter=int(maxiter), ewma_alpha=float(ewma_alpha), min_obs=int(min_obs))
+):
+    """
+    Compute Markov 4h snapshot "as-of" asof_ts:
+    - Uses only rows with timestamp <= asof_ts for lookup (no wall-clock leakage).
+    - Model fit semantics (filtered/smoothed, log/pct) are determined in compute_markov4h_series.
+    """
 
-    df4h = _ensure_utc_index(df4h)
-    key = _markov4h_cache_key(df4h, cfg)
-    if key not in _MARKOV4H_SERIES_CACHE:
-        _MARKOV4H_SERIES_CACHE[key] = compute_markov4h_series(df4h, cfg)
+    # Normalize alpha alias
+    if ewma_alpha is None and alpha is not None:
+        ewma_alpha = float(alpha)
+    if ewma_alpha is None:
+        ewma_alpha = 0.2  # matches offline default unless overridden by caller
 
-    series = _MARKOV4H_SERIES_CACHE[key]
-    row = _asof_row(series, asof_ts)
-    if row is None:
-        return {"markov_prob_up_4h": np.nan, "markov_state_4h": None}
+    series = compute_markov4h_series(
+        df4h,
+        ewma_alpha=float(ewma_alpha),
+        maxiter=int(maxiter),
+        min_obs=int(min_obs),
+    )
 
-    p = row.get("markov_prob_up_4h")
-    s = row.get("markov_state_4h")
+    if series is None or series.empty:
+        raise AssertionError("compute_markov4h_snapshot: markov series empty")
+
+    # as-of lookup: last row with timestamp <= asof_ts
+    ts = pd.to_datetime(asof_ts, utc=True)
+    series = series.sort_index()
+    sub = series.loc[:ts]
+    if sub.empty:
+        raise AssertionError(f"compute_markov4h_snapshot: no rows <= {ts}")
+    row = sub.iloc[-1]
+
+    # expected columns from compute_markov4h_series
     return {
-        "markov_prob_up_4h": float(p) if pd.notna(p) else np.nan,
-        "markov_state_4h": int(s) if pd.notna(s) else None,
+        "markov_state_4h": int(row["state_up"]),
+        "markov_prob_up_4h": float(row["prob_up"]),
     }
