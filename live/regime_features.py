@@ -1,33 +1,87 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, Any
+from typing import Optional, Tuple, Dict, Any
 
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 
-# Import indicators from THIS repo deterministically.
-# We must avoid accidentally importing a third-party "indicators" module from site-packages.
-try:
-    # When running as package "live.*"
-    from . import indicators as ta  # type: ignore
-except Exception:
+# IMPORTANT: indicators is inside the live package on LIVE
+from . import indicators as ta
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+
+def _ensure_utc_ts(ts: pd.Timestamp) -> pd.Timestamp:
+    ts = pd.to_datetime(ts, utc=True)
+    if ts.tz is None:
+        ts = ts.tz_localize("UTC")
+    else:
+        ts = ts.tz_convert("UTC")
+    return ts
+
+
+def _ensure_dt_index(df: pd.DataFrame, ts_col: str = "timestamp") -> pd.DataFrame:
+    """
+    Ensure df is indexed by a tz-aware UTC DatetimeIndex, sorted ascending.
+    Accepts either:
+      - df already indexed by DatetimeIndex, or
+      - df has a timestamp column.
+    """
+    out = df.copy()
+    if isinstance(out.index, pd.DatetimeIndex):
+        idx = pd.to_datetime(out.index, utc=True, errors="coerce")
+        out.index = idx
+    elif ts_col in out.columns:
+        idx = pd.to_datetime(out[ts_col], utc=True, errors="coerce")
+        out = out.drop(columns=[ts_col])
+        out.index = idx
+    else:
+        raise AssertionError(f"Expected DatetimeIndex or '{ts_col}' column.")
+
+    out = out[~out.index.isna()].sort_index()
+    return out
+
+
+def _asof_row(df: pd.DataFrame, asof_ts: pd.Timestamp) -> pd.Series:
+    """
+    Deterministic as-of: last row with index <= asof_ts.
+    """
+    asof_ts = _ensure_utc_ts(asof_ts)
+    if df.empty:
+        raise AssertionError("Series is empty.")
+    pos = df.index.searchsorted(asof_ts, side="right") - 1
+    if pos < 0:
+        raise AssertionError(f"No rows <= asof_ts={asof_ts} (min={df.index.min()})")
+    return df.iloc[int(pos)]
+
+
+def triangular_moving_average(series: pd.Series, period: int) -> pd.Series:
+    """
+    OFFLINE parity:
+      TMA = SMA(SMA(close, period), period)
+    """
+    p = int(period)
+    return series.rolling(p).mean().rolling(p).mean()
+
+
+def _atr_compat(ohlc: pd.DataFrame, period: int) -> pd.Series:
+    """
+    LIVE has had atr signature drift ('length' vs 'period').
+    Use a compat wrapper to avoid failures.
+    """
     try:
-        # When repo root is on PYTHONPATH and indicators.py is at repo root
-        import indicators as ta  # type: ignore
-    except Exception as e:
-        raise ImportError(
-            "Could not import repo indicators module. Ensure you run from repo root "
-            "or set PYTHONPATH=/root/apps/donch."
-        ) from e
+        return ta.atr(ohlc, length=int(period))  # pandas_ta-like
+    except TypeError:
+        return ta.atr(ohlc, period=int(period))  # local implementation-like
 
 
-
-
-# ----------------------------
-# Config
-# ----------------------------
+# -----------------------------
+# Daily regime (trend + vol)
+# -----------------------------
 
 @dataclass(frozen=True)
 class DailyRegimeConfig:
@@ -35,108 +89,41 @@ class DailyRegimeConfig:
     atr_period: int = 20
     atr_mult: float = 2.0
     maxiter: int = 200
-    min_obs: int = 80  # keep consistent with your tests/tooling; offline code effectively needs "enough" data
 
-
-@dataclass(frozen=True)
-class Markov4hConfig:
-    maxiter: int = 200
-    ewma_alpha: float = 0.2
-    min_obs: int = 80
-
-
-# ----------------------------
-# Internal helpers
-# ----------------------------
-
-def _ensure_utc_index(df: pd.DataFrame) -> pd.DataFrame:
-    if not isinstance(df.index, pd.DatetimeIndex):
-        raise TypeError("DataFrame index must be a DatetimeIndex")
-    if df.index.tz is None:
-        df = df.copy()
-        df.index = df.index.tz_localize("UTC")
-    else:
-        df = df.copy()
-        df.index = df.index.tz_convert("UTC")
-    return df
-
-
-def triangular_moving_average(series: pd.Series, period: int) -> pd.Series:
-    # TMA = SMA(SMA(price, period), period)
-    return series.rolling(period).mean().rolling(period).mean()
-
-
-def _asof_row(df: pd.DataFrame, asof_ts: pd.Timestamp) -> Optional[pd.Series]:
-    if df.empty:
-        return None
-    ts = pd.to_datetime(asof_ts, utc=True, errors="coerce")
-    if ts is pd.NaT:
-        return None
-    sub = df.loc[:ts]
-    if sub.empty:
-        return None
-    return sub.iloc[-1]
-
-
-# ----------------------------
-# Caches (fit-once per input window)
-# ----------------------------
-
-_DAILY_SERIES_CACHE: Dict[Tuple[Any, ...], pd.DataFrame] = {}
-_MARKOV4H_SERIES_CACHE: Dict[Tuple[Any, ...], pd.DataFrame] = {}
-
-
-def _daily_cache_key(df_daily: pd.DataFrame, cfg: DailyRegimeConfig) -> Tuple[Any, ...]:
-    # Key by identity + shape + bounds + params (good enough for tests/live snapshots)
-    return (
-        id(df_daily),
-        int(df_daily.shape[0]),
-        str(df_daily.index[0]),
-        str(df_daily.index[-1]),
-        int(cfg.ma_period),
-        int(cfg.atr_period),
-        float(cfg.atr_mult),
-        int(cfg.maxiter),
-        int(cfg.min_obs),
-    )
-
-
-def _markov4h_cache_key(df4h: pd.DataFrame, cfg: Markov4hConfig) -> Tuple[Any, ...]:
-    return (
-        id(df4h),
-        int(df4h.shape[0]),
-        str(df4h.index[0]),
-        str(df4h.index[-1]),
-        int(cfg.maxiter),
-        float(cfg.ewma_alpha),
-        int(cfg.min_obs),
-    )
-
-
-# ----------------------------
-# Daily regime (trend + daily vol Markov)
-# Offline semantics:
-# - model fit ONCE over full window
-# - volatility uses smoothed probs
-# - low-vol state chosen by weighted variance under smoothed probs
-# - as-of lookup is done by selecting the last daily row <= decision ts
-# ----------------------------
 
 def compute_daily_regime_series(df_daily: pd.DataFrame, cfg: DailyRegimeConfig) -> pd.DataFrame:
-    df = _ensure_utc_index(df_daily)
+    """
+    Match OFFLINE regime_detector.compute_daily_combined_regime() semantics,
+    assuming df_daily already represents 1D OHLC with the OFFLINE bin labeling.
 
-    required = {"open", "high", "low", "close"}
-    missing = required - set(df.columns)
+    - Trend:
+        TMA(close, ma_period) +/- atr_mult * ATR(atr_period)
+        trend = BULL if close > upper, BEAR if close < lower, then ffill/bfill
+    - Volatility:
+        MarkovRegression on daily pct returns, k=2, switching_variance=True, trend='c'
+        Uses smoothed_marginal_probabilities (two-sided).
+        Low-vol state chosen by prob-weighted variance under smoothed probs.
+        vol_prob_low = smoothed prob of low-var state
+        vol_regime = LOW_VOL if vol_prob_low > 0.5 else HIGH_VOL (on return rows only)
+    - regime_code mapping:
+        BEAR_HIGH_VOL=0, BEAR_LOW_VOL=1, BULL_HIGH_VOL=2, BULL_LOW_VOL=3
+    """
+    df = _ensure_dt_index(df_daily)
+
+    req = {"open", "high", "low", "close"}
+    missing = sorted(req - set(df.columns))
     if missing:
-        raise ValueError(f"df_daily missing columns: {sorted(missing)}")
+        raise AssertionError(f"Daily OHLC missing required columns: {missing}")
 
+    # Ensure numeric close
     close = df["close"].astype(float)
 
-    # --- Trend intermediates ---
+    # Trend intermediates
     tma = triangular_moving_average(close, int(cfg.ma_period))
-    # Call ATR positionally to be compatible with both our repo ATR and any legacy signatures.
-    atr = ta.atr(df[["open", "high", "low", "close"]], int(cfg.atr_period))
 
+    ohlc = df[["open", "high", "low", "close"]].astype(float)
+    atr = _atr_compat(ohlc, int(cfg.atr_period))
+    # Align + ffill like OFFLINE does via reindex(..., method="ffill")
     atr = atr.reindex(df.index, method="ffill")
 
     upper = tma + float(cfg.atr_mult) * atr
@@ -145,39 +132,39 @@ def compute_daily_regime_series(df_daily: pd.DataFrame, cfg: DailyRegimeConfig) 
     trend = pd.Series(index=df.index, dtype="object")
     trend[close > upper] = "BULL"
     trend[close < lower] = "BEAR"
+    # OFFLINE: ffill().bfill()
     trend = trend.ffill().bfill()
 
-    # --- Volatility regime (global fit; smoothed probs) ---
-    ret = close.pct_change().dropna()
+    # Volatility regime intermediates
+    ret = close.pct_change()
+    r = ret.dropna()
+
     vol_regime = pd.Series("UNKNOWN", index=df.index, dtype="object")
     vol_prob_low = pd.Series(np.nan, index=df.index, dtype=float)
 
-    if ret.shape[0] >= int(cfg.min_obs):
-        model = sm.tsa.MarkovRegression(ret, k_regimes=2, switching_variance=True, trend="c")
+    if not r.empty:
+        model = sm.tsa.MarkovRegression(r, k_regimes=2, switching_variance=True, trend="c")
         res = model.fit(disp=False, maxiter=int(cfg.maxiter))
 
         probs = [res.smoothed_marginal_probabilities[i].clip(0, 1) for i in range(2)]
-        r = ret.reindex(probs[0].index)
+        rr = r.reindex(probs[0].index)
 
         var_est = []
         for p in probs:
             w = p.values
-            denom = np.sum(w)
-            if denom <= 0:
+            denom = float(np.sum(w))
+            if denom <= 1e-12:
                 var_est.append(np.inf)
                 continue
-            mu = np.sum(w * r.values) / denom
-            var = np.sum(w * (r.values - mu) ** 2) / denom
+            mu = float(np.sum(w * rr.values) / denom)
+            var = float(np.sum(w * (rr.values - mu) ** 2) / denom)
             var_est.append(var)
 
         low_idx = int(np.argmin(var_est))
         low_prob = probs[low_idx].clip(0, 1)
 
         vol_prob_low.loc[low_prob.index] = low_prob.values
-        vol_regime.loc[low_prob.index] = np.where(low_prob > 0.5, "LOW_VOL", "HIGH_VOL")
-    else:
-        # Not enough observations; keep UNKNOWN / NaN
-        pass
+        vol_regime.loc[low_prob.index] = np.where(low_prob.values > 0.5, "LOW_VOL", "HIGH_VOL")
 
     regime = (trend.fillna("NA") + "_" + vol_regime.fillna("UNKNOWN")).astype(str)
     code_map = {"BEAR_HIGH_VOL": 0, "BEAR_LOW_VOL": 1, "BULL_HIGH_VOL": 2, "BULL_LOW_VOL": 3}
@@ -185,11 +172,16 @@ def compute_daily_regime_series(df_daily: pd.DataFrame, cfg: DailyRegimeConfig) 
 
     out = pd.DataFrame(
         {
-            "trend_regime_1d": trend.astype("object"),
-            "vol_regime_1d": vol_regime.astype("object"),
-            "vol_prob_low_1d": vol_prob_low.astype(float),
-            "regime_1d": regime.astype(str),
-            "regime_code_1d": regime_code,
+            "close": close,
+            "tma": tma,
+            "atr": atr,
+            "upper": upper,
+            "lower": lower,
+            "trend_regime": trend,
+            "vol_regime": vol_regime,
+            "vol_prob_low": vol_prob_low,
+            "regime": regime,
+            "regime_code": regime_code,
         },
         index=df.index,
     )
@@ -199,84 +191,76 @@ def compute_daily_regime_series(df_daily: pd.DataFrame, cfg: DailyRegimeConfig) 
 
 def compute_daily_regime_snapshot(
     df_daily: pd.DataFrame,
-    asof_ts: pd.Timestamp,
-    ma_period: int,
-    atr_period: int,
-    atr_mult: float,
+    decision_ts: pd.Timestamp,
+    *,
+    ma_period: int = 200,
+    atr_period: int = 20,
+    atr_mult: float = 2.0,
     maxiter: int = 200,
-    min_obs: int = 80,
-) -> Dict[str, object]:
-    cfg = DailyRegimeConfig(
-        ma_period=int(ma_period),
-        atr_period=int(atr_period),
-        atr_mult=float(atr_mult),
-        maxiter=int(maxiter),
-        min_obs=int(min_obs),
-    )
+) -> Dict[str, Any]:
+    """
+    Convenience wrapper (NOT used by the optimized test; kept for callers).
+    Computes full series then as-of lookup.
 
-    df_daily = _ensure_utc_index(df_daily)
-    key = _daily_cache_key(df_daily, cfg)
-    if key not in _DAILY_SERIES_CACHE:
-        _DAILY_SERIES_CACHE[key] = compute_daily_regime_series(df_daily, cfg)
-
-    series = _DAILY_SERIES_CACHE[key]
-    row = _asof_row(series, asof_ts)
-    if row is None:
-        return {
-            "trend_regime_1d": None,
-            "vol_regime_1d": None,
-            "vol_prob_low_1d": np.nan,
-            "regime_1d": None,
-            "regime_code_1d": None,
-        }
-
-    regime_code = row.get("regime_code_1d")
-    vol_prob_low = row.get("vol_prob_low_1d")
-
+    OFFLINE mapping is effectively day-based (ts.floor('D')), but since daily index
+    is at 00:00 it is equivalent to as-of decision_ts for any intraday time.
+    """
+    cfg = DailyRegimeConfig(ma_period=int(ma_period), atr_period=int(atr_period), atr_mult=float(atr_mult), maxiter=int(maxiter))
+    series = compute_daily_regime_series(df_daily, cfg)
+    row = _asof_row(series, decision_ts)
     return {
-        "trend_regime_1d": row.get("trend_regime_1d"),
-        "vol_regime_1d": row.get("vol_regime_1d"),
-        "vol_prob_low_1d": float(vol_prob_low) if pd.notna(vol_prob_low) else np.nan,
-        "regime_1d": row.get("regime_1d"),
-        "regime_code_1d": int(regime_code) if pd.notna(regime_code) else None,
+        "regime_code_1d": int(row["regime_code"]) if pd.notna(row["regime_code"]) else None,
+        "vol_prob_low_1d": float(row["vol_prob_low"]) if pd.notna(row["vol_prob_low"]) else None,
     }
 
 
-# ----------------------------
+# -----------------------------
 # 4h Markov regime
-# Offline semantics:
-# - log returns
-# - model fit ONCE over full window
-# - filtered probs (past-only)
-# - UP state chosen by higher prob-weighted mean return (filtered probs)
-# - EWMA smoothing on prob_up (adjust=False)
-# - as-of lookup via last row <= decision ts
-# ----------------------------
+# -----------------------------
 
-def compute_markov4h_series(df4h: pd.DataFrame, cfg: Markov4hConfig) -> pd.DataFrame:
-    df = _ensure_utc_index(df4h)
+@dataclass(frozen=True)
+class Markov4hConfig:
+    ewma_alpha: float = 0.2
+    maxiter: int = 200
+
+
+def compute_markov4h_series(df_4h: pd.DataFrame, cfg: Markov4hConfig) -> pd.DataFrame:
+    """
+    Match OFFLINE regime_detector.compute_markov_regime_4h() semantics,
+    assuming df_4h already represents 4h OHLC with the OFFLINE bin labeling.
+
+    - returns: log(close).diff()
+    - MarkovRegression: k=2, switching_variance=True, trend='c', maxiter=200
+    - probabilities: filtered_marginal_probabilities (past-only)
+    - UP state: regime with higher prob-weighted mean return under filtered probs
+    - prob_up: filtered prob of UP state, then EWMA(alpha, adjust=False)
+    - state_up: (prob_up > 0.5).astype(int)
+    """
+    df = _ensure_dt_index(df_4h)
 
     if "close" not in df.columns:
-        raise ValueError("df4h missing required column: close")
+        raise AssertionError("4h OHLC missing required column: close")
 
     close = df["close"].astype(float)
-    ret = np.log(close).diff().dropna()
-    if ret.shape[0] < int(cfg.min_obs):
-        out = pd.DataFrame(columns=["markov_prob_up_4h", "markov_state_4h"], index=pd.DatetimeIndex([], tz="UTC"))
-        out.index.name = "timestamp"
-        return out
+    ret = np.log(close).diff()
+    r = ret.dropna()
+    if r.empty:
+        raise AssertionError("4h log return series is empty")
 
-    mod = sm.tsa.MarkovRegression(ret, k_regimes=2, switching_variance=True, trend="c")
-    res = mod.fit(disp=False, maxiter=int(cfg.maxiter))
+    model = sm.tsa.MarkovRegression(r, k_regimes=2, switching_variance=True, trend="c")
+    res = model.fit(disp=False, maxiter=int(cfg.maxiter))
 
     fp = [res.filtered_marginal_probabilities[i].clip(0, 1) for i in range(2)]
+    rr = r.reindex(fp[0].index)
 
     means = []
     for p in fp:
         w = p.values
-        r = ret.reindex(p.index).values
-        denom = max(np.sum(w), 1e-12)
-        mu = np.sum(w * r) / denom
+        denom = float(np.sum(w))
+        if denom <= 1e-12:
+            means.append(-np.inf)
+            continue
+        mu = float(np.sum(w * rr.values) / denom)
         means.append(mu)
 
     up_idx = int(np.argmax(means))
@@ -286,56 +270,42 @@ def compute_markov4h_series(df4h: pd.DataFrame, cfg: Markov4hConfig) -> pd.DataF
     state_up = (prob_up > 0.5).astype(int)
 
     out = pd.DataFrame(
-        {"markov_prob_up_4h": prob_up.astype(float), "markov_state_4h": state_up.astype(int)},
-        index=prob_up.index,
+        {
+            "close": close,
+            "logret": ret,
+            "prob_up": prob_up,
+            "state_up": state_up,
+        },
+        index=df.index,
     )
     out.index.name = "timestamp"
     return out
 
 
 def compute_markov4h_snapshot(
-    df4h,
-    asof_ts,
+    df_4h: pd.DataFrame,
+    decision_ts: pd.Timestamp,
     *,
-    # canonical name
-    ewma_alpha: float | None = None,
-    # backward-compatible alias used by callers/tests
-    alpha: float | None = None,
+    ewma_alpha: Optional[float] = None,
+    alpha: Optional[float] = None,
     maxiter: int = 200,
-    min_obs: int = 80,
-):
+) -> Dict[str, Any]:
     """
-    Compute Markov 4h snapshot "as-of" asof_ts:
-    - Uses only rows with timestamp <= asof_ts for lookup (no wall-clock leakage).
-    - Model fit semantics (filtered/smoothed, log/pct) are determined in compute_markov4h_series.
-    """
+    Convenience wrapper with backward-compat keyword handling:
+      - accept ewma_alpha=... (preferred)
+      - accept alpha=... (legacy)
 
-    # Normalize alpha alias
+    Computes full series then as-of lookup.
+    """
     if ewma_alpha is None and alpha is not None:
-        ewma_alpha = float(alpha)
+        ewma_alpha = alpha
     if ewma_alpha is None:
-        ewma_alpha = 0.2  # matches offline default unless overridden by caller
+        ewma_alpha = 0.2
 
-    series = compute_markov4h_series(
-        df4h,
-        ewma_alpha=float(ewma_alpha),
-        maxiter=int(maxiter),
-        min_obs=int(min_obs),
-    )
-
-    if series is None or series.empty:
-        raise AssertionError("compute_markov4h_snapshot: markov series empty")
-
-    # as-of lookup: last row with timestamp <= asof_ts
-    ts = pd.to_datetime(asof_ts, utc=True)
-    series = series.sort_index()
-    sub = series.loc[:ts]
-    if sub.empty:
-        raise AssertionError(f"compute_markov4h_snapshot: no rows <= {ts}")
-    row = sub.iloc[-1]
-
-    # expected columns from compute_markov4h_series
+    cfg = Markov4hConfig(ewma_alpha=float(ewma_alpha), maxiter=int(maxiter))
+    series = compute_markov4h_series(df_4h, cfg)
+    row = _asof_row(series, decision_ts)
     return {
-        "markov_state_4h": int(row["state_up"]),
         "markov_prob_up_4h": float(row["prob_up"]),
+        "markov_state_4h": int(row["state_up"]),
     }
