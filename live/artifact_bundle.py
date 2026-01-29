@@ -32,22 +32,25 @@ def _extract_feature_names_from_manifest(feature_manifest: dict) -> list[str]:
     """
     Extract feature names from feature_manifest.json in a schema-robust way.
 
-    Supports common shapes:
-      - {"feature_names": [...]}
-      - {"columns": [...]}
-      - {"features": {name: {...}, ...}}
-      - {"features": [{"name": "..."} , ...]}
-      - {"features": ["a", "b", ...]}
-      - {"schema": {...}} (recursive)
+    Supported shapes:
+      - {"features": {"numeric_cols": [...], "cat_cols": [...]} }   (current)
+      - {"feature_names": [...]} / {"columns": [...]} / {"feature_cols": [...]}
+      - {"features": {feature_name: {...}, ...}}                   (legacy)
+      - {"features": [{"name": "..."}, ...]} / {"features": ["a", "b", ...]}
+      - {"schema": {...}}                                          (recursive)
     """
+
     def _dedupe(xs: list[str]) -> list[str]:
-        seen = set()
+        seen: set[str] = set()
         out: list[str] = []
         for x in xs:
             if x not in seen:
                 seen.add(x)
                 out.append(x)
         return out
+
+    def _is_str_list(v: object) -> bool:
+        return isinstance(v, list) and all(isinstance(x, str) and x for x in v)
 
     def _from(obj: object) -> list[str]:
         if not isinstance(obj, dict):
@@ -56,21 +59,35 @@ def _extract_feature_names_from_manifest(feature_manifest: dict) -> list[str]:
         # Direct lists
         for k in ("feature_names", "columns", "feature_list", "feature_cols"):
             v = obj.get(k)
-            if isinstance(v, list) and all(isinstance(x, str) for x in v):
+            if _is_str_list(v):
                 return _dedupe(list(v))
 
         feats = obj.get("features")
 
-        # Dict of feature_name -> metadata
+        # Current schema: {"features": {"numeric_cols": [...], "cat_cols": [...]} }
         if isinstance(feats, dict):
-            keys = [str(k) for k in feats.keys() if isinstance(k, str)]
-            return _dedupe(keys)
+            num = feats.get("numeric_cols")
+            cat = feats.get("cat_cols")
+            if _is_str_list(num) or _is_str_list(cat):
+                out: list[str] = []
+                if _is_str_list(num):
+                    out.extend(list(num))
+                if _is_str_list(cat):
+                    out.extend(list(cat))
+                return _dedupe(out)
+
+            # Legacy schema: {"features": {feature_name: {...}, ...}}
+            # Guard against accidentally returning structural keys.
+            structural = {"numeric_cols", "cat_cols"}
+            keys = [str(k) for k in feats.keys() if isinstance(k, str) and k not in structural]
+            if keys:
+                return _dedupe(keys)
 
         # List of strings or dicts containing a name-like key
         if isinstance(feats, list):
             out: list[str] = []
             for item in feats:
-                if isinstance(item, str):
+                if isinstance(item, str) and item:
                     out.append(item)
                     continue
                 if isinstance(item, dict):
@@ -91,9 +108,7 @@ def _extract_feature_names_from_manifest(feature_manifest: dict) -> list[str]:
 
         return []
 
-    names = _from(feature_manifest)
-    return names
-
+    return _from(feature_manifest)
 
 
 @dataclass(frozen=True)
@@ -102,6 +117,7 @@ class ArtifactBundle:
     bundle_id: str
     model_kind: str  # "sklearn_pipeline" or "legacy_lgbm"
     feature_manifest: dict
+    feature_names: list[str]
 
     # Artifacts
     model: Any
@@ -261,21 +277,22 @@ def load_bundle(meta_dir: str | Path, strict: bool = True, required_extra_files:
 
     feature_manifest = _read_json(meta_dir_p / "feature_manifest.json")
 
-    manifest_features = _extract_feature_names_from_manifest(feature_manifest)
-
     feature_names = _extract_feature_names_from_manifest(feature_manifest)
     if strict and (not feature_names):
         raise ValueError(
             f"feature_manifest.json yielded 0 feature names (schema mismatch). "
             f"path={meta_dir_p / 'feature_manifest.json'}"
         )
+    
+    feature_set = set(feature_names)
 
-    bundle.feature_names = feature_names
 
     daily_truth_p = meta_dir_p / REGIME_DAILY_TRUTH_FILE
     markov_truth_p = meta_dir_p / REGIME_MARKOV4H_TRUTH_FILE
 
-    needs_regime_truth = bool(manifest_features & REGIME_FEATURE_KEYS)
+    include_regimes = bool(feature_manifest.get("include_regimes_as_features", True))
+    needs_regime_truth = bool(feature_set & REGIME_FEATURE_KEYS) if include_regimes else False
+
     has_daily = daily_truth_p.exists()
     has_markov = markov_truth_p.exists()
     has_both = has_daily and has_markov
@@ -352,6 +369,7 @@ def load_bundle(meta_dir: str | Path, strict: bool = True, required_extra_files:
         bundle_id=b_id,
         model_kind=model_kind,
         feature_manifest=feature_manifest,
+        feature_names=feature_names,
         model=model,
         calibrator=calibrator,
         calibrator_path=calibrator_path,
