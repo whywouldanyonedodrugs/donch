@@ -28,7 +28,7 @@ from typing import Optional, Tuple, Dict, Any, List
 
 import numpy as np
 import pandas as pd
-
+bootstrap_repo_root()
 
 # ---------------------------------------------------------------------
 # Bootstrap: allow running as `python tools/diag_...py` from anywhere

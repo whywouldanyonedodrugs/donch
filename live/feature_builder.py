@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import logging
 from typing import Dict, Any
+from live.regime_truth import macro_regimes_asof
 
 from . import indicators as ta
 from .parity_utils import resample_ohlcv, map_to_left_index, donchian_upper_days_no_lookahead
