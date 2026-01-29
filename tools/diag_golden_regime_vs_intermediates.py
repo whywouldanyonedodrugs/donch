@@ -1,230 +1,287 @@
 #!/usr/bin/env python3
+"""
+diag_golden_regime_vs_intermediates.py
+
+Diagnose which benchmark symbol (BTCUSDT vs ETHUSDT, etc.) the golden "macro" regime
+columns were derived from by comparing golden_features.parquet against OFFLINE
+intermediate exports.
+
+Semantics:
+- Golden timestamps are decision_ts (5m bar-close timestamps).
+- OFFLINE intermediates are left-edge labeled (default pandas resample), so to compare
+  as-of decision_ts using bar-close labeling, we shift:
+    - daily intermediates by +1D
+    - 4H intermediates by +4H
+  (unless --no-shift-intermediate is used)
+- As-of lookup: for each decision_ts, use the last intermediate row with ts <= decision_ts.
+No wall-clock leakage. Deterministic as-of-only.
+
+This tool does not recompute regimes; it only compares golden vs intermediates.
+"""
+
+from __future__ import annotations
+
 import argparse
+import sys
 from pathlib import Path
+from typing import Optional, Tuple, Dict, Any, List
 
 import numpy as np
 import pandas as pd
 
 
-def _load_parquet_ts(path: Path) -> pd.DataFrame:
-    df = pd.read_parquet(path)
-    if "timestamp" in df.columns:
-        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
-        df = df[df["timestamp"].notna()].copy()
-        df = df.sort_values("timestamp")
-        df = df.set_index("timestamp", drop=True)
+# ---------------------------------------------------------------------
+# Bootstrap: allow running as `python tools/diag_...py` from anywhere
+# without relying on PYTHONPATH hacks.
+# ---------------------------------------------------------------------
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+
+def _ensure_utc_index(df: pd.DataFrame, ts_col: str = "timestamp") -> pd.DataFrame:
+    out = df.copy()
+    if ts_col in out.columns:
+        out[ts_col] = pd.to_datetime(out[ts_col], utc=True, errors="coerce")
+        out = out.dropna(subset=[ts_col]).set_index(ts_col)
+    elif isinstance(out.index, pd.DatetimeIndex):
+        out.index = pd.to_datetime(out.index, utc=True, errors="coerce")
+        out = out[~out.index.isna()]
     else:
-        if not isinstance(df.index, pd.DatetimeIndex):
-            raise RuntimeError(f"{path} has no timestamp column and index is not DatetimeIndex")
-        df = df.copy()
-        df.index = pd.to_datetime(df.index, utc=True, errors="coerce")
-        df = df[df.index.notna()].copy()
-        df = df.sort_index()
-    return df
+        raise AssertionError(f"Expected '{ts_col}' column or DatetimeIndex.")
+    return out.sort_index()
 
 
-def _pick_golden_symbol(g: pd.DataFrame, user_symbol: str | None) -> str | None:
-    if "symbol" not in g.columns:
-        return None
-    if user_symbol:
-        return user_symbol
-    vc = g["symbol"].value_counts()
-    return str(vc.index[0]) if len(vc) else None
+def _load_golden(path: Path) -> pd.DataFrame:
+    g = pd.read_parquet(path)
+    g = _ensure_utc_index(g, "timestamp")
+    # Golden macro columns are constant across symbols per timestamp; pick first row per ts.
+    g = g.groupby(g.index).first().sort_index()
+    return g
 
 
-def _asof_last(df: pd.DataFrame, ts: pd.Timestamp) -> pd.Series | None:
-    # expects df indexed by timestamp sorted
+def _asof_row(df: pd.DataFrame, ts: pd.Timestamp) -> Optional[pd.Series]:
+    ts = pd.to_datetime(ts, utc=True)
     if df.empty:
         return None
-    # fast path: if ts < first index
-    if ts < df.index[0]:
-        return None
-    # position via searchsorted
     pos = df.index.searchsorted(ts, side="right") - 1
     if pos < 0:
         return None
     return df.iloc[int(pos)]
 
 
-def eval_daily(golden: pd.DataFrame, daily_inter: pd.DataFrame) -> tuple[float, float, int]:
-    # golden expected columns
-    code_col = "regime_code_1d" if "regime_code_1d" in golden.columns else "regime_code"
-    prob_col = "vol_prob_low_1d" if "vol_prob_low_1d" in golden.columns else "vol_prob_low"
+def _pick_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
 
-    if code_col not in golden.columns or prob_col not in golden.columns:
-        raise RuntimeError(f"Golden missing {code_col} or {prob_col}")
 
-    # offline semantics: day = ts.floor("D"), then last daily row <= day
-    # daily_inter index is daily labels; ensure we have a daily table
-    di = daily_inter.copy()
-    di["_day"] = di.index.floor("D")
-    di_day = di.groupby("_day").last().sort_index()
-    di_day.index.name = "day"
+def _eval_daily(golden: pd.DataFrame, daily_inter: pd.DataFrame, limit: int) -> Dict[str, Any]:
+    exp_code_c = _pick_col(golden, ["regime_code_1d", "regime_code"])
+    exp_prob_c = _pick_col(golden, ["vol_prob_low_1d", "vol_prob_low"])
 
-    exp_code = []
-    got_code = []
-    exp_prob = []
-    got_prob = []
+    got_code_c = _pick_col(daily_inter, ["regime_code", "regime_code_1d"])
+    got_prob_c = _pick_col(daily_inter, ["vol_prob_low", "vol_prob_low_1d"])
+
+    if exp_code_c is None:
+        raise AssertionError("Golden missing daily regime code column (expected regime_code_1d).")
+    if exp_prob_c is None:
+        raise AssertionError("Golden missing daily vol prob column (expected vol_prob_low_1d).")
+    if got_code_c is None:
+        raise AssertionError("Daily intermediate missing regime code column (expected regime_code).")
+    if got_prob_c is None:
+        raise AssertionError("Daily intermediate missing vol prob column (expected vol_prob_low).")
+
+    n = 0
+    code_ok = 0
+    prob_errs = []
+    prob_max = 0.0
+    mism = []
 
     for ts, row in golden.iterrows():
-        day = ts.floor("D")
-        r = _asof_last(di_day, day)
-        if r is None:
+        if n >= limit:
+            break
+
+        exp_code = row.get(exp_code_c, np.nan)
+        exp_prob = row.get(exp_prob_c, np.nan)
+        if not np.isfinite(exp_code) and not np.isfinite(exp_prob):
             continue
-        if pd.isna(row[code_col]) or pd.isna(row[prob_col]):
+
+        got = _asof_row(daily_inter, ts)
+        if got is None:
             continue
 
-        exp_code.append(int(row[code_col]))
-        got_code.append(int(r["regime_code"] if "regime_code" in r.index else r.get("regime_code", np.nan)))
+        got_code = got.get(got_code_c, np.nan)
+        got_prob = got.get(got_prob_c, np.nan)
 
-        exp_prob.append(float(row[prob_col]))
-        got_prob.append(float(r["vol_prob_low"] if "vol_prob_low" in r.index else r.get("vol_prob_low", np.nan)))
+        if np.isfinite(exp_code) and np.isfinite(got_code):
+            if int(exp_code) == int(got_code):
+                code_ok += 1
+            else:
+                mism.append(f"{ts} code exp={int(exp_code)} got={int(got_code)}")
 
-    if not exp_code:
-        return (np.nan, np.nan, 0)
+        if np.isfinite(exp_prob) and np.isfinite(got_prob):
+            e = float(abs(float(exp_prob) - float(got_prob)))
+            prob_errs.append(e)
+            prob_max = max(prob_max, e)
+            if e > 1e-3:
+                mism.append(f"{ts} vol_prob_low exp={float(exp_prob):.6f} got={float(got_prob):.6f} err={e:.6f}")
 
-    exp_code = np.array(exp_code, dtype=int)
-    got_code = np.array(got_code, dtype=int)
-    exp_prob = np.array(exp_prob, dtype=float)
-    got_prob = np.array(got_prob, dtype=float)
+        n += 1
 
-    code_acc = float((exp_code == got_code).mean())
-    prob_mae = float(np.mean(np.abs(exp_prob - got_prob)))
-    return (code_acc, prob_mae, int(len(exp_code)))
+    prob_mae = float(np.mean(prob_errs)) if prob_errs else float("nan")
+    code_acc = float(code_ok / max(n, 1)) if n else float("nan")
+
+    return {
+        "n": n,
+        "code_acc": code_acc,
+        "prob_mae": prob_mae,
+        "prob_max": prob_max,
+        "mismatches_sample": mism[:10],
+    }
 
 
-def eval_markov(
-    golden: pd.DataFrame,
-    markov_inter: pd.DataFrame,
-    shift_hours: int,
-    alpha: float | None,
-    use_raw: bool,
-) -> tuple[float, float, int]:
-    # golden expected columns
-    prob_col = "markov_prob_up_4h"
-    state_col = "markov_state_4h"
-    if prob_col not in golden.columns or state_col not in golden.columns:
-        raise RuntimeError(f"Golden missing {prob_col} or {state_col}")
+def _eval_markov(golden: pd.DataFrame, markov_inter: pd.DataFrame, limit: int) -> Dict[str, Any]:
+    exp_p_c = _pick_col(golden, ["markov_prob_up_4h", "prob_up"])
+    exp_s_c = _pick_col(golden, ["markov_state_4h", "state_up"])
 
-    mi = markov_inter.copy()
-    mi.index = mi.index + pd.Timedelta(hours=int(shift_hours))
-    mi = mi.sort_index()
+    got_p_c = _pick_col(markov_inter, ["prob_up_ewm", "prob_up"])
+    got_s_c = _pick_col(markov_inter, ["state_up", "markov_state_4h"])
 
-    # choose base probability series
-    if "prob_up_raw" in mi.columns:
-        base = mi["prob_up_raw"].astype(float)
-    elif "prob_up" in mi.columns:
-        base = mi["prob_up"].astype(float)
-    else:
-        raise RuntimeError("Markov intermediate missing prob_up_raw/prob_up")
+    if exp_p_c is None or exp_s_c is None:
+        raise AssertionError("Golden missing markov columns (expected markov_prob_up_4h and markov_state_4h).")
+    if got_p_c is None or got_s_c is None:
+        raise AssertionError("Markov intermediate missing columns (expected prob_up/prob_up_ewm and state_up).")
 
-    if use_raw:
-        prob = base
-    else:
-        a = float(alpha)
-        prob = base.ewm(alpha=a, adjust=False).mean().clip(0, 1)
+    n = 0
+    state_ok = 0
+    prob_errs = []
+    prob_max = 0.0
+    mism = []
 
-    exp_p = []
-    got_p = []
-    exp_s = []
-    got_s = []
-
-    # as-of lookup: last markov row <= ts
     for ts, row in golden.iterrows():
-        if pd.isna(row[prob_col]) or pd.isna(row[state_col]):
+        if n >= limit:
+            break
+
+        exp_p = row.get(exp_p_c, np.nan)
+        exp_s = row.get(exp_s_c, np.nan)
+        if not np.isfinite(exp_p) and not np.isfinite(exp_s):
             continue
-        r = _asof_last(pd.DataFrame({"prob": prob}).dropna(), ts)
-        if r is None:
+
+        got = _asof_row(markov_inter, ts)
+        if got is None:
             continue
-        p = float(r["prob"])
-        exp_p.append(float(row[prob_col]))
-        got_p.append(p)
-        exp_s.append(int(row[state_col]))
-        got_s.append(int(p > 0.5))
 
-    if not exp_p:
-        return (np.nan, np.nan, 0)
+        got_p = got.get(got_p_c, np.nan)
+        got_s = got.get(got_s_c, np.nan)
 
-    exp_p = np.array(exp_p, dtype=float)
-    got_p = np.array(got_p, dtype=float)
-    exp_s = np.array(exp_s, dtype=int)
-    got_s = np.array(got_s, dtype=int)
+        if np.isfinite(exp_p) and np.isfinite(got_p):
+            e = float(abs(float(exp_p) - float(got_p)))
+            prob_errs.append(e)
+            prob_max = max(prob_max, e)
+            if e > 5e-3:
+                mism.append(f"{ts} prob exp={float(exp_p):.6f} got={float(got_p):.6f} err={e:.6f}")
 
-    prob_mae = float(np.mean(np.abs(exp_p - got_p)))
-    state_acc = float((exp_s == got_s).mean())
-    return (state_acc, prob_mae, int(len(exp_p)))
+        if np.isfinite(exp_s) and np.isfinite(got_s):
+            if int(exp_s) == int(got_s):
+                state_ok += 1
+            else:
+                mism.append(f"{ts} state exp={int(exp_s)} got={int(got_s)}")
+
+        n += 1
+
+    prob_mae = float(np.mean(prob_errs)) if prob_errs else float("nan")
+    state_acc = float(state_ok / max(n, 1)) if n else float("nan")
+
+    return {
+        "n": n,
+        "state_acc": state_acc,
+        "prob_mae": prob_mae,
+        "prob_max": prob_max,
+        "mismatches_sample": mism[:10],
+    }
 
 
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--golden", required=True)
-    ap.add_argument("--intermediate-dir", required=True)
-    ap.add_argument("--golden-symbol", default=None)
-    ap.add_argument("--max-rows", type=int, default=300)
+    ap.add_argument("--golden-path", type=str, default="results/meta_export/golden_features.parquet")
+    ap.add_argument("--intermediate-dir", type=str, required=True)
+    ap.add_argument("--symbols", type=str, default="BTCUSDT,ETHUSDT", help="Comma-separated symbols to compare.")
+    ap.add_argument("--no-shift-intermediate", action="store_true")
+    ap.add_argument("--shift-daily", type=str, default="1D")
+    ap.add_argument("--shift-4h", type=str, default="4H")
+    ap.add_argument("--limit", type=int, default=1500, help="Max golden decision_ts to evaluate per symbol.")
     args = ap.parse_args()
 
-    golden_path = Path(args.golden).resolve()
-    idir = Path(args.intermediate_dir).resolve()
+    golden_path = (_REPO_ROOT / args.golden_path).resolve()
+    inter_dir = (_REPO_ROOT / args.intermediate_dir).resolve()
 
-    g_raw = pd.read_parquet(golden_path)
-    # timestamp handling for golden
-    if "timestamp" in g_raw.columns:
-        g_raw["timestamp"] = pd.to_datetime(g_raw["timestamp"], utc=True, errors="coerce")
-        g_raw = g_raw[g_raw["timestamp"].notna()].copy()
-        g_raw = g_raw.sort_values("timestamp").set_index("timestamp", drop=True)
+    if not golden_path.exists():
+        raise SystemExit(f"Missing golden: {golden_path}")
+    if not inter_dir.exists():
+        raise SystemExit(f"Missing intermediate dir: {inter_dir}")
+
+    golden = _load_golden(golden_path)
+    symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
+
+    shift_daily = pd.Timedelta(args.shift_daily)
+    shift_4h = pd.Timedelta(args.shift_4h)
+
+    daily_rank: List[Tuple[float, str, Dict[str, Any]]] = []
+    markov_rank: List[Tuple[float, str, Dict[str, Any]]] = []
+
+    for sym in symbols:
+        daily_p = inter_dir / f"{sym}_daily_regime_intermediate.parquet"
+        markov_p = inter_dir / f"{sym}_markov4h_intermediate.parquet"
+
+        if not daily_p.exists():
+            print(f"[SKIP] {sym} daily missing: {daily_p}")
+            continue
+        if not markov_p.exists():
+            print(f"[SKIP] {sym} markov missing: {markov_p}")
+            continue
+
+        daily_inter = _ensure_utc_index(pd.read_parquet(daily_p), "timestamp")
+        markov_inter = _ensure_utc_index(pd.read_parquet(markov_p), "timestamp")
+
+        if not args.no_shift_intermediate:
+            daily_inter = daily_inter.copy()
+            markov_inter = markov_inter.copy()
+            daily_inter.index = daily_inter.index + shift_daily
+            markov_inter.index = markov_inter.index + shift_4h
+
+        d = _eval_daily(golden, daily_inter, limit=int(args.limit))
+        m = _eval_markov(golden, markov_inter, limit=int(args.limit))
+
+        # Ranking scores: lower is better
+        d_score = float(d["prob_mae"]) + 10.0 * (1.0 - float(d["code_acc"]))
+        m_score = float(m["prob_mae"]) + 1.0 * (1.0 - float(m["state_acc"]))
+
+        daily_rank.append((d_score, sym, d))
+        markov_rank.append((m_score, sym, m))
+
+        print(f"\n=== {sym} ===")
+        print(f"DAILY   n={d['n']} code_acc={d['code_acc']:.6f} prob_mae={d['prob_mae']:.6f} prob_max={d['prob_max']:.6f}")
+        for s in d["mismatches_sample"]:
+            print(f"  {s}")
+        print(f"MARKOV  n={m['n']} state_acc={m['state_acc']:.6f} prob_mae={m['prob_mae']:.6f} prob_max={m['prob_max']:.6f}")
+        for s in m["mismatches_sample"]:
+            print(f"  {s}")
+
+    if daily_rank:
+        daily_rank.sort(key=lambda x: x[0])
+        best = daily_rank[0]
+        print(f"\nBEST DAILY match: {best[1]} (score={best[0]:.6f})")
     else:
-        if not isinstance(g_raw.index, pd.DatetimeIndex):
-            raise RuntimeError("Golden has no timestamp and index is not DatetimeIndex")
-        g_raw = g_raw.copy()
-        g_raw.index = pd.to_datetime(g_raw.index, utc=True, errors="coerce")
-        g_raw = g_raw[g_raw.index.notna()].copy().sort_index()
+        print("\nNo DAILY comparisons were run (missing files).")
 
-    sym = _pick_golden_symbol(g_raw, args.golden_symbol)
-    if sym is not None:
-        g = g_raw[g_raw["symbol"] == sym].copy()
+    if markov_rank:
+        markov_rank.sort(key=lambda x: x[0])
+        best = markov_rank[0]
+        print(f"BEST MARKOV match: {best[1]} (score={best[0]:.6f})")
     else:
-        g = g_raw.copy()
-
-    if args.max_rows and len(g) > args.max_rows:
-        g = g.iloc[: args.max_rows].copy()
-
-    print(f"Golden rows used: {len(g)} symbol={sym}")
-
-    # DAILY: try BTC/ETH intermediates
-    for s in ["BTCUSDT", "ETHUSDT"]:
-        p = idir / f"{s}_daily_regime_intermediate.parquet"
-        if not p.exists():
-            print(f"DAILY {s}: missing {p}")
-            continue
-        di = _load_parquet_ts(p)
-        code_acc, prob_mae, n = eval_daily(g, di)
-        print(f"DAILY {s}: n={n} code_acc={code_acc:.4f} volprob_mae={prob_mae:.6f}")
-
-    # MARKOV: try BTC/ETH, shift 0/4, raw vs ewm(alpha grid)
-    alpha_grid = [None] + [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 1.0]
-    for s in ["BTCUSDT", "ETHUSDT"]:
-        p = idir / f"{s}_markov4h_intermediate.parquet"
-        if not p.exists():
-            print(f"MARKOV {s}: missing {p}")
-            continue
-        mi = _load_parquet_ts(p)
-        best = None
-        for shift in [0, 4, -4]:
-            # raw
-            st_acc, mae, n = eval_markov(g, mi, shift_hours=shift, alpha=0.2, use_raw=True)
-            best = min(best, (mae, st_acc, n, s, shift, "raw", None), default=(mae, st_acc, n, s, shift, "raw", None))
-            # ewm
-            for a in alpha_grid:
-                if a is None:
-                    continue
-                st_acc, mae, n = eval_markov(g, mi, shift_hours=shift, alpha=a, use_raw=False)
-                cand = (mae, st_acc, n, s, shift, "ewm", a)
-                best = cand if (best is None or cand[0] < best[0]) else best
-
-        if best is None:
-            continue
-        mae, st_acc, n, s, shift, mode, a = best
-        print(f"MARKOV BEST {s}: n={n} prob_mae={mae:.6f} state_acc={st_acc:.4f} shift={shift} mode={mode} alpha={a}")
+        print("No MARKOV comparisons were run (missing files).")
 
 
 if __name__ == "__main__":
