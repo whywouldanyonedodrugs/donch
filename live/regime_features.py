@@ -10,6 +10,42 @@ import statsmodels.api as sm
 from . import indicators as ta
 
 
+def _tf_to_timedelta(tf: str) -> pd.Timedelta:
+    tf = str(tf).strip().lower()
+    if tf.endswith("m"):
+        return pd.Timedelta(minutes=int(tf[:-1]))
+    if tf.endswith("h"):
+        return pd.Timedelta(hours=int(tf[:-1]))
+    if tf.endswith("d"):
+        return pd.Timedelta(days=int(tf[:-1]))
+    raise ValueError(f"Unsupported timeframe: {tf}")
+
+def drop_incomplete_last_bar(df: pd.DataFrame, tf: str, asof_ts: pd.Timestamp) -> pd.DataFrame:
+    """
+    Drop the last row if it corresponds to a bar that is not fully completed as-of asof_ts.
+
+    Works whether the index is bar START time or bar CLOSE time, as long as:
+      last_index + tf_delta > asof_ts  => last bar is still forming.
+    """
+    if df is None or len(df) == 0:
+        return df
+
+    asof_ts = pd.Timestamp(asof_ts)
+    if asof_ts.tzinfo is None:
+        asof_ts = asof_ts.tz_localize("UTC")
+    else:
+        asof_ts = asof_ts.tz_convert("UTC")
+
+    idx = pd.to_datetime(df.index, utc=True)
+    last_ts = idx[-1]
+    delta = _tf_to_timedelta(tf)
+
+    if last_ts + delta > asof_ts:
+        return df.iloc[:-1]
+
+    return df
+
+
 def _ensure_utc_ts(ts: pd.Timestamp) -> pd.Timestamp:
     ts = pd.to_datetime(ts, utc=True)
     if ts.tz is None:

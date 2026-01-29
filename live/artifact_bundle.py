@@ -27,6 +27,40 @@ REGIME_FEATURE_KEYS = {
 }
 
 
+
+def _extract_feature_names_from_manifest(feature_manifest: object) -> set[str]:
+    """
+    Best-effort extraction of raw feature names from feature_manifest.json.
+
+    Supports common shapes:
+      - dict mapping feature_name -> dtype/spec
+      - dict with nested containers: {"features": {...}} / {"raw_features": [...]} / {"feature_names": [...]} / {"columns": [...]}
+      - list[str]
+    """
+    if feature_manifest is None:
+        return set()
+
+    if isinstance(feature_manifest, list):
+        return {str(x) for x in feature_manifest}
+
+    if isinstance(feature_manifest, dict):
+        # If this looks like a direct mapping: feature -> spec
+        # (heuristic: values are scalars/dicts and keys look like feature names)
+        keys = set(feature_manifest.keys())
+
+        # Common nested containers
+        for k in ("features", "raw_features", "feature_names", "columns"):
+            v = feature_manifest.get(k)
+            if isinstance(v, list):
+                return {str(x) for x in v}
+            if isinstance(v, dict):
+                return set(v.keys())
+
+        return keys
+
+    return set()
+
+
 @dataclass(frozen=True)
 class ArtifactBundle:
     meta_dir: Path
@@ -190,13 +224,39 @@ def load_bundle(meta_dir: str | Path, strict: bool = True, required_extra_files:
         if not p.exists():
             raise BundleError(f"Missing required bundle file: {p}")
 
-    feature_manifest = _read_json(meta_dir_p / "feature_manifest.json")
-    manifest_keys = set(feature_manifest.keys()) if isinstance(feature_manifest, dict) else set()
+    manifest_features = _extract_feature_names_from_manifest(feature_manifest)
 
-    # If regimes are in the manifest, require truth artifacts (Option A).
+    daily_truth_p = meta_dir_p / REGIME_DAILY_TRUTH_FILE
+    markov_truth_p = meta_dir_p / REGIME_MARKOV4H_TRUTH_FILE
+
+    needs_regime_truth = bool(manifest_features & REGIME_FEATURE_KEYS)
+    has_daily = daily_truth_p.exists()
+    has_markov = markov_truth_p.exists()
+    has_both = has_daily and has_markov
+
     auto_extra: list[str] = []
-    if manifest_keys & REGIME_FEATURE_KEYS:
+
+    # If the files exist, attach them (this is your current situation).
+    # If the manifest needs them, require them in strict mode.
+    if has_both or needs_regime_truth:
         auto_extra.extend([REGIME_DAILY_TRUTH_FILE, REGIME_MARKOV4H_TRUTH_FILE])
+
+    if strict:
+        # Fail closed on partial presence (prevents silent drift).
+        if has_daily != has_markov:
+            raise BundleError(
+                "Inconsistent regime truth artifacts: "
+                f"{REGIME_DAILY_TRUTH_FILE} exists={has_daily}, "
+                f"{REGIME_MARKOV4H_TRUTH_FILE} exists={has_markov}"
+            )
+        if needs_regime_truth and not has_both:
+            missing = []
+            if not has_daily:
+                missing.append(str(daily_truth_p))
+            if not has_markov:
+                missing.append(str(markov_truth_p))
+            raise BundleError("Regime truth artifacts required by manifest are missing: " + ", ".join(missing))
+
 
     user_extra = list(required_extra_files) if required_extra_files is not None else []
     for n in auto_extra:
