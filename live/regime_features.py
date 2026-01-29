@@ -20,30 +20,32 @@ def _tf_to_timedelta(tf: str) -> pd.Timedelta:
         return pd.Timedelta(days=int(tf[:-1]))
     raise ValueError(f"Unsupported timeframe: {tf}")
 
-def drop_incomplete_last_bar(df: pd.DataFrame, tf: str, asof_ts: pd.Timestamp) -> pd.DataFrame:
+def drop_incomplete_last_bar(df: pd.DataFrame, asof_ts: pd.Timestamp) -> pd.DataFrame:
     """
-    Drop the last row if it corresponds to a bar that is not fully completed as-of asof_ts.
-
-    Works whether the index is bar START time or bar CLOSE time, as long as:
-      last_index + tf_delta > asof_ts  => last bar is still forming.
+    Drop the last row if its timestamp is strictly AFTER asof_ts.
+    This enforces 'past-only' semantics for as-of feature snapshots.
+    Assumes the DataFrame index represents BAR CLOSE timestamps.
     """
     if df is None or len(df) == 0:
         return df
 
-    asof_ts = pd.Timestamp(asof_ts)
-    if asof_ts.tzinfo is None:
-        asof_ts = asof_ts.tz_localize("UTC")
+    out = df
+    if not isinstance(out.index, pd.DatetimeIndex):
+        out = out.copy()
+        out.index = pd.to_datetime(out.index, utc=True)
+
+    out = out.sort_index()
+
+    ts = pd.Timestamp(asof_ts)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
     else:
-        asof_ts = asof_ts.tz_convert("UTC")
+        ts = ts.tz_convert("UTC")
 
-    idx = pd.to_datetime(df.index, utc=True)
-    last_ts = idx[-1]
-    delta = _tf_to_timedelta(tf)
+    if out.index[-1] > ts:
+        return out.iloc[:-1].copy()
 
-    if last_ts + delta > asof_ts:
-        return df.iloc[:-1]
-
-    return df
+    return out
 
 
 def _ensure_utc_ts(ts: pd.Timestamp) -> pd.Timestamp:
