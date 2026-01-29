@@ -224,6 +224,8 @@ def load_bundle(meta_dir: str | Path, strict: bool = True, required_extra_files:
         if not p.exists():
             raise BundleError(f"Missing required bundle file: {p}")
 
+    feature_manifest = _read_json(meta_dir_p / "feature_manifest.json")
+
     manifest_features = _extract_feature_names_from_manifest(feature_manifest)
 
     daily_truth_p = meta_dir_p / REGIME_DAILY_TRUTH_FILE
