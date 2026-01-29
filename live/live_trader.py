@@ -48,7 +48,7 @@ from .telegram import TelegramBot
 from .winprob_loader import WinProbScorer
 from .golden_features import GoldenFeatureStore
 from .regime_features import compute_daily_regime_snapshot, compute_markov4h_snapshot, drop_incomplete_last_bar
-
+from .regime_truth import macro_regimes_asof
 
 from .artifact_bundle import load_bundle, BundleError, SchemaError
 
@@ -1985,6 +1985,21 @@ class LiveTrader:
                 self._augment_meta_with_regime_sets(meta_full)
             except Exception as e:
                 LOG.warning("bundle=%s augment_meta_with_regime_sets failed: %s", getattr(self, "bundle_id", "no_bundle"), e)
+
+            # ---- Sprint 2 / Option A: freeze macro regime inputs from golden truth ----
+            macro = macro_regimes_asof(self.bundle, decision_ts)
+            meta_full.update(macro)
+
+            # Keep regime_up consistent with regime_code_1d (if regime_up is still used downstream)
+            # (Adjust mapping only if your offline team defines it differently.)
+            try:
+                rc = int(meta_full["regime_code_1d"])
+                meta_full["regime_up"] = 1 if rc in (2, 3) else 0
+            except Exception:
+                pass
+            # -------------------------------------------------------------------------
+
+
 
             # ---------------- 10. Strict Slice & Score ----------------
             required = list(getattr(self.winprob, "raw_features", []) or [])

@@ -8,10 +8,35 @@ from typing import Dict, Tuple
 
 import numpy as np
 import pandas as pd
-
+import os
 
 DAILY_OUT_DEFAULT = "regime_daily_truth.parquet"
 MARKOV_OUT_DEFAULT = "regime_markov4h_truth.parquet"
+
+
+def _resolve_out_path(meta_dir: Path, out_arg: str | None, default_name: str) -> Path:
+    """
+    Resolve output path with these rules:
+      - None -> meta_dir/default_name
+      - absolute path -> as-is
+      - bare filename (no parent dirs) -> meta_dir/filename
+      - relative path with dirs (e.g. results/meta_export/foo.parquet) -> relative to CWD
+        (do NOT prefix meta_dir again)
+    """
+    if not out_arg:
+        return (meta_dir / default_name).resolve()
+
+    p = Path(out_arg)
+
+    if p.is_absolute():
+        return p.resolve()
+
+    # bare filename: write inside meta_dir
+    if p.parent == Path("."):
+        return (meta_dir / p).resolve()
+
+    # relative path that already includes directories: treat as CWD-relative
+    return p.resolve()
 
 
 def _sha256_file(path: Path, chunk_bytes: int = 1024 * 1024) -> str:
@@ -147,8 +172,13 @@ def main() -> None:
     daily_truth = _build_daily_truth(macro)
     markov_truth = _build_markov_truth(macro)
 
-    out_daily = (meta_dir / args.out_daily).resolve()
-    out_markov = (meta_dir / args.out_markov).resolve()
+    out_daily = _resolve_out_path(meta_dir, args.out_daily, "regime_daily_truth.parquet")
+    out_markov = _resolve_out_path(meta_dir, args.out_markov, "regime_markov4h_truth.parquet")
+
+    # Ensure parent dirs exist (safe even if they already exist)
+    out_daily.parent.mkdir(parents=True, exist_ok=True)
+    out_markov.parent.mkdir(parents=True, exist_ok=True)
+
 
     daily_truth.to_parquet(out_daily, index=True)
     markov_truth.to_parquet(out_markov, index=True)
