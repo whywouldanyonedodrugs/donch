@@ -160,7 +160,6 @@ def load_bundle(meta_dir: str | Path, strict: bool = True, required_extra_files:
     # Core required artifacts
     required = [
         "feature_manifest.json",
-        "feature_names.json",
         "checksums_sha256.json",
     ]
 
