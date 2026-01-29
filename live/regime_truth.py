@@ -8,7 +8,7 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from artifact_bundle import ArtifactBundle
+from .artifact_bundle import ArtifactBundle
 
 
 def _ensure_utc_ts(ts: Any) -> pd.Timestamp:

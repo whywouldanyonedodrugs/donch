@@ -11,6 +11,8 @@ import joblib
 
 class BundleError(RuntimeError):
     pass
+class SchemaError(BundleError):
+    """Raised when raw feature schema/dtypes do not match the feature manifest."""
 
 
 # Regime truth artifacts (Option A)

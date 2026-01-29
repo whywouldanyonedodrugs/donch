@@ -6,7 +6,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from artifact_bundle import load_bundle
+from live.artifact_bundle import load_bundle
+
 from live.regime_truth import macro_regimes_asof
 
 
