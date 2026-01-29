@@ -28,37 +28,72 @@ REGIME_FEATURE_KEYS = {
 
 
 
-def _extract_feature_names_from_manifest(feature_manifest: object) -> set[str]:
+def _extract_feature_names_from_manifest(feature_manifest: dict) -> list[str]:
     """
-    Best-effort extraction of raw feature names from feature_manifest.json.
+    Extract feature names from feature_manifest.json in a schema-robust way.
 
     Supports common shapes:
-      - dict mapping feature_name -> dtype/spec
-      - dict with nested containers: {"features": {...}} / {"raw_features": [...]} / {"feature_names": [...]} / {"columns": [...]}
-      - list[str]
+      - {"feature_names": [...]}
+      - {"columns": [...]}
+      - {"features": {name: {...}, ...}}
+      - {"features": [{"name": "..."} , ...]}
+      - {"features": ["a", "b", ...]}
+      - {"schema": {...}} (recursive)
     """
-    if feature_manifest is None:
-        return set()
+    def _dedupe(xs: list[str]) -> list[str]:
+        seen = set()
+        out: list[str] = []
+        for x in xs:
+            if x not in seen:
+                seen.add(x)
+                out.append(x)
+        return out
 
-    if isinstance(feature_manifest, list):
-        return {str(x) for x in feature_manifest}
+    def _from(obj: object) -> list[str]:
+        if not isinstance(obj, dict):
+            return []
 
-    if isinstance(feature_manifest, dict):
-        # If this looks like a direct mapping: feature -> spec
-        # (heuristic: values are scalars/dicts and keys look like feature names)
-        keys = set(feature_manifest.keys())
+        # Direct lists
+        for k in ("feature_names", "columns", "feature_list", "feature_cols"):
+            v = obj.get(k)
+            if isinstance(v, list) and all(isinstance(x, str) for x in v):
+                return _dedupe(list(v))
 
-        # Common nested containers
-        for k in ("features", "raw_features", "feature_names", "columns"):
-            v = feature_manifest.get(k)
-            if isinstance(v, list):
-                return {str(x) for x in v}
-            if isinstance(v, dict):
-                return set(v.keys())
+        feats = obj.get("features")
 
-        return keys
+        # Dict of feature_name -> metadata
+        if isinstance(feats, dict):
+            keys = [str(k) for k in feats.keys() if isinstance(k, str)]
+            return _dedupe(keys)
 
-    return set()
+        # List of strings or dicts containing a name-like key
+        if isinstance(feats, list):
+            out: list[str] = []
+            for item in feats:
+                if isinstance(item, str):
+                    out.append(item)
+                    continue
+                if isinstance(item, dict):
+                    for nk in ("name", "key", "feature", "col", "column"):
+                        nv = item.get(nk)
+                        if isinstance(nv, str) and nv:
+                            out.append(nv)
+                            break
+            if out:
+                return _dedupe(out)
+
+        # Some manifests nest under "schema"
+        schema = obj.get("schema")
+        if isinstance(schema, dict):
+            got = _from(schema)
+            if got:
+                return got
+
+        return []
+
+    names = _from(feature_manifest)
+    return names
+
 
 
 @dataclass(frozen=True)
@@ -227,6 +262,15 @@ def load_bundle(meta_dir: str | Path, strict: bool = True, required_extra_files:
     feature_manifest = _read_json(meta_dir_p / "feature_manifest.json")
 
     manifest_features = _extract_feature_names_from_manifest(feature_manifest)
+
+    feature_names = _extract_feature_names_from_manifest(feature_manifest)
+    if strict and (not feature_names):
+        raise ValueError(
+            f"feature_manifest.json yielded 0 feature names (schema mismatch). "
+            f"path={meta_dir_p / 'feature_manifest.json'}"
+        )
+
+    bundle.feature_names = feature_names
 
     daily_truth_p = meta_dir_p / REGIME_DAILY_TRUTH_FILE
     markov_truth_p = meta_dir_p / REGIME_MARKOV4H_TRUTH_FILE
