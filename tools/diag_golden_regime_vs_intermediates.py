@@ -11,7 +11,7 @@ Semantics:
 - OFFLINE intermediates are left-edge labeled (default pandas resample), so to compare
   as-of decision_ts using bar-close labeling, we shift:
     - daily intermediates by +1D
-    - 4H intermediates by +4H
+    - 4H intermediates by +4h
   (unless --no-shift-intermediate is used)
 - As-of lookup: for each decision_ts, use the last intermediate row with ts <= decision_ts.
 No wall-clock leakage. Deterministic as-of-only.
@@ -50,6 +50,25 @@ def _ensure_utc_index(df: pd.DataFrame, ts_col: str = "timestamp") -> pd.DataFra
     else:
         raise AssertionError(f"Expected '{ts_col}' column or DatetimeIndex.")
     return out.sort_index()
+
+
+def _to_num(x) -> float:
+    """
+    Robust scalar->float coercion.
+    Handles pd.NA, strings, objects. Non-numeric -> np.nan.
+    """
+    try:
+        if x is None:
+            return float("nan")
+        # pd.NA / NaT
+        if pd.isna(x):
+            return float("nan")
+        v = pd.to_numeric(x, errors="coerce")
+        if pd.isna(v):
+            return float("nan")
+        return float(v)
+    except Exception:
+        return float("nan")
 
 
 def _load_golden(path: Path) -> pd.DataFrame:
@@ -103,30 +122,34 @@ def _eval_daily(golden: pd.DataFrame, daily_inter: pd.DataFrame, limit: int) -> 
         if n >= limit:
             break
 
-        exp_code = row.get(exp_code_c, np.nan)
-        exp_prob = row.get(exp_prob_c, np.nan)
-        if not np.isfinite(exp_code) and not np.isfinite(exp_prob):
+        exp_code = _to_num(row.get(exp_code_c, np.nan))
+        exp_prob = _to_num(row.get(exp_prob_c, np.nan))
+
+        # skip rows where both are missing/non-numeric
+        if pd.isna(exp_code) and pd.isna(exp_prob):
             continue
 
         got = _asof_row(daily_inter, ts)
         if got is None:
             continue
 
-        got_code = got.get(got_code_c, np.nan)
-        got_prob = got.get(got_prob_c, np.nan)
+        got_code = _to_num(got.get(got_code_c, np.nan))
+        got_prob = _to_num(got.get(got_prob_c, np.nan))
 
-        if np.isfinite(exp_code) and np.isfinite(got_code):
+        if not pd.isna(exp_code) and not pd.isna(got_code):
             if int(exp_code) == int(got_code):
                 code_ok += 1
             else:
                 mism.append(f"{ts} code exp={int(exp_code)} got={int(got_code)}")
 
-        if np.isfinite(exp_prob) and np.isfinite(got_prob):
+        if not pd.isna(exp_prob) and not pd.isna(got_prob):
             e = float(abs(float(exp_prob) - float(got_prob)))
             prob_errs.append(e)
             prob_max = max(prob_max, e)
             if e > 1e-3:
-                mism.append(f"{ts} vol_prob_low exp={float(exp_prob):.6f} got={float(got_prob):.6f} err={e:.6f}")
+                mism.append(
+                    f"{ts} vol_prob_low exp={float(exp_prob):.6f} got={float(got_prob):.6f} err={e:.6f}"
+                )
 
         n += 1
 
@@ -164,26 +187,27 @@ def _eval_markov(golden: pd.DataFrame, markov_inter: pd.DataFrame, limit: int) -
         if n >= limit:
             break
 
-        exp_p = row.get(exp_p_c, np.nan)
-        exp_s = row.get(exp_s_c, np.nan)
-        if not np.isfinite(exp_p) and not np.isfinite(exp_s):
+        exp_p = _to_num(row.get(exp_p_c, np.nan))
+        exp_s = _to_num(row.get(exp_s_c, np.nan))
+
+        if pd.isna(exp_p) and pd.isna(exp_s):
             continue
 
         got = _asof_row(markov_inter, ts)
         if got is None:
             continue
 
-        got_p = got.get(got_p_c, np.nan)
-        got_s = got.get(got_s_c, np.nan)
+        got_p = _to_num(got.get(got_p_c, np.nan))
+        got_s = _to_num(got.get(got_s_c, np.nan))
 
-        if np.isfinite(exp_p) and np.isfinite(got_p):
+        if not pd.isna(exp_p) and not pd.isna(got_p):
             e = float(abs(float(exp_p) - float(got_p)))
             prob_errs.append(e)
             prob_max = max(prob_max, e)
             if e > 5e-3:
                 mism.append(f"{ts} prob exp={float(exp_p):.6f} got={float(got_p):.6f} err={e:.6f}")
 
-        if np.isfinite(exp_s) and np.isfinite(got_s):
+        if not pd.isna(exp_s) and not pd.isna(got_s):
             if int(exp_s) == int(got_s):
                 state_ok += 1
             else:
@@ -210,7 +234,7 @@ def main() -> None:
     ap.add_argument("--symbols", type=str, default="BTCUSDT,ETHUSDT", help="Comma-separated symbols to compare.")
     ap.add_argument("--no-shift-intermediate", action="store_true")
     ap.add_argument("--shift-daily", type=str, default="1D")
-    ap.add_argument("--shift-4h", type=str, default="4H")
+    ap.add_argument("--shift-4h", type=str, default="4h")  # 'H' deprecated
     ap.add_argument("--limit", type=int, default=1500, help="Max golden decision_ts to evaluate per symbol.")
     args = ap.parse_args()
 
@@ -268,6 +292,7 @@ def main() -> None:
         print(f"MARKOV  n={m['n']} state_acc={m['state_acc']:.6f} prob_mae={m['prob_mae']:.6f} prob_max={m['prob_max']:.6f}")
         for s in m["mismatches_sample"]:
             print(f"  {s}")
+        print(f"Scores: daily={d_score:.6f} markov={m_score:.6f}")
 
     if daily_rank:
         daily_rank.sort(key=lambda x: x[0])

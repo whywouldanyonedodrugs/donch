@@ -31,6 +31,24 @@ def _ensure_utc_index(df: pd.DataFrame, ts_col: str = "timestamp") -> pd.DataFra
     return out.sort_index()
 
 
+def _to_num(x) -> float:
+    """
+    Robust scalar->float coercion.
+    Handles pd.NA, strings, objects. Non-numeric -> np.nan.
+    """
+    try:
+        if x is None:
+            return float("nan")
+        if pd.isna(x):
+            return float("nan")
+        v = pd.to_numeric(x, errors="coerce")
+        if pd.isna(v):
+            return float("nan")
+        return float(v)
+    except Exception:
+        return float("nan")
+
+
 def _load_json(path: Path) -> dict:
     if not path.exists():
         return {}
@@ -41,7 +59,6 @@ def _pick_first_not_none(d: dict, keys: list[str]) -> Optional[Any]:
     for k in keys:
         if k in d and d[k] is not None:
             return d[k]
-    # also check common nested containers if present
     for container_key in ["regime", "regimes", "params", "config", "deployment"]:
         sub = d.get(container_key)
         if isinstance(sub, dict):
@@ -52,10 +69,6 @@ def _pick_first_not_none(d: dict, keys: list[str]) -> Optional[Any]:
 
 
 def _load_regime_params() -> dict:
-    """
-    Prefer meta_export reports if present; else fallback to config defaults.
-    Important: treat cfg attributes that exist but are None as "missing" and do NOT use them.
-    """
     regimes_report = _load_json(PROJECT_ROOT / "results" / "meta_export" / "regimes_report.json")
     deploy_cfg = _load_json(PROJECT_ROOT / "results" / "meta_export" / "deployment_config.json")
 
@@ -77,7 +90,6 @@ def _load_regime_params() -> dict:
                         return cand
         return default if v is None else v
 
-    # OFFLINE defaults are (200,20,2.0,maxiter=200) and alpha=0.2
     ma_period = int(g(["ma_period", "REGIME_MA_PERIOD", "regime_ma_period"], 200))
     atr_period = int(g(["atr_period", "REGIME_ATR_PERIOD", "regime_atr_period"], 20))
     atr_mult = float(g(["atr_mult", "REGIME_ATR_MULT", "regime_atr_mult"], 2.0))
@@ -114,10 +126,7 @@ def _load_golden() -> pd.DataFrame:
 
     g = pd.read_parquet(GOLDEN_PATH)
     g = _ensure_utc_index(g, "timestamp")
-
-    # Golden macro columns are constant across symbols per timestamp; pick first row per ts.
-    g = g.groupby(g.index).first()
-    g = g.sort_index()
+    g = g.groupby(g.index).first().sort_index()
     return g
 
 
@@ -139,7 +148,6 @@ def _asof_row(df: pd.DataFrame, ts: pd.Timestamp) -> Optional[pd.Series]:
     return df.iloc[int(pos)]
 
 
-# Simple caches to avoid refitting MarkovRegression multiple times in one test run.
 _DAILY_CACHE: Dict[Tuple[str, int, int, float], pd.DataFrame] = {}
 _MARKOV_CACHE: Dict[Tuple[str, float], pd.DataFrame] = {}
 
@@ -177,31 +185,32 @@ def _get_markov_series(symbol: str, ewma_alpha: float) -> pd.DataFrame:
 
 
 def _score_daily_candidate(series: pd.DataFrame, golden: pd.DataFrame, limit: int = 250) -> Tuple[int, float]:
-    # Return (code_miss_count, vol_prob_mae)
     misses = 0
     vol_errs = []
-
     n = 0
+
     for ts, row in golden.iterrows():
         if n >= limit:
             break
 
-        exp_code = row.get("regime_code_1d", np.nan)
-        exp_vol = row.get("vol_prob_low_1d", np.nan)
-
-        if not np.isfinite(exp_code) and not np.isfinite(exp_vol):
+        exp_code = _to_num(row.get("regime_code_1d", np.nan))
+        exp_vol = _to_num(row.get("vol_prob_low_1d", np.nan))
+        if pd.isna(exp_code) and pd.isna(exp_vol):
             continue
 
         got = _asof_row(series, ts)
         if got is None:
             continue
 
-        if np.isfinite(exp_code) and pd.notna(got.get("regime_code", np.nan)):
-            if int(exp_code) != int(got["regime_code"]):
+        got_code = _to_num(got.get("regime_code", np.nan))
+        got_vol = _to_num(got.get("vol_prob_low", np.nan))
+
+        if not pd.isna(exp_code) and not pd.isna(got_code):
+            if int(exp_code) != int(got_code):
                 misses += 1
 
-        if np.isfinite(exp_vol) and pd.notna(got.get("vol_prob_low", np.nan)):
-            vol_errs.append(float(abs(float(exp_vol) - float(got["vol_prob_low"]))))
+        if not pd.isna(exp_vol) and not pd.isna(got_vol):
+            vol_errs.append(float(abs(float(exp_vol) - float(got_vol))))
 
         n += 1
 
@@ -210,31 +219,32 @@ def _score_daily_candidate(series: pd.DataFrame, golden: pd.DataFrame, limit: in
 
 
 def _score_markov_candidate(series: pd.DataFrame, golden: pd.DataFrame, limit: int = 300) -> Tuple[int, float]:
-    # Return (state_miss_count, prob_mae)
     misses = 0
     prob_errs = []
-
     n = 0
+
     for ts, row in golden.iterrows():
         if n >= limit:
             break
 
-        exp_p = row.get("markov_prob_up_4h", np.nan)
-        exp_s = row.get("markov_state_4h", np.nan)
-
-        if not np.isfinite(exp_p) and not np.isfinite(exp_s):
+        exp_p = _to_num(row.get("markov_prob_up_4h", np.nan))
+        exp_s = _to_num(row.get("markov_state_4h", np.nan))
+        if pd.isna(exp_p) and pd.isna(exp_s):
             continue
 
         got = _asof_row(series, ts)
         if got is None:
             continue
 
-        if np.isfinite(exp_s) and pd.notna(got.get("state_up", np.nan)):
-            if int(exp_s) != int(got["state_up"]):
+        got_p = _to_num(got.get("prob_up", np.nan))
+        got_s = _to_num(got.get("state_up", np.nan))
+
+        if not pd.isna(exp_s) and not pd.isna(got_s):
+            if int(exp_s) != int(got_s):
                 misses += 1
 
-        if np.isfinite(exp_p) and pd.notna(got.get("prob_up", np.nan)):
-            prob_errs.append(float(abs(float(exp_p) - float(got["prob_up"]))))
+        if not pd.isna(exp_p) and not pd.isna(got_p):
+            prob_errs.append(float(abs(float(exp_p) - float(got_p))))
 
         n += 1
 
@@ -243,7 +253,6 @@ def _score_markov_candidate(series: pd.DataFrame, golden: pd.DataFrame, limit: i
 
 
 def _best_daily_candidate(params: dict, golden: pd.DataFrame) -> Tuple[str, int]:
-    # Evaluate at most two symbols to cap runtime.
     preferred = params["daily_symbol"]
     alt = "ETHUSDT" if preferred == "BTCUSDT" else "BTCUSDT"
 
@@ -313,7 +322,6 @@ class TestDailyRegimeAndMarkovGolden(unittest.TestCase):
         eval_n = 0
 
         for ts, row in g.iterrows():
-            # Ensure within fixture window
             if ts < series.index.min() or ts > series.index.max():
                 continue
 
@@ -321,16 +329,15 @@ class TestDailyRegimeAndMarkovGolden(unittest.TestCase):
             if got is None:
                 continue
 
-            exp_code = row.get("regime_code_1d", np.nan)
-            got_code = got.get("regime_code", np.nan)
-
-            if np.isfinite(exp_code) and pd.notna(got_code):
+            exp_code = _to_num(row.get("regime_code_1d", np.nan))
+            got_code = _to_num(got.get("regime_code", np.nan))
+            if not pd.isna(exp_code) and not pd.isna(got_code):
                 if int(exp_code) != int(got_code):
                     bad.append(f"{ts} exp={int(exp_code)} got={int(got_code)}")
 
-            exp_vol = row.get("vol_prob_low_1d", np.nan)
-            got_vol = got.get("vol_prob_low", np.nan)
-            if np.isfinite(exp_vol) and pd.notna(got_vol):
+            exp_vol = _to_num(row.get("vol_prob_low_1d", np.nan))
+            got_vol = _to_num(got.get("vol_prob_low", np.nan))
+            if not pd.isna(exp_vol) and not pd.isna(got_vol):
                 if abs(float(exp_vol) - float(got_vol)) > 1e-3:
                     bad.append(
                         f"{ts} vol_prob_low exp={float(exp_vol):.6f} got={float(got_vol):.6f} tol=0.001"
@@ -373,15 +380,15 @@ class TestDailyRegimeAndMarkovGolden(unittest.TestCase):
             if got is None:
                 continue
 
-            exp_p = row.get("markov_prob_up_4h", np.nan)
-            got_p = got.get("prob_up", np.nan)
-            if np.isfinite(exp_p) and pd.notna(got_p):
+            exp_p = _to_num(row.get("markov_prob_up_4h", np.nan))
+            got_p = _to_num(got.get("prob_up", np.nan))
+            if not pd.isna(exp_p) and not pd.isna(got_p):
                 if abs(float(exp_p) - float(got_p)) > 5e-3:
                     bad.append(f"{ts} prob exp={float(exp_p):.6f} got={float(got_p):.6f} tol=0.005")
 
-            exp_s = row.get("markov_state_4h", np.nan)
-            got_s = got.get("state_up", np.nan)
-            if np.isfinite(exp_s) and pd.notna(got_s):
+            exp_s = _to_num(row.get("markov_state_4h", np.nan))
+            got_s = _to_num(got.get("state_up", np.nan))
+            if not pd.isna(exp_s) and not pd.isna(got_s):
                 if int(exp_s) != int(got_s):
                     bad.append(f"{ts} state exp={int(exp_s)} got={int(got_s)}")
 
