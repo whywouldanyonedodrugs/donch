@@ -655,17 +655,9 @@ class LiveTrader:
             df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
             df = df.set_index("timestamp").sort_index()
 
-            # Drop last bar if it is still forming (open-labeled semantics)
+            # Drop last bar deterministically (conservative; avoids wall-clock leakage)
             if len(df) > 1:
-                now_ts = pd.Timestamp(datetime.now(timezone.utc))
-                freq = {"5m": "5min", "15m": "15min", "30m": "30min", "1h": "1h", "4h": "4h", "1d": "D"}.get(tf)
-                if freq is None:
-                    # Fallback: conservative behavior
-                    df = df.iloc[:-1]
-                else:
-                    floor = now_ts.floor(freq)
-                    if df.index[-1] >= floor:
-                        df = df.iloc[:-1]
+                df = df.iloc[:-1]
 
             return df
         except Exception as e:
@@ -709,7 +701,7 @@ class LiveTrader:
         except Exception:
             return float(np.nan)
 
-    async def _compute_cross_asset_daily_ctx(self, asset: str, asof_ts: pd.Timestamp) -> dict:
+    async def _compute_cross_asset_daily_ctx(self, asset: str, asof_ts: pd.Timestamp, df5: Optional[pd.DataFrame] = None) -> dict:
         """
         Offline-parity cross-asset DAILY context (scout.py logic):
         - vol_regime_level: (ATR20/close) / expanding_median(min_periods=50), then shift(1)
@@ -726,16 +718,42 @@ class LiveTrader:
         asof_ts = pd.to_datetime(asof_ts, utc=True, errors="coerce")
         if pd.isna(asof_ts):
             return out
-
         try:
-            ohlcv_d = await self.exchange.fetch_ohlcv(asset, timeframe="1d", limit=650)
-            if not ohlcv_d:
-                return out
+            # Offline parity: build DAILY bars from the 5m stream using pandas resample defaults
+            # (label=left, closed=left). Fall back to exchange-provided 1d candles only if df5 is unavailable.
+            if df5 is not None and isinstance(df5, pd.DataFrame) and not df5.empty:
+                _df5 = df5.copy()
+                if _df5.index.tz is None:
+                    _df5.index = _df5.index.tz_localize("UTC")
+                else:
+                    _df5.index = _df5.index.tz_convert("UTC")
+                _df5 = _df5.sort_index()
+                _df5 = _df5[~_df5.index.duplicated(keep="last")]
 
-            df = pd.DataFrame(ohlcv_d, columns=["ts", "open", "high", "low", "close", "volume"])
-            df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-            df = df.set_index("ts").sort_index()
-            df = df[~df.index.duplicated(keep="last")]
+                needed_5m = ("open", "high", "low", "close", "volume")
+                if any(c not in _df5.columns for c in needed_5m):
+                    raise ValueError("df5 missing required OHLCV columns")
+
+                daily = _df5[list(needed_5m)].resample("1D").agg({
+                    "open": "first",
+                    "high": "max",
+                    "low": "min",
+                    "close": "last",
+                    "volume": "sum",
+                })
+                df = daily.dropna(subset=["open", "high", "low", "close"])
+                if df.empty:
+                    return out
+
+            else:
+                ohlcv_d = await self.exchange.fetch_ohlcv(asset, timeframe="1d", limit=650)
+                if not ohlcv_d:
+                    return out
+
+                df = pd.DataFrame(ohlcv_d, columns=["ts", "open", "high", "low", "close", "volume"])
+                df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+                df = df.set_index("ts").sort_index()
+                df = df[~df.index.duplicated(keep="last")]
 
             needed = ("open", "high", "low", "close")
             if any(c not in df.columns for c in needed):
@@ -848,8 +866,8 @@ class LiveTrader:
         except KeyError:
             try:
                 btc_ctx, eth_ctx = await asyncio.gather(
-                    self._compute_cross_asset_daily_ctx("BTCUSDT", decision_ts_gov),
-                    self._compute_cross_asset_daily_ctx("ETHUSDT", decision_ts_gov),
+                    self._compute_cross_asset_daily_ctx("BTCUSDT", decision_ts_gov, df5=df_btc),
+                    self._compute_cross_asset_daily_ctx("ETHUSDT", decision_ts_gov, df5=df_eth),
                     return_exceptions=False,
                 )
                 merged = {}
@@ -1581,14 +1599,21 @@ class LiveTrader:
             except Exception as e:
                 LOG.warning("Cancel sweep loop error on %s: %s", symbol, e)
     
-    def _listing_age_days(self, symbol: str, dfs: dict[str, pd.DataFrame] | None = None) -> int | None:
+    def _listing_age_days(self, symbol: str, dfs: dict[str, pd.DataFrame] | None = None, asof_ts: pd.Timestamp | None = None) -> int | None:
         """
         Order of preference:
           1) cached listing_dates.json
           2) earliest timestamp in fetched dataframes (prefer '1d' if present)
           3) None if unknown
         """
-        today = datetime.now(timezone.utc).date()
+        # Derive 'today' from decision_ts when available to avoid wall-clock leakage.
+        today = None
+        if asof_ts is not None:
+            ts = pd.to_datetime(asof_ts, utc=True, errors="coerce")
+            if ts is not pd.NaT and not pd.isna(ts):
+                today = ts.date()
+        if today is None:
+            today = datetime.now(timezone.utc).date()
 
         # 1) cache
         d = self._listing_dates_cache.get(symbol)
@@ -1793,11 +1818,7 @@ class LiveTrader:
             df5 = df5.sort_index()
             df5 = df5[~df5.index.duplicated(keep="last")]
 
-            # --- Strict-parity: drop currently forming 5m bar (assumes index is bar OPEN time) ---
-            now_utc = pd.Timestamp.now(tz="UTC")
-            cur_bucket = now_utc.floor("5min")
-            if len(df5) > 0 and df5.index[-1] >= cur_bucket:
-                df5 = df5.iloc[:-1]
+            # _fetch_ohlcv_df_paged() already drops the last (possibly incomplete) bar deterministically.
 
             if df5.empty:
                 return None
@@ -1846,7 +1867,7 @@ class LiveTrader:
             last = df5_req.iloc[-1]
 
             # ---------------- Listing age ------------------------
-            age_opt = self._listing_age_days(symbol, dfs)
+            age_opt = self._listing_age_days(symbol, dfs, asof_ts=decision_ts)
             listing_age_days = int(age_opt) if age_opt is not None else 9999
 
             # ---------------- Strategy verdict (rule engine) -----
@@ -2077,13 +2098,23 @@ class LiveTrader:
                     float((eth_macd or {}).get("hist_slope_4h"))
                     if (eth_macd is not None and (eth_macd or {}).get("hist_slope_4h") is not None)
                     else np.nan
-                ),
-                "eth_macd_hist_slope_1h": (
+                ),                "eth_macd_hist_slope_1h": (
                     float((eth_macd or {}).get("hist_slope_1h"))
                     if (eth_macd is not None and (eth_macd or {}).get("hist_slope_1h") is not None)
                     else np.nan
                 ),
 
+                # Explicit literals so diag_manifest_coverage can see these keys
+                "eth_vol_regime_level": (
+                    float((gov_ctx or {}).get("eth_vol_regime_level"))
+                    if isinstance(gov_ctx, dict) and (gov_ctx or {}).get("eth_vol_regime_level") is not None
+                    else np.nan
+                ),
+                "eth_trend_slope": (
+                    float((gov_ctx or {}).get("eth_trend_slope"))
+                    if isinstance(gov_ctx, dict) and (gov_ctx or {}).get("eth_trend_slope") is not None
+                    else np.nan
+                ),
 
                 # regime flags (manifest expects regime_code_1d + regime_up)
                 "regime_code_1d": float(reg_code),
