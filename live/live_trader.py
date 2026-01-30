@@ -786,6 +786,13 @@ class LiveTrader:
 
         decision_ts_gov = pd.to_datetime(decision_ts_gov, utc=True)
 
+        # Hard as-of cut to prevent any downstream cross-asset lookahead
+        if df_btc is not None and not df_btc.empty:
+            df_btc = df_btc.loc[:decision_ts_gov].copy()
+        if df_eth is not None and not df_eth.empty:
+            df_eth = df_eth.loc[:decision_ts_gov].copy()
+
+
         # Deterministic per-cycle cache
         if hasattr(self, "_gov_ctx_cache_key") and hasattr(self, "_gov_ctx_cache"):
             if getattr(self, "_gov_ctx_cache_key") == decision_ts_gov:
@@ -831,7 +838,9 @@ class LiveTrader:
 
         # OI/Funding (existing behavior)
         if df_btc is not None and not df_btc.empty:
-            btc_feats = await self._build_oi_funding_features("BTCUSDT", df_btc)
+
+            btc_feats = await self._build_oi_funding_features("BTCUSDT", df_btc, decision_ts_gov)
+
             if btc_feats:
                 if "funding_rate" in btc_feats:
                     ctx["btc_funding_rate"] = float(btc_feats["funding_rate"])
@@ -839,7 +848,9 @@ class LiveTrader:
                     ctx["btc_oi_z_7d"] = float(btc_feats["oi_z_7d"])
 
         if df_eth is not None and not df_eth.empty:
-            eth_feats = await self._build_oi_funding_features("ETHUSDT", df_eth)
+
+            eth_feats = await self._build_oi_funding_features("ETHUSDT", df_eth, decision_ts_gov)
+
             if eth_feats:
                 if "funding_rate" in eth_feats:
                     ctx["eth_funding_rate"] = float(eth_feats["funding_rate"])
