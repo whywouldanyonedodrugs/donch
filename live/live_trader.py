@@ -50,6 +50,8 @@ from .golden_features import GoldenFeatureStore
 from .regime_features import compute_daily_regime_snapshot, compute_markov4h_snapshot, drop_incomplete_last_bar
 from .regime_truth import macro_regimes_asof
 
+from .online_state import OnlinePerformanceState
+
 from .artifact_bundle import load_bundle, BundleError, SchemaError
 
 from pydantic import Field, ValidationError
@@ -494,7 +496,18 @@ class LiveTrader:
 
             # --- NEW: regimes thresholds for deterministic meta feature codes (S2/S3/S4/S6, etc.)
             self.regime_thresholds = self._load_regime_thresholds()
-            
+
+
+            # --- Sprint 2.4: persistent online performance state ---
+            try:
+                state_path = str(self.cfg.get("ONLINE_STATE_PATH", "results/online_state.jsonl"))
+                max_records = int(self.cfg.get("ONLINE_STATE_MAX_RECORDS", 2000))
+                self.online_state = OnlinePerformanceState(path=state_path, max_records=max_records)
+            except Exception as e:
+                LOG.warning("bundle=%s OnlinePerformanceState init failed (disabling): %s", getattr(self, "bundle_id", None) or "no_bundle", e)
+                self.online_state = None
+
+
     async def _build_oi_funding_features(
         self,
         symbol: str,
@@ -744,7 +757,21 @@ class LiveTrader:
 
             out[f"{prefix}_vol_regime_level"] = self._asof_series_value(vol_regime_level, asof_ts)
             out[f"{prefix}_trend_slope"] = self._asof_series_value(trend_slope, asof_ts)
+
+            # Manifest-friendly aliases (offline uses prefixed series, scorer may require short btc_/eth_ keys)
+            short = None
+            up = asset.upper()
+            if up.startswith("BTC"):
+                short = "btc"
+            elif up.startswith("ETH"):
+                short = "eth"
+
+            if short is not None:
+                out[f"{short}_vol_regime_level"] = out[f"{prefix}_vol_regime_level"]
+                out[f"{short}_trend_slope"] = out[f"{prefix}_trend_slope"]
+
             return out
+
 
         except Exception as e:
             LOG.warning("Cross-asset daily ctx failed for %s: %s", asset, e)
@@ -897,10 +924,34 @@ class LiveTrader:
             except Exception as e:
                 LOG.warning("GOV_CTX: Markov 4h computation failed: %s", e)
 
+        # Sprint 2.4: online performance features as-of decision_ts_gov
+        try:
+            if getattr(self, "online_state", None) is not None:
+                ctx.update(self.online_state.features_asof(decision_ts_gov))
+        except Exception as e:
+            LOG.warning("GOV_CTX: online performance features failed: %s", e)
+
         # store per-cycle cache
         self._gov_ctx_cache_key = decision_ts_gov
         self._gov_ctx_cache = dict(ctx)
         return dict(ctx)
+
+
+
+    async def _last_closed_5m_ts(self, symbol: str) -> Optional[pd.Timestamp]:
+        """
+        Deterministic event timestamp derived from the data stream:
+        last fully-closed 5m bar timestamp from the exchange OHLCV stream
+        (implementation is conservative: relies only on returned candle timestamps).
+        """
+        try:
+            df = await self._fetch_ohlcv_df_paged(str(symbol).upper(), "5m", limit=10)
+            if df is None or df.empty:
+                return None
+            ts = df.index[-1]
+            return pd.to_datetime(ts, utc=True)
+        except Exception:
+            return None
 
 
     # ──────────────────────────────────────────────────────────────────────
@@ -1155,6 +1206,34 @@ class LiveTrader:
 
         # Offline note: risk_on_1 is effectively an alias used for scope gating.
         meta_full["risk_on"] = float(risk_on)
+
+        # -----------------------------
+        # Sprint 2.3: btc_risk_regime_code (0..3) and S5_btcRisk_x_regimeUp
+        # Offline spec:
+        #   btc_trend_up  = 1 if btc_trend_slope > 0 else 0
+        #   btc_vol_high  = 1 if btc_vol_regime_level >= btc_vol_hi else 0
+        #   btc_risk_regime_code = btc_trend_up*2 + btc_vol_high
+        #   S5 = btc_risk_regime_code*2 + regime_up (ru in {0,1})
+        # Fail-closed: only compute when prerequisites are finite.
+        # -----------------------------
+        try:
+            if np.isfinite(btc_trend_slope) and np.isfinite(btc_vol_level) and np.isfinite(btc_vol_hi):
+                btc_trend_up = 1 if btc_trend_slope > 0.0 else 0
+                btc_vol_high = 1 if btc_vol_level >= btc_vol_hi else 0
+                btc_risk = int(btc_trend_up * 2 + btc_vol_high)
+                meta_full["btc_risk_regime_code"] = float(btc_risk)
+
+                ru = 1 if int(regime_up) == 1 else 0
+                meta_full["S5_btcRisk_x_regimeUp"] = float(btc_risk * 2 + ru)
+            else:
+                meta_full["btc_risk_regime_code"] = np.nan
+                meta_full["S5_btcRisk_x_regimeUp"] = np.nan
+        except Exception:
+            meta_full["btc_risk_regime_code"] = np.nan
+            meta_full["S5_btcRisk_x_regimeUp"] = np.nan
+
+
+
         meta_full["risk_on_1"] = float(risk_on)
 
         # The remaining features need regime_code_1d + markov_state_4h + vol_prob_low_1d etc.
@@ -1991,10 +2070,20 @@ class LiveTrader:
                 "dow": float(day_of_week),
                 "vol_mult": float(vol_mult),
 
-                # ETH MACD (4h) components (manifest requires these names)
                 "eth_macd_line_4h": float((eth_macd or {}).get("macd", 0.0) or 0.0),
                 "eth_macd_signal_4h": float((eth_macd or {}).get("signal", 0.0) or 0.0),
                 "eth_macd_hist_4h": float((eth_macd or {}).get("hist", 0.0) or 0.0),
+                "eth_macd_hist_slope_4h": (
+                    float((eth_macd or {}).get("hist_slope_4h"))
+                    if (eth_macd is not None and (eth_macd or {}).get("hist_slope_4h") is not None)
+                    else np.nan
+                ),
+                "eth_macd_hist_slope_1h": (
+                    float((eth_macd or {}).get("hist_slope_1h"))
+                    if (eth_macd is not None and (eth_macd or {}).get("hist_slope_1h") is not None)
+                    else np.nan
+                ),
+
 
                 # regime flags (manifest expects regime_code_1d + regime_up)
                 "regime_code_1d": float(reg_code),
@@ -2544,51 +2633,87 @@ class LiveTrader:
 
     async def _get_eth_macd_barometer_asof(self, asof_ts: pd.Timestamp) -> Optional[dict]:
         """
-        Deterministic ETHUSDT 4h MACD dict computed strictly as-of `asof_ts` (decision_ts semantics).
-        Returns: {'macd','signal','hist'} for the latest fully-closed 4h bar as-of asof_ts.
+        Deterministic ETHUSDT MACD context computed strictly as-of `asof_ts` (decision_ts semantics).
+
+        Returns dict for the latest fully-closed bars as-of asof_ts:
+        - macd, signal, hist (4h)
+        - hist_slope_4h = diff(hist) on 4h bars (latest closed bar minus prior)
+        - hist_slope_1h = diff(hist) on 1h bars (latest closed bar minus prior)
+
+        NOTE: Slopes are computed as first differences on the native bar grid, then read at the
+        last fully closed bar as-of `asof_ts`.
         """
         try:
             asof_ts = pd.to_datetime(asof_ts, utc=True, errors="coerce")
             if pd.isna(asof_ts):
                 raise ValueError("asof_ts is invalid")
 
-            eth_ohlcv = await self.exchange.fetch_ohlcv("ETHUSDT", "4h", limit=210)
-            if not eth_ohlcv:
+            # ---- 4h MACD ----
+            eth_ohlcv_4h = await self.exchange.fetch_ohlcv("ETHUSDT", "4h", limit=260)
+            if not eth_ohlcv_4h:
                 return None
 
-            df = pd.DataFrame(eth_ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
-            df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-            df = df.set_index("ts").sort_index()
-            df = df[~df.index.duplicated(keep="last")]
-
-            # Drop the currently-forming 4h bar strictly as-of `asof_ts`
-            df = drop_incomplete_last_bar(df, "4h", asof_ts)
-            if df is None or df.empty:
+            df4 = pd.DataFrame(eth_ohlcv_4h, columns=["ts", "open", "high", "low", "close", "volume"])
+            df4["ts"] = pd.to_datetime(df4["ts"], unit="ms", utc=True)
+            df4 = df4.set_index("ts").sort_index()
+            df4 = df4[~df4.index.duplicated(keep="last")]
+            df4 = drop_incomplete_last_bar(df4, "4h", asof_ts)
+            if df4 is None or df4.empty or len(df4) < 40:
                 return None
 
-            macd_df = ta.macd(df["close"])
-            if macd_df is None or macd_df.empty:
+            macd4 = ta.macd(df4["close"])
+            if macd4 is None or macd4.empty:
                 return None
 
-            latest = macd_df.iloc[-1]
+            last4 = macd4.iloc[-1]
+            hist_slope_4h = float("nan")
+            try:
+                if len(macd4) >= 2:
+                    hist_slope_4h = float(macd4["hist"].diff().iloc[-1])
+            except Exception:
+                hist_slope_4h = float("nan")
+
             out = {
-                "macd": float(latest["macd"]),
-                "signal": float(latest["signal"]),
-                "hist": float(latest["hist"]),
+                "macd": float(last4["macd"]),
+                "signal": float(last4["signal"]),
+                "hist": float(last4["hist"]),
+                "hist_slope_4h": float(hist_slope_4h),
             }
 
-            # Fail-closed on non-finite
-            for k, v in out.items():
+            # ---- 1h MACD (slope only) ----
+            try:
+                eth_ohlcv_1h = await self.exchange.fetch_ohlcv("ETHUSDT", "1h", limit=400)
+                if eth_ohlcv_1h:
+                    df1 = pd.DataFrame(eth_ohlcv_1h, columns=["ts", "open", "high", "low", "close", "volume"])
+                    df1["ts"] = pd.to_datetime(df1["ts"], unit="ms", utc=True)
+                    df1 = df1.set_index("ts").sort_index()
+                    df1 = df1[~df1.index.duplicated(keep="last")]
+                    df1 = drop_incomplete_last_bar(df1, "1h", asof_ts)
+                    if df1 is not None and (not df1.empty) and len(df1) >= 40:
+                        macd1 = ta.macd(df1["close"])
+                        if macd1 is not None and (not macd1.empty) and len(macd1) >= 2:
+                            out["hist_slope_1h"] = float(macd1["hist"].diff().iloc[-1])
+                        else:
+                            out["hist_slope_1h"] = float("nan")
+                    else:
+                        out["hist_slope_1h"] = float("nan")
+                else:
+                    out["hist_slope_1h"] = float("nan")
+            except Exception:
+                out["hist_slope_1h"] = float("nan")
+
+            # Fail-closed on non-finite core 4h values (macd/signal/hist).
+            for k in ("macd", "signal", "hist"):
+                v = out.get(k)
                 if v is None or not math.isfinite(float(v)):
                     return None
 
+            # Slopes may be NaN if insufficient history; allow NaN so schema can fail-closed if required.
             return out
 
         except Exception as e:
             LOG.warning("ETH barometer unavailable (asof): %s", e)
             return None
-
-
 
     # ───────────────────── Entry & position lifecycle ─────────────────────
 
@@ -3436,6 +3561,17 @@ class LiveTrader:
         )
 
         await self.risk.on_trade_close(total_pnl, self.tg)
+
+        # Sprint 2.4: record outcome (ts derived from last closed 5m bar; no wall-clock)
+        try:
+            if getattr(self, "online_state", None) is not None:
+                evt_ts = await self._last_closed_5m_ts(symbol)
+                if evt_ts is not None and not pd.isna(evt_ts):
+                    self.online_state.record_trade_close(ts=evt_ts, pnl=float(total_pnl))
+        except Exception as e:
+            LOG.warning("bundle=%s OnlinePerformanceState record failed for %s: %s", bundle, symbol, e)
+
+
         self.open_positions.pop(pid, None)
         self.last_exit[symbol] = closed_at
         await self.tg.send(f"✅ {symbol} position closed @ {avg_exit:.6g} | PnL ≈ {total_pnl:.2f} USDT")
@@ -3486,6 +3622,17 @@ class LiveTrader:
         )
         await self.db.add_fill(pid, tag, exit_price, size, closed_at)
         await self.risk.on_trade_close(pnl, self.tg)
+
+
+        # Sprint 2.4: record outcome (ts derived from last closed 5m bar; no wall-clock)
+        try:
+            if getattr(self, "online_state", None) is not None:
+                evt_ts = await self._last_closed_5m_ts(symbol)
+                if evt_ts is not None and not pd.isna(evt_ts):
+                    self.online_state.record_trade_close(ts=evt_ts, pnl=float(pnl))
+        except Exception as e:
+            LOG.warning("bundle=%s OnlinePerformanceState record failed for %s: %s", getattr(self, "bundle_id", None) or "no_bundle", symbol, e)
+
         self.last_exit[symbol] = closed_at
         self.open_positions.pop(pid, None)
         await self.tg.send(f"⏰ {symbol} closed by {tag}. PnL ≈ {pnl:.2f} USDT")
