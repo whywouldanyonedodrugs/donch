@@ -1,21 +1,31 @@
 # live/feature_builder.py
 from __future__ import annotations
-import pandas as pd
-import numpy as np
+
 import logging
-from typing import Dict, Any
+from pathlib import Path
+from typing import Dict, Any, Optional
+
+import numpy as np
+import pandas as pd
+
 from live.regime_truth import macro_regimes_asof
 
 from . import indicators as ta
 from .parity_utils import resample_ohlcv, map_to_left_index, donchian_upper_days_no_lookahead
 
+from live.regimes_report import load_regime_thresholds
+from live.oi_funding import oi_funding_features_at_decision, StaleDerivativesDataError
+
+
 LOG = logging.getLogger("feature_builder")
+
 
 class FeatureBuilder:
     """
     Strict-parity feature builder.
     Computes specific feature families using exact offline semantics.
     """
+
     def __init__(self, cfg: Dict[str, Any]):
         self.cfg = cfg
         self.atr_len = int(cfg.get("ATR_LEN", 14))
@@ -24,6 +34,17 @@ class FeatureBuilder:
         self.vol_lookback = int(cfg.get("VOL_LOOKBACK_DAYS", 30))
         self.don_days = int(cfg.get("DON_N_DAYS", 20))
         self.pullback_win = int(cfg.get("PULLBACK_WINDOW_BARS", 12))
+
+        # thresholds cache (bundle-specific; keyed by meta_dir)
+        self._thr_meta_dir: Optional[Path] = None
+        self._thr_obj = None
+
+    def _get_regime_thresholds(self, meta_dir: Path):
+        meta_dir = Path(meta_dir).resolve()
+        if self._thr_meta_dir is None or self._thr_obj is None or meta_dir != self._thr_meta_dir:
+            self._thr_obj = load_regime_thresholds(meta_dir)
+            self._thr_meta_dir = meta_dir
+        return self._thr_obj
 
     def compute_entry_quality_features(self, df5: pd.DataFrame, decision_ts: pd.Timestamp) -> Dict[str, float]:
         """
@@ -119,5 +140,61 @@ class FeatureBuilder:
             out["don_dist_atr"] = (close_now - out["don_break_level"]) / out["atr_1h"]
         else:
             out["don_dist_atr"] = np.nan
+
+        return out
+
+    def compute_oi_funding_features(
+        self,
+        df5: pd.DataFrame,
+        decision_ts: pd.Timestamp,
+        *,
+        meta_dir: Path,
+    ) -> Dict[str, float]:
+        """
+        Computes OI/Funding features at decision_ts with strict as-of semantics.
+        Fail-closed on missing required raw cols or stale feeds by raising.
+        """
+        thr = self._get_regime_thresholds(Path(meta_dir))
+
+        # Default staleness: 8h unless configured; use None to disable.
+        max_age_raw = self.cfg.get("DERIV_MAX_AGE", "8h")
+        staleness_max_age = pd.Timedelta(max_age_raw) if max_age_raw else None
+
+        try:
+            return oi_funding_features_at_decision(
+                df5,
+                decision_ts,
+                thresholds=thr,
+                staleness_max_age=staleness_max_age,
+            )
+        except StaleDerivativesDataError:
+            # Upstream must treat as safe-mode/no trade
+            raise
+        except KeyError:
+            # Missing required raw -> fail-closed (upstream safe-mode/no trade)
+            raise
+
+    def compute_features_for_decision(
+        self,
+        df5: pd.DataFrame,
+        decision_ts: pd.Timestamp,
+        *,
+        meta_dir: Path,
+        include_entry_quality: bool = True,
+        include_oi_funding: bool = True,
+    ) -> Dict[str, float]:
+        """
+        Aggregates feature families into a single feature dict for scoring.
+        This method is the intended integration point for Sprint 2.2.
+
+        It does NOT use wall-clock time. Everything is as-of decision_ts.
+        """
+        out: Dict[str, float] = {}
+
+        if include_entry_quality:
+            out.update(self.compute_entry_quality_features(df5, decision_ts))
+
+        if include_oi_funding:
+            out.update(self.compute_oi_funding_features(df5, decision_ts, meta_dir=meta_dir))
 
         return out

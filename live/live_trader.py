@@ -1977,7 +1977,7 @@ class LiveTrader:
                 meta_full.update(gov_ctx)
 
             # --- Strict-parity: Entry Quality overlay (overwrites critical fields) ---
-            eq_feats = self.feature_builder.compute_entry_quality_features(df5, decision_ts)
+            eq_feats = self.feature_builder.compute_entry_quality_features(df5, decision_ts, meta_dir=bundle.meta_dir)
             meta_full.update(eq_feats)
 
             # --- Strict-parity: regime-set derivations (includes risk_on / risk_on_1 for scope gating) ---

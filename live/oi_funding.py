@@ -1,165 +1,203 @@
-# live/oi_funding.py
 from __future__ import annotations
-from typing import Dict, Tuple
+
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple
+
 import numpy as np
 import pandas as pd
 
-# 5-minute windows (training parity)
-WIN_1H, WIN_4H, WIN_1D, WIN_3D, WIN_7D = 12, 48, 288, 864, 2016
+from .regimes_report import RegimeThresholds
 
 
-# -------------------- TZ helpers --------------------
-def _now_utc() -> pd.Timestamp:
-    """UTC-aware 'now' (safe across pandas versions)."""
-    return pd.Timestamp.now(tz="UTC")
-
-def _ensure_utc(ts: pd.Timestamp) -> pd.Timestamp:
-    """Return a UTC-aware Timestamp whether input was naive or tz-aware."""
-    if ts.tzinfo is None:
-        return ts.tz_localize("UTC")   # naive → localize
-    return ts.tz_convert("UTC")        # aware → convert
+WIN_1H = 12
+WIN_4H = 48
+WIN_1D = 288
+WIN_3D = 3 * WIN_1D
+WIN_7D = 7 * WIN_1D
 
 
-# -------------------- parsing helpers --------------------
-def _as_df(items: list[dict], ts_key: str, val_key: str) -> pd.DataFrame:
+class StaleDerivativesDataError(RuntimeError):
+    pass
+
+
+def _ensure_dt_index(df: pd.DataFrame) -> pd.DataFrame:
+    if isinstance(df.index, pd.DatetimeIndex):
+        out = df.copy()
+        out = out.sort_index()
+        return out
+
+    if "timestamp" not in df.columns:
+        raise KeyError("df must have DatetimeIndex or a 'timestamp' column")
+
+    out = df.copy()
+    out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True)
+    out = out.set_index("timestamp", drop=True).sort_index()
+    return out
+
+
+def _zscore_rolling(x: pd.Series, win: int, *, min_periods: int) -> pd.Series:
+    mu = x.rolling(win, min_periods=min_periods).mean()
+    sd = x.rolling(win, min_periods=min_periods).std()
+    return (x - mu) / (sd + 1e-12)
+
+
+def _bucket_3way(x: pd.Series, q33: float, q66: float) -> pd.Series:
+    # returns float series with values -1, 0, +1 or NaN
+    out = pd.Series(np.nan, index=x.index, dtype="float64")
+    out = out.where(~x.notna(), out)  # keep NaN where x is NaN
+    out.loc[x <= q33] = -1.0
+    out.loc[(x > q33) & (x < q66)] = 0.0
+    out.loc[x >= q66] = 1.0
+    return out
+
+
+def _funding_regime_code(funding_rate: pd.Series, eps: float) -> pd.Series:
+    out = pd.Series(np.nan, index=funding_rate.index, dtype="float64")
+    ok = funding_rate.notna()
+    fr = funding_rate[ok]
+    out.loc[fr <= -eps] = -1.0
+    out.loc[(fr > -eps) & (fr < eps)] = 0.0
+    out.loc[fr >= eps] = 1.0
+    return out
+
+
+def add_oi_funding_features(
+    df5: pd.DataFrame,
+    *,
+    thresholds: RegimeThresholds,
+    decision_ts: Optional[pd.Timestamp] = None,
+    staleness_max_age: Optional[pd.Timedelta] = None,
+) -> pd.DataFrame:
     """
-    Accept a list of dicts or list-of-lists and return a DataFrame indexed by UTC ms,
-    with a single float column named `val_key`.
-    """
-    if not items:
-        return pd.DataFrame(columns=[val_key])
+    Computes OI/Funding feature block on a 5m grid, using as-of semantics via ffill.
 
-    # list of dicts
-    if isinstance(items[0], dict):
-        df = pd.DataFrame(items)
-        # normalize timestamp key
-        cand_ts = [ts_key, "timestamp", "time", "fundingRateTimestamp"]
-        ts_key = next((k for k in cand_ts if k in df.columns), ts_key)
-        # normalize value key (OI or funding aliases)
-        if val_key not in df.columns:
-            for k in ("openInterest", "open_interest", "value", "openInterestValue",
-                      "fundingRate", "rate", "funding_rate"):
-                if k in df.columns:
-                    val_key = k
-                    break
-        df = df[[ts_key, val_key]].copy()
-        df[ts_key] = pd.to_numeric(df[ts_key], errors="coerce").astype("Int64")
-        df[val_key] = pd.to_numeric(df[val_key], errors="coerce")
+    Required raw columns on df5:
+      - close
+      - open_interest
+      - funding_rate
+
+    Adds columns:
+      - oi_level, oi_notional_est, oi_pct_1h/4h/1d, oi_z_7d, oi_chg_norm_vol_1h, oi_price_div_1h
+      - funding_rate (ffill), funding_abs, funding_z_7d, funding_rollsum_3d, funding_oi_div, est_leverage
+      - funding_regime_code, oi_regime_code, S3_funding_x_oi
+    """
+    df = _ensure_dt_index(df5)
+
+    for col in ("close", "open_interest", "funding_rate"):
+        if col not in df.columns:
+            raise KeyError(f"Missing required raw column: {col}")
+
+    # as-of mapping on 5m grid: forward-fill raw derivatives
+    close = df["close"].astype("float64")
+    oi = df["open_interest"].astype("float64").ffill()
+    fr = df["funding_rate"].astype("float64").ffill()
+
+    if decision_ts is not None:
+        decision_ts = pd.to_datetime(decision_ts, utc=True)
+        if decision_ts < df.index.min():
+            raise ValueError(f"decision_ts {decision_ts} is before df start {df.index.min()}")
+
+        # staleness: require last known non-NaN raw to be recent enough
+        if staleness_max_age is not None:
+            staleness_max_age = pd.Timedelta(staleness_max_age)
+            last_oi = df["open_interest"].dropna().index.max() if df["open_interest"].notna().any() else None
+            last_fr = df["funding_rate"].dropna().index.max() if df["funding_rate"].notna().any() else None
+            if last_oi is None or (decision_ts - last_oi) > staleness_max_age:
+                raise StaleDerivativesDataError(
+                    f"open_interest stale or missing: last={last_oi}, decision_ts={decision_ts}, max_age={staleness_max_age}"
+                )
+            if last_fr is None or (decision_ts - last_fr) > staleness_max_age:
+                raise StaleDerivativesDataError(
+                    f"funding_rate stale or missing: last={last_fr}, decision_ts={decision_ts}, max_age={staleness_max_age}"
+                )
+
+    out = df.copy()
+
+    out["oi_level"] = oi
+    out["oi_notional_est"] = oi * close
+
+    out["oi_pct_1h"] = out["oi_level"].pct_change(WIN_1H)
+    out["oi_pct_4h"] = out["oi_level"].pct_change(WIN_4H)
+    out["oi_pct_1d"] = out["oi_level"].pct_change(WIN_1D)
+
+    # z-score of oi_pct_1d over 7d
+    out["oi_z_7d"] = _zscore_rolling(out["oi_pct_1d"], WIN_7D, min_periods=WIN_1D)
+
+    # normalized by abs 1h price move
+    price_pct_1h = close.pct_change(WIN_1H)
+    out["oi_chg_norm_vol_1h"] = out["oi_pct_1h"] / (price_pct_1h.abs() + 1e-12)
+
+    # divergence
+    out["oi_price_div_1h"] = out["oi_pct_1h"] - price_pct_1h
+
+    out["funding_rate"] = fr
+    out["funding_abs"] = out["funding_rate"].abs()
+
+    out["funding_z_7d"] = _zscore_rolling(out["funding_rate"], WIN_7D, min_periods=WIN_1D)
+    out["funding_rollsum_3d"] = out["funding_rate"].rolling(WIN_3D, min_periods=WIN_1D).sum()
+
+    out["funding_oi_div"] = out["funding_z_7d"] * out["oi_z_7d"]
+    out["est_leverage"] = (out["oi_z_7d"].abs() + 0.5) * (out["funding_z_7d"].abs() + 0.5)
+
+    # regime codes (no extra shifting; assumes as-of mapped)
+    out["funding_regime_code"] = _funding_regime_code(out["funding_rate"], thresholds.funding_neutral_eps)
+
+    if thresholds.oi_source == "oi_z_7d":
+        oi_val = out["oi_z_7d"]
+    elif thresholds.oi_source == "oi_pct_1d":
+        oi_val = out["oi_pct_1d"]
     else:
-        # list of [timestamp, value, ...]
-        df = pd.DataFrame(items, columns=[ts_key, val_key])
-        df[ts_key] = pd.to_numeric(df[ts_key], errors="coerce").astype("Int64")
-        df[val_key] = pd.to_numeric(df[val_key], errors="coerce")
+        raise ValueError(f"Unsupported oi_source={thresholds.oi_source!r}")
 
-    df.dropna(subset=[ts_key], inplace=True)
-    # Create a tz-aware UTC index directly (no later tz_localize on tz-aware values!)
-    idx = pd.to_datetime(df[ts_key].astype("int64"), unit="ms", utc=True)
-    df = df.drop(columns=[ts_key]).set_index(idx).sort_index()
-    return df
+    out["oi_regime_code"] = _bucket_3way(oi_val, thresholds.oi_q33, thresholds.oi_q66)
+
+    # S3 = (funding_regime_code + 1)*3 + (oi_regime_code + 1)
+    frc = out["funding_regime_code"]
+    oic = out["oi_regime_code"]
+    s3 = (frc + 1.0) * 3.0 + (oic + 1.0)
+    s3 = s3.where(frc.notna() & oic.notna(), np.nan)
+    out["S3_funding_x_oi"] = s3
+
+    return out
 
 
-# -------------------- main fetch/alignment --------------------
-async def fetch_series_5m(exchange, symbol: str, lookback_oi_days: int = 7, lookback_fr_days: int = 7) -> Tuple[pd.Series, pd.Series]:
+def oi_funding_features_at_decision(
+    df5: pd.DataFrame,
+    decision_ts: pd.Timestamp,
+    *,
+    thresholds: RegimeThresholds,
+    staleness_max_age: Optional[pd.Timedelta] = None,
+) -> Dict[str, float]:
     """
-    Returns (oi_series_5m, funding_series_5m) aligned on a 5-minute UTC grid.
-    Funding is forward-filled to the 5m grid (training parity).
+    Convenience: compute the block and return the feature values at the as-of decision timestamp.
+    Uses pure as-of semantics: last row at or before decision_ts.
     """
-    # Pull raw histories (helpers are on ExchangeProxy)
-    oi_hist = await exchange.fetch_open_interest_history_5m(symbol, lookback_days=lookback_oi_days)
-    fr_hist = await exchange.fetch_funding_rate_history(symbol, lookback_days=lookback_fr_days)
+    df = _ensure_dt_index(df5)
+    decision_ts = pd.to_datetime(decision_ts, utc=True)
+    df = df.loc[:decision_ts]
+    if df.empty:
+        raise ValueError(f"No rows at or before decision_ts={decision_ts}")
 
-    oi_df = _as_df(oi_hist, "timestamp", "openInterest")
-    fr_df = _as_df(fr_hist, "timestamp", "fundingRate")
+    df2 = add_oi_funding_features(df, thresholds=thresholds, decision_ts=decision_ts, staleness_max_age=staleness_max_age)
+    row = df2.iloc[-1]
 
-    # Build a 5m grid covering the union of inputs (or a minimal window if empty)
-    if not oi_df.empty:
-        start = _ensure_utc(oi_df.index.min())
-    elif not fr_df.empty:
-        start = _ensure_utc(fr_df.index.min())
-    else:
-        start = _now_utc() - pd.Timedelta(days=max(lookback_oi_days, lookback_fr_days))
-
-    end = _now_utc()
-
-    # Important: start/end are already tz-aware UTC → don't pass tz= again here
-    idx5 = pd.date_range(start=start.floor("5min"), end=end.floor("5min"), freq="5min")
-
-    # Reindex to the 5m grid
-    oi5 = oi_df.reindex(idx5)["openInterest"] if "openInterest" in oi_df.columns else pd.Series(index=idx5, dtype=float)
-    fr5 = fr_df.reindex(idx5)["fundingRate"] if "fundingRate" in fr_df.columns else pd.Series(index=idx5, dtype=float)
-
-    # Funding is published discretely → forward-fill to 5m (matches training)
-    fr5 = fr5.ffill()
-
-    return oi5, fr5
-
-
-# -------------------- feature computation (13 features) --------------------
-def compute_oi_funding_features(df5: pd.DataFrame, oi5: pd.Series, fr5: pd.Series, *, allow_nans: bool = True) -> Dict[str, float]:
-    """
-    Compute the 13 OI+Funding features for the **last** bar of df5.
-    If allow_nans=False, replace missing with 0.0 to satisfy strict parity.
-    """
-    # Align to df5’s UTC 5m index
-    oi = oi5.reindex(df5.index)
-    fr = fr5.reindex(df5.index)
-
-    close = df5["close"].astype(float)
-    volume = df5.get("volume", pd.Series(index=df5.index, dtype=float)).astype(float)
-
-    # 1-2) levels
-    oi_level        = oi
-    oi_notional_est = oi * close
-
-    # 3-5) pct changes (no implicit fill)
-    oi_pct_1h = oi.pct_change(WIN_1H, fill_method=None)
-    oi_pct_4h = oi.pct_change(WIN_4H, fill_method=None)
-    oi_pct_1d = oi.pct_change(WIN_1D, fill_method=None)
-
-    # 6) OI z-score (7d)
-    oi_mean_7d = oi.rolling(WIN_7D, min_periods=WIN_1D).mean()
-    oi_std_7d  = oi.rolling(WIN_7D, min_periods=WIN_1D).std()
-    oi_z_7d    = (oi - oi_mean_7d) / (oi_std_7d + 1e-12)
-
-    # 7) ΔOI normalized by recent turnover (1h)
-    vol_1h = volume.rolling(WIN_1H).sum()
-    oi_chg_norm_vol_1h = (oi - oi.shift(WIN_1H)) / (vol_1h + 1e-9)
-
-    # 8) OI–price interaction
-    ret_1h          = close.pct_change(WIN_1H, fill_method=None)
-    oi_price_div_1h = np.sign(ret_1h) * oi_pct_1h
-
-    # 9-12) Funding transforms
-    funding_rate       = fr
-    funding_abs        = fr.abs()
-    fr_mean_7d         = fr.rolling(WIN_7D, min_periods=WIN_1D).mean()
-    fr_std_7d          = fr.rolling(WIN_7D, min_periods=WIN_1D).std()
-    funding_z_7d       = (fr - fr_mean_7d) / (fr_std_7d + 1e-12)
-    funding_rollsum_3d = fr.rolling(WIN_3D, min_periods=WIN_1D).sum()
-
-    # 13) Interaction
-    funding_oi_div = funding_z_7d * oi_z_7d
-
-    # Assemble last-bar snapshot
-    fields = {
-        "oi_level":            float(oi_level.iloc[-1]) if len(oi_level) else np.nan,
-        "oi_notional_est":     float(oi_notional_est.iloc[-1]) if len(oi_notional_est) else np.nan,
-        "oi_pct_1h":           float(oi_pct_1h.iloc[-1]) if len(oi_pct_1h) else np.nan,
-        "oi_pct_4h":           float(oi_pct_4h.iloc[-1]) if len(oi_pct_4h) else np.nan,
-        "oi_pct_1d":           float(oi_pct_1d.iloc[-1]) if len(oi_pct_1d) else np.nan,
-        "oi_z_7d":             float(oi_z_7d.iloc[-1]) if len(oi_z_7d) else np.nan,
-        "oi_chg_norm_vol_1h":  float(oi_chg_norm_vol_1h.iloc[-1]) if len(oi_chg_norm_vol_1h) else np.nan,
-        "oi_price_div_1h":     float(oi_price_div_1h.iloc[-1]) if len(oi_price_div_1h) else np.nan,
-        "funding_rate":        float(funding_rate.iloc[-1]) if len(funding_rate) else np.nan,
-        "funding_abs":         float(funding_abs.iloc[-1]) if len(funding_abs) else np.nan,
-        "funding_z_7d":        float(funding_z_7d.iloc[-1]) if len(funding_z_7d) else np.nan,
-        "funding_rollsum_3d":  float(funding_rollsum_3d.iloc[-1]) if len(funding_rollsum_3d) else np.nan,
-        "funding_oi_div":      float(funding_oi_div.iloc[-1]) if len(funding_oi_div) else np.nan,
-    }
-
-    if not allow_nans:
-        for k, v in list(fields.items()):
-            if v is None or not np.isfinite(v):
-                fields[k] = 0.0
-
-    return fields
+    keys = [
+        "oi_level",
+        "oi_notional_est",
+        "oi_pct_1h",
+        "oi_pct_4h",
+        "oi_pct_1d",
+        "oi_z_7d",
+        "oi_chg_norm_vol_1h",
+        "oi_price_div_1h",
+        "funding_rate",
+        "funding_abs",
+        "funding_z_7d",
+        "funding_rollsum_3d",
+        "funding_oi_div",
+        "est_leverage",
+        "funding_regime_code",
+        "oi_regime_code",
+        "S3_funding_x_oi",
+    ]
+    return {k: (float(row[k]) if pd.notna(row[k]) else np.nan) for k in keys}
