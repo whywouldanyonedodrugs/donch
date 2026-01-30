@@ -5,7 +5,7 @@ A resilient proxy wrapper for the CCXT exchange object.
 It uses the 'tenacity' library to automatically retry API calls that fail
 due to temporary, recoverable network issues.
 """
-
+import pandas as pd
 import math
 from datetime import timedelta
 import logging
@@ -38,6 +38,9 @@ class ExchangeProxy:
     def markets(self):
         """Pass through to the underlying exchange's markets property."""
         return self._exchange.markets
+
+
+
 
     def __getattr__(self, name):
         """
@@ -150,6 +153,89 @@ class ExchangeProxy:
 
         # Unsupported exchange
         return []
+
+    async def fetch_oi_funding_series_5m(
+        self,
+        symbol: str,
+        *,
+        lookback_days: int = 10,
+        end_ts: Optional[pd.Timestamp] = None,
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Adapter used by live.oi_funding.fetch_series_5m().
+
+        Returns:
+          - oi_df:    DatetimeIndex (UTC), column ['open_interest'] (float)
+          - fund_df:  DatetimeIndex (UTC), column ['funding_rate']  (float)
+
+        Critical invariant:
+          If end_ts is provided, both series are truncated to <= end_ts so that
+          downstream staleness checks are evaluated "as-of decision_ts" and cannot
+          be masked by newer (future) observations.
+        """
+        # Normalize end_ts
+        if end_ts is not None:
+            end_ts = pd.to_datetime(end_ts, utc=True)
+            # Defensive: if caller passed naive ts, force UTC
+            if getattr(end_ts, "tzinfo", None) is None:
+                end_ts = end_ts.tz_localize("UTC")
+
+        # Fetch raw history
+        oi_rows = await self.fetch_open_interest_history_5m(symbol, lookback_days=lookback_days)
+        fr_rows = await self.fetch_funding_rate_history(symbol, lookback_days=lookback_days)
+
+        # Build OI dataframe
+        oi_df = pd.DataFrame(oi_rows or [])
+        if oi_df.empty:
+            oi_df = pd.DataFrame({"open_interest": pd.Series(dtype="float64")})
+            oi_df.index = pd.DatetimeIndex([], tz="UTC", name="timestamp")
+        else:
+            if "timestamp" in oi_df.columns:
+                oi_df["timestamp"] = pd.to_datetime(oi_df["timestamp"], unit="ms", utc=True)
+                oi_df = oi_df.set_index("timestamp")
+
+            # Normalize column name(s)
+            if "openInterest" in oi_df.columns and "open_interest" not in oi_df.columns:
+                oi_df = oi_df.rename(columns={"openInterest": "open_interest"})
+
+            if "open_interest" not in oi_df.columns:
+                # Fail-closed by returning empty; downstream will treat as missing/stale
+                oi_df = pd.DataFrame({"open_interest": pd.Series(dtype="float64")})
+                oi_df.index = pd.DatetimeIndex([], tz="UTC", name="timestamp")
+            else:
+                oi_df["open_interest"] = pd.to_numeric(oi_df["open_interest"], errors="coerce").astype(float)
+                oi_df = oi_df[["open_interest"]].sort_index()
+                oi_df = oi_df[~oi_df.index.duplicated(keep="last")]
+
+        # Build funding dataframe
+        fr_df = pd.DataFrame(fr_rows or [])
+        if fr_df.empty:
+            fr_df = pd.DataFrame({"funding_rate": pd.Series(dtype="float64")})
+            fr_df.index = pd.DatetimeIndex([], tz="UTC", name="timestamp")
+        else:
+            if "timestamp" in fr_df.columns:
+                fr_df["timestamp"] = pd.to_datetime(fr_df["timestamp"], unit="ms", utc=True)
+                fr_df = fr_df.set_index("timestamp")
+
+            if "fundingRate" in fr_df.columns and "funding_rate" not in fr_df.columns:
+                fr_df = fr_df.rename(columns={"fundingRate": "funding_rate"})
+
+            if "funding_rate" not in fr_df.columns:
+                fr_df = pd.DataFrame({"funding_rate": pd.Series(dtype="float64")})
+                fr_df.index = pd.DatetimeIndex([], tz="UTC", name="timestamp")
+            else:
+                fr_df["funding_rate"] = pd.to_numeric(fr_df["funding_rate"], errors="coerce").astype(float)
+                fr_df = fr_df[["funding_rate"]].sort_index()
+                fr_df = fr_df[~fr_df.index.duplicated(keep="last")]
+
+        # Truncate to end_ts to preserve "as-of" semantics (prevents staleness masking)
+        if end_ts is not None:
+            oi_df = oi_df.loc[:end_ts]
+            fr_df = fr_df.loc[:end_ts]
+
+        return oi_df, fr_df
+
+
 
     async def fetch_funding_rate_history(self, symbol: str, *, lookback_days: int = 7) -> list[dict]:
         """
