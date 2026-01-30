@@ -149,135 +149,123 @@ class ExchangeProxy:
         self,
         symbol: str,
         lookback_days: int = 7,
-        *,
         end_ts: Optional[pd.Timestamp] = None,
+        category: str = "linear",
+        limit: int = 200,
     ) -> list[dict]:
-
         """
-        Return a list of dicts: [{"timestamp": ms, "openInterest": float}, ...] on a 5-minute grid,
-        newest last. Robust to both CCXT unified and direct Bybit V5 endpoints.
+        Fetch Bybit V5 open-interest history at 5min resolution.
+
+        Returns list of dicts:
+          {"timestamp": <ms int>, "openInterest": <float>}
+
+        Semantics:
+        - Uses startTime/endTime window derived from end_ts and lookback_days.
+        - Paginates using nextPageCursor until exhausted.
+        - Filters returned timestamps to <= end_ts (no lookahead).
         """
-        ex = self._exchange
-        interval = "5m"  # CCXT timeframe
-        intervalTime = "5min"  # Bybit V5 param
+        ex = self.ex
+        if ex is None:
+            raise RuntimeError("ExchangeProxy.ex is None")
 
-        # Try CCXT unified first
-        if getattr(ex, "has", {}).get("fetchOpenInterestHistory"):
-            # CCXT returns newest-first; we normalize to newest-last
-            rows = await ex.fetchOpenInterestHistory(symbol, timeframe=interval)
-            if not rows:
-                return []
-            # rows may be list of dicts or list of [ts, oi]
-            out = []
-            if isinstance(rows[0], dict):
-                for r in rows:
-                    ts = int(r.get("timestamp") or r.get("time") or r.get("datetime") or 0)
-                    oi = r.get("openInterest") or r.get("open_interest") or r.get("value") or r.get("openInterestValue")
-                    try: oi = float(oi)
-                    except Exception: oi = None
-                    if ts and oi is not None:
-                        out.append({"timestamp": ts, "openInterest": oi})
-                        cutoff_ms = end_ms - int(lookback_days) * 24 * 3600 * 1000
-                        out = [r for r in out if int(r["timestamp"]) >= cutoff_ms and int(r["timestamp"]) <= end_ms]
-
+        if end_ts is None:
+            end_ts = pd.Timestamp.now(tz="UTC").floor("5min")
+        else:
+            end_ts = pd.Timestamp(end_ts)
+            if end_ts.tzinfo is None:
+                end_ts = end_ts.tz_localize("UTC")
             else:
-                for ts, oi, *_ in rows:
-                    out.append({"timestamp": int(ts), "openInterest": float(oi)})
-            out.sort(key=lambda x: x["timestamp"])
-            return out
+                end_ts = end_ts.tz_convert("UTC")
+            end_ts = end_ts.floor("5min")
 
-        # Fallback: direct Bybit V5 public endpoint through CCXT (async)
-        if ex.id == "bybit" and hasattr(ex, "publicGetV5MarketOpenInterest"):
-            now_ms = ex.milliseconds()
-            start_ms = now_ms - lookback_days * 24 * 60 * 60 * 1000
-            cursor = None
-            result: list[dict] = []
+        if lookback_days <= 0:
+            return []
 
+        start_ts = end_ts - pd.Timedelta(days=int(lookback_days))
+        start_ms = int(start_ts.timestamp() * 1000)
+        end_ms = int(end_ts.timestamp() * 1000)
 
-
-            cursor = None
-            out: List[Dict[str, Any]] = []
-            interval_time = "5min"
-            cutoff_ms = end_ms - int(lookback_days) * 24 * 3600 * 1000
-
-            # Paginate “as-of end_ms” backwards. Avoid relying on startTime semantics.
-            # We keep requesting pages until we have crossed cutoff_ms or the API stops returning data.
-            page_end_ms = end_ms
-
-            while True:
-                params = {
-                    "category": "linear",
-                    "symbol": symbol,
-                    "intervalTime": interval_time,
-                    "endTime": page_end_ms,
-                    "limit": 200,
-                }
-                if cursor:
-                    params["cursor"] = cursor
-
-                fn = getattr(self.ex, "publicGetV5MarketOpenInterest", None)
-                if fn is None:
-                    return out  # best-effort: return what we have (likely empty)
-
+        # Prefer Bybit V5 raw endpoint (documented params: category/symbol/intervalTime/startTime/endTime/limit/cursor)
+        # https://bybit-exchange.github.io/docs/v5/market/open-interest :contentReference[oaicite:1]{index=1}
+        if not hasattr(ex, "publicGetV5MarketOpenInterest"):
+            # Fall back to unified method if present
+            if getattr(ex, "has", {}).get("fetchOpenInterestHistory"):
+                # Try to resolve CCXT symbol if markets are loaded
                 try:
-                    resp = await fn(params)
+                    if not getattr(ex, "markets", None):
+                        await ex.load_markets()
+                    sym_ccxt = symbol
+                    if hasattr(ex, "markets_by_id") and symbol in ex.markets_by_id:
+                        sym_ccxt = ex.markets_by_id[symbol]["symbol"]
                 except Exception:
-                    return out  # best-effort: return what we have so far
+                    sym_ccxt = symbol
 
-                result = (resp or {}).get("result") or {}
-                lst = result.get("list") or []
-                next_cursor = result.get("nextPageCursor") or ""
-
-                # Parse rows
-                got_any = False
-                for row in lst:
-                    ts = row.get("timestamp")
-                    oi = row.get("openInterest") or row.get("open_interest") or row.get("openInterestValue")
+                rows = await ex.fetch_open_interest_history(
+                    sym_ccxt,
+                    timeframe="5m",
+                    since=start_ms,
+                    limit=limit,
+                    params={"category": category},
+                )
+                out: list[dict] = []
+                for r in rows or []:
+                    ts = r.get("timestamp")
+                    oi = r.get("openInterest") or r.get("open_interest") or r.get("openInterestValue")
                     if ts is None or oi is None:
                         continue
-                    try:
-                        ts_i = int(ts)
-                        oi_f = float(oi)
-                    except Exception:
+                    ts = int(ts)
+                    if ts <= end_ms:
+                        out.append({"timestamp": ts, "openInterest": float(oi)})
+                out.sort(key=lambda x: x["timestamp"])
+                return out
+
+            raise NotImplementedError(
+                "No supported open-interest method (missing publicGetV5MarketOpenInterest and fetchOpenInterestHistory)"
+            )
+
+        cursor: Optional[str] = None
+        out: list[dict] = []
+
+        while True:
+            params = {
+                "category": category,
+                "symbol": symbol,
+                "intervalTime": "5min",
+                "startTime": start_ms,
+                "endTime": end_ms,
+                "limit": int(limit),
+            }
+            if cursor:
+                params["cursor"] = cursor
+
+            resp = await ex.publicGetV5MarketOpenInterest(params)
+            if (resp or {}).get("retCode") not in (0, "0", None):
+                raise RuntimeError(f"Bybit open-interest retCode={resp.get('retCode')} retMsg={resp.get('retMsg')}")
+
+            result = (resp or {}).get("result", {}) or {}
+            lst = result.get("list", []) or []
+            next_cursor = result.get("nextPageCursor", "") or ""
+
+            if not lst:
+                break
+
+            for r in lst:
+                try:
+                    ts_ms = int(r["timestamp"])
+                    if ts_ms > end_ms:
                         continue
-                    out.append({"timestamp": ts_i, "openInterest": oi_f})
-                    got_any = True
+                    oi = float(r["openInterest"])
+                    out.append({"timestamp": ts_ms, "openInterest": oi})
+                except Exception:
+                    continue
 
-                if not got_any:
-                    break
+            if not next_cursor:
+                break
+            cursor = next_cursor
 
-                # If we already crossed cutoff, stop
-                min_ts = min(r["timestamp"] for r in out) if out else page_end_ms
-                if min_ts <= cutoff_ms:
-                    break
+        out.sort(key=lambda x: x["timestamp"])
+        return out
 
-                # Prefer cursor if provided; otherwise move endTime backwards using oldest received ts
-                if next_cursor:
-                    cursor = next_cursor
-                else:
-                    cursor = None
-                    oldest_in_page = None
-                    try:
-                        oldest_in_page = min(int(r.get("timestamp")) for r in lst if r.get("timestamp") is not None)
-                    except Exception:
-                        oldest_in_page = None
-                    if oldest_in_page is None:
-                        break
-                    page_end_ms = max(cutoff_ms, oldest_in_page - 1)
-
-            # Deduplicate by timestamp, keep last
-            if out:
-                dedup: Dict[int, Dict[str, Any]] = {}
-                for r in out:
-                    dedup[int(r["timestamp"])] = r
-                out = list(dedup.values())
-                out.sort(key=lambda x: int(x["timestamp"]))
-
-            return out
-
-
-        # Unsupported exchange
-        return []
 
     async def fetch_oi_funding_series_5m(
         self,
