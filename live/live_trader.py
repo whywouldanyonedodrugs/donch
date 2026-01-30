@@ -495,9 +495,14 @@ class LiveTrader:
             # --- NEW: regimes thresholds for deterministic meta feature codes (S2/S3/S4/S6, etc.)
             self.regime_thresholds = self._load_regime_thresholds()
             
-    async def _build_oi_funding_features(self, symbol: str, df5: pd.DataFrame, decision_ts: pd.Timestamp) -> Dict[str, float]:
+    async def _build_oi_funding_features(
+        self,
+        symbol: str,
+        df5: pd.DataFrame,
+        decision_ts: pd.Timestamp,
+    ) -> Dict[str, float]:
         """
-        OI/funding features computed "as-of decision_ts" (no wall-clock leakage).
+        OI/funding features computed strictly "as-of decision_ts" (no wall-clock leakage).
 
         Fail-closed:
           - if series fetch fails
@@ -506,19 +511,31 @@ class LiveTrader:
           - if STRICT_PARITY_FEATURES is enabled and any derived feature is NaN
         """
         try:
+            if df5 is None or df5.empty:
+                raise ValueError("df5 is empty")
+
+            if decision_ts not in df5.index:
+                # Enforce strict as-of semantics: we only compute on decision grid.
+                raise KeyError(f"decision_ts not in df5.index: {decision_ts}")
+
+            # Hard as-of cut (prevents leakage if caller accidentally passes a longer frame).
+            df5_cut = df5.loc[:decision_ts].copy()
+            if df5_cut.empty:
+                raise ValueError("df5_cut is empty after slicing to decision_ts")
+
             oi5, fr5 = await fetch_series_5m(
                 self.exchange,
                 symbol,
                 lookback_oi_days=int(self.cfg.get("OI_LOOKBACK_DAYS", 8)),
                 lookback_fr_days=int(self.cfg.get("FUNDING_LOOKBACK_DAYS", 8)),
+                end_ts=decision_ts,  # enforce as-of on the fetch side too
             )
 
             staleness_max_age = pd.Timedelta(minutes=int(self.cfg.get("DERIV_MAX_AGE_MIN", 30)))
 
-            # Strict-parity stance: do not coerce NaNs -> fail-closed instead.
             strict = bool(self.cfg.get("STRICT_PARITY_FEATURES", False))
             feats = compute_oi_funding_features(
-                df5=df5,
+                df5=df5_cut,
                 oi5=oi5,
                 fr5=fr5,
                 thresholds=self.regime_thresholds,
@@ -528,11 +545,12 @@ class LiveTrader:
             return feats
 
         except (StaleDerivativesDataError, KeyError, ValueError, NotImplementedError) as e:
-            self.logger.warning(f"OI/Funding features unavailable for {symbol}: {e}")
+            self.logger.warning(f"OI/Funding features unavailable for {symbol} at {decision_ts}: {e}")
             return {}
         except Exception as e:
-            self.logger.warning(f"OI/Funding features error for {symbol}: {e}")
+            self.logger.warning(f"OI/Funding features error for {symbol} at {decision_ts}: {e}")
             return {}
+
 
     async def _fetch_ohlcv_df_paged(self, symbol: str, tf: str, limit: int) -> Optional[pd.DataFrame]:
         """
@@ -810,7 +828,6 @@ class LiveTrader:
 
             except Exception as e:
                 LOG.warning("GOV_CTX: cross-asset daily ctx computation failed: %s", e)
-
 
         # OI/Funding (existing behavior)
         if df_btc is not None and not df_btc.empty:
@@ -1945,7 +1962,7 @@ class LiveTrader:
             turnover_z = float(univ.get("turnover_z", 0.0) or 0.0)
 
             # --- NEW: OI + Funding features (13) ----------
-            oi_feats = await self._build_oi_funding_features(symbol, df5)
+            oi_feats = await self._build_oi_funding_features(symbol, df5, decision_ts)
 
             # Build a superset dict, then FILTER to manifest columns before scoring.
             meta_full = {

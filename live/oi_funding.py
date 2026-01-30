@@ -312,6 +312,7 @@ def compute_oi_funding_features(
       - As-of mapping: reindex(df5.index, method='ffill') (no wall-clock leakage).
       - decision_ts: last timestamp in df5 index.
       - Fail-closed on missing required raw at decision_ts (open_interest or funding_rate).
+      - Staleness check uses LAST RAW observation timestamps (not ffilled timestamps).
       - If allow_nans is False: fail-closed if any returned feature is NaN.
     """
     df = _ensure_dt_index(df5)
@@ -321,15 +322,29 @@ def compute_oi_funding_features(
     decision_ts = df.index[-1]
     out = df.copy()
 
-    if "open_interest" not in out.columns:
-        oi_s = _extract_series(oi5, preferred_cols=["open_interest", "openInterest", "oi", "value"])
-        out["open_interest"] = oi_s.reindex(out.index, method="ffill")
+    oi_s = _extract_series(oi5, preferred_cols=["open_interest", "openInterest", "oi", "value"])
+    fr_s = _extract_series(fr5, preferred_cols=["funding_rate", "fundingRate", "fr", "value"])
 
-    if "funding_rate" not in out.columns:
-        fr_s = _extract_series(fr5, preferred_cols=["funding_rate", "fundingRate", "fr", "value"])
-        out["funding_rate"] = fr_s.reindex(out.index, method="ffill")
+    # Staleness check must be based on raw series, not on ffilled grids
+    if staleness_max_age is not None:
+        last_oi = oi_s.dropna().index.max() if len(oi_s.dropna()) else None
+        last_fr = fr_s.dropna().index.max() if len(fr_s.dropna()) else None
+        if last_oi is None or last_fr is None:
+            raise StaleDerivativesDataError("Derivatives series missing raw observations (OI/FR)")
+        if (decision_ts - last_oi) > staleness_max_age:
+            raise StaleDerivativesDataError(
+                f"OI stale: last={last_oi} decision_ts={decision_ts} max_age={staleness_max_age}"
+            )
+        if (decision_ts - last_fr) > staleness_max_age:
+            raise StaleDerivativesDataError(
+                f"Funding stale: last={last_fr} decision_ts={decision_ts} max_age={staleness_max_age}"
+            )
 
-    # required raw must exist at decision_ts
+    # As-of mapping onto decision grid
+    out["open_interest"] = oi_s.reindex(out.index, method="ffill")
+    out["funding_rate"] = fr_s.reindex(out.index, method="ffill")
+
+    # Required raw must exist at decision_ts after as-of mapping
     if pd.isna(out.at[decision_ts, "open_interest"]) or pd.isna(out.at[decision_ts, "funding_rate"]):
         raise KeyError("Missing required derivatives raw at decision_ts (open_interest/funding_rate)")
 
@@ -337,11 +352,10 @@ def compute_oi_funding_features(
         out,
         decision_ts,
         thresholds=thresholds,
-        staleness_max_age=staleness_max_age,
+        staleness_max_age=None,  # already enforced above using raw timestamps
     )
 
     if not allow_nans:
-        # fail-closed: do NOT coerce NaNs to zeros
         bad = [k for k, v in feats.items() if v is None or (isinstance(v, float) and np.isnan(v))]
         if bad:
             raise ValueError(f"NaNs in oi/funding derived features at decision_ts: {bad}")
