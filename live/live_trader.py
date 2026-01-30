@@ -495,24 +495,43 @@ class LiveTrader:
             # --- NEW: regimes thresholds for deterministic meta feature codes (S2/S3/S4/S6, etc.)
             self.regime_thresholds = self._load_regime_thresholds()
             
-
-
-
-
-    async def _build_oi_funding_features(self, symbol: str, df5: "pd.DataFrame") -> dict:
+    async def _build_oi_funding_features(self, symbol: str, df5: pd.DataFrame, decision_ts: pd.Timestamp) -> Dict[str, float]:
         """
-        Pull 5m OI & funding, align to df5, and compute the 13 features.
-        Fills NaNs to 0.0 when strict parity is enabled in the WinProbScorer.
+        OI/funding features computed "as-of decision_ts" (no wall-clock leakage).
+
+        Fail-closed:
+          - if series fetch fails
+          - if staleness check fails
+          - if required raw is missing at decision_ts
+          - if STRICT_PARITY_FEATURES is enabled and any derived feature is NaN
         """
         try:
-            oi_days = int(self.cfg.get("OI_LOOKBACK_DAYS", 7))
-            fr_days = int(self.cfg.get("FUNDING_LOOKBACK_DAYS", 7))
-            oi5, fr5 = await fetch_series_5m(self.exchange, symbol, lookback_oi_days=oi_days, lookback_fr_days=fr_days)
-            allow_nans = not bool(getattr(self.winprob, "strict_parity", False))
-            feats = compute_oi_funding_features(df5, oi5, fr5, allow_nans=allow_nans)
+            oi5, fr5 = await fetch_series_5m(
+                self.exchange,
+                symbol,
+                lookback_oi_days=int(self.cfg.get("OI_LOOKBACK_DAYS", 8)),
+                lookback_fr_days=int(self.cfg.get("FUNDING_LOOKBACK_DAYS", 8)),
+            )
+
+            staleness_max_age = pd.Timedelta(minutes=int(self.cfg.get("DERIV_MAX_AGE_MIN", 30)))
+
+            # Strict-parity stance: do not coerce NaNs -> fail-closed instead.
+            strict = bool(self.cfg.get("STRICT_PARITY_FEATURES", False))
+            feats = compute_oi_funding_features(
+                df5=df5,
+                oi5=oi5,
+                fr5=fr5,
+                thresholds=self.regime_thresholds,
+                allow_nans=not strict,
+                staleness_max_age=staleness_max_age,
+            )
             return feats
+
+        except (StaleDerivativesDataError, KeyError, ValueError, NotImplementedError) as e:
+            self.logger.warning(f"OI/Funding features unavailable for {symbol}: {e}")
+            return {}
         except Exception as e:
-            LOG.debug("OI/Funding feature pack failed for %s: %s", symbol, e)
+            self.logger.warning(f"OI/Funding features error for {symbol}: {e}")
             return {}
 
     async def _fetch_ohlcv_df_paged(self, symbol: str, tf: str, limit: int) -> Optional[pd.DataFrame]:
