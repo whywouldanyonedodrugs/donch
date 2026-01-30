@@ -82,10 +82,17 @@ def add_oi_funding_features(
       - funding_regime_code, oi_regime_code, S3_funding_x_oi
     """
     df = _ensure_dt_index(df5)
+    if df.empty:
+        raise ValueError("df5 is empty")
 
     for col in ("close", "open_interest", "funding_rate"):
         if col not in df.columns:
             raise KeyError(f"Missing required raw column: {col}")
+
+    # If staleness enforcement is requested but decision_ts isn't provided,
+    # infer decision_ts as the last available 5m timestamp (as-of semantics).
+    if staleness_max_age is not None and decision_ts is None:
+        decision_ts = df.index[-1]
 
     # as-of mapping on 5m grid: forward-fill raw derivatives
     close = df["close"].astype("float64")
@@ -100,8 +107,10 @@ def add_oi_funding_features(
         # staleness: require last known non-NaN raw to be recent enough
         if staleness_max_age is not None:
             staleness_max_age = pd.Timedelta(staleness_max_age)
+
             last_oi = df["open_interest"].dropna().index.max() if df["open_interest"].notna().any() else None
             last_fr = df["funding_rate"].dropna().index.max() if df["funding_rate"].notna().any() else None
+
             if last_oi is None or (decision_ts - last_oi) > staleness_max_age:
                 raise StaleDerivativesDataError(
                     f"open_interest stale or missing: last={last_oi}, decision_ts={decision_ts}, max_age={staleness_max_age}"
