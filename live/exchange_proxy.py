@@ -41,6 +41,10 @@ class ExchangeProxy:
     def markets(self):
         """Pass through to the underlying exchange's markets property."""
         return self._exchange.markets
+    @property
+    def ex(self):
+        # Compatibility alias; some methods reference self.ex
+        return self._exchange
 
     def _end_ms(self, end_ts: Optional[pd.Timestamp]) -> int:
         """
@@ -145,126 +149,94 @@ class ExchangeProxy:
     # ─────────────────────────────────────────────────────────────────────
     # Open Interest & Funding History helpers (Bybit V5 + CCXT unified)
     # ─────────────────────────────────────────────────────────────────────
-    async def fetch_open_interest_history_5m(
-        self,
-        symbol: str,
-        lookback_days: int = 7,
-        end_ts: Optional[pd.Timestamp] = None,
-        category: str = "linear",
-        limit: int = 200,
-    ) -> list[dict]:
-        """
-        Fetch Bybit V5 open-interest history at 5min resolution.
+async def fetch_open_interest_history_5m(
+    self,
+    symbol: str,
+    lookback_days: int = 7,
+    *,
+    end_ts: "Optional[pd.Timestamp]" = None,
+    limit: int = 200,
+) -> "List[Dict[str, Any]]":
+    """
+    Fetch Bybit linear perpetual open interest on a 5m grid using v5 endpoint.
+    Returns a list of dicts with keys: {"timestamp": <ms>, "openInterest": <float>}.
+    Window is [end_ts - lookback_days, end_ts]. If end_ts is None, uses exchange time.
+    """
+    ex = self._exchange
 
-        Returns list of dicts:
-          {"timestamp": <ms int>, "openInterest": <float>}
+    # Only Bybit v5 supports 5m open interest in the way we need.
+    fn = getattr(ex, "publicGetV5MarketOpenInterest", None)
+    if fn is None:
+        return []
 
-        Semantics:
-        - Uses startTime/endTime window derived from end_ts and lookback_days.
-        - Paginates using nextPageCursor until exhausted.
-        - Filters returned timestamps to <= end_ts (no lookahead).
-        """
-        ex = self.ex
-        if ex is None:
-            raise RuntimeError("ExchangeProxy.ex is None")
+    # Resolve end/start in ms
+    end_ms = self._end_ms(end_ts)
+    start_ms = end_ms - int(lookback_days) * 24 * 60 * 60 * 1000
 
-        if end_ts is None:
-            end_ts = pd.Timestamp.now(tz="UTC").floor("5min")
-        else:
-            end_ts = pd.Timestamp(end_ts)
-            if end_ts.tzinfo is None:
-                end_ts = end_ts.tz_localize("UTC")
-            else:
-                end_ts = end_ts.tz_convert("UTC")
-            end_ts = end_ts.floor("5min")
+    # Bybit expects "BTCUSDT" and category "linear"
+    try:
+        # If your file already has this helper, use it. If not, default.
+        unified_symbol, sym_id, category = await self._bybit_resolve_symbol_and_category(symbol)
+    except Exception:
+        sym_id, category = symbol, "linear"
 
-        if lookback_days <= 0:
-            return []
+    step_ms = 5 * 60 * 1000  # 5 minutes
+    page_span_ms = limit * step_ms  # how much time one page can cover
 
-        start_ts = end_ts - pd.Timedelta(days=int(lookback_days))
-        start_ms = int(start_ts.timestamp() * 1000)
-        end_ms = int(end_ts.timestamp() * 1000)
+    out: list[dict] = []
+    seen_ts: set[int] = set()
 
-        # Prefer Bybit V5 raw endpoint (documented params: category/symbol/intervalTime/startTime/endTime/limit/cursor)
-        # https://bybit-exchange.github.io/docs/v5/market/open-interest :contentReference[oaicite:1]{index=1}
-        if not hasattr(ex, "publicGetV5MarketOpenInterest"):
-            # Fall back to unified method if present
-            if getattr(ex, "has", {}).get("fetchOpenInterestHistory"):
-                # Try to resolve CCXT symbol if markets are loaded
-                try:
-                    if not getattr(ex, "markets", None):
-                        await ex.load_markets()
-                    sym_ccxt = symbol
-                    if hasattr(ex, "markets_by_id") and symbol in ex.markets_by_id:
-                        sym_ccxt = ex.markets_by_id[symbol]["symbol"]
-                except Exception:
-                    sym_ccxt = symbol
+    page_end_ms = end_ms
+    while page_end_ms > start_ms:
+        page_start_ms = max(start_ms, page_end_ms - page_span_ms)
 
-                rows = await ex.fetch_open_interest_history(
-                    sym_ccxt,
-                    timeframe="5m",
-                    since=start_ms,
-                    limit=limit,
-                    params={"category": category},
-                )
-                out: list[dict] = []
-                for r in rows or []:
-                    ts = r.get("timestamp")
-                    oi = r.get("openInterest") or r.get("open_interest") or r.get("openInterestValue")
-                    if ts is None or oi is None:
-                        continue
-                    ts = int(ts)
-                    if ts <= end_ms:
-                        out.append({"timestamp": ts, "openInterest": float(oi)})
-                out.sort(key=lambda x: x["timestamp"])
-                return out
+        params = {
+            "category": category,
+            "symbol": sym_id,
+            "intervalTime": "5min",
+            "startTime": int(page_start_ms),
+            "endTime": int(page_end_ms),
+            "limit": int(limit),
+        }
 
-            raise NotImplementedError(
-                "No supported open-interest method (missing publicGetV5MarketOpenInterest and fetchOpenInterestHistory)"
-            )
+        resp = await fn(params)
+        result = (resp or {}).get("result") or {}
+        lst = result.get("list") or []
+        if not lst:
+            break
 
-        cursor: Optional[str] = None
-        out: list[dict] = []
+        # Bybit returns timestamps as strings in ms
+        oldest_ms = None
+        for row in lst:
+            try:
+                ts = int(row.get("timestamp") or 0)
+                oi = float(row.get("openInterest")) if row.get("openInterest") is not None else None
+            except Exception:
+                continue
 
-        while True:
-            params = {
-                "category": category,
-                "symbol": symbol,
-                "intervalTime": "5min",
-                "startTime": start_ms,
-                "endTime": end_ms,
-                "limit": int(limit),
-            }
-            if cursor:
-                params["cursor"] = cursor
+            if ts <= 0 or oi is None:
+                continue
+            if ts < start_ms or ts > end_ms:
+                continue
 
-            resp = await ex.publicGetV5MarketOpenInterest(params)
-            if (resp or {}).get("retCode") not in (0, "0", None):
-                raise RuntimeError(f"Bybit open-interest retCode={resp.get('retCode')} retMsg={resp.get('retMsg')}")
+            if ts not in seen_ts:
+                out.append({"timestamp": ts, "openInterest": oi})
+                seen_ts.add(ts)
 
-            result = (resp or {}).get("result", {}) or {}
-            lst = result.get("list", []) or []
-            next_cursor = result.get("nextPageCursor", "") or ""
+            if oldest_ms is None or ts < oldest_ms:
+                oldest_ms = ts
 
-            if not lst:
-                break
+        if oldest_ms is None:
+            break
+        if oldest_ms <= start_ms:
+            break
 
-            for r in lst:
-                try:
-                    ts_ms = int(r["timestamp"])
-                    if ts_ms > end_ms:
-                        continue
-                    oi = float(r["openInterest"])
-                    out.append({"timestamp": ts_ms, "openInterest": oi})
-                except Exception:
-                    continue
+        # Move window backward
+        page_end_ms = oldest_ms - 1
 
-            if not next_cursor:
-                break
-            cursor = next_cursor
-
-        out.sort(key=lambda x: x["timestamp"])
-        return out
+    # Return ascending by timestamp (nice for df conversion)
+    out.sort(key=lambda d: d["timestamp"])
+    return out
 
 
     async def fetch_oi_funding_series_5m(
@@ -296,8 +268,8 @@ class ExchangeProxy:
                 end_ts = end_ts.tz_localize("UTC")
 
         # Fetch raw history
-        oi_rows = await self.fetch_open_interest_history_5m(symbol, lookback_days=lookback_days)
-        fr_rows = await self.fetch_funding_rate_history(symbol, lookback_days=lookback_days)
+        oi_rows = await self.fetch_open_interest_history_5m(symbol, lookback_days=lookback_days, end_ts=end_ts)
+        fr_rows = await self.fetch_funding_rate_history(symbol, lookback_days=lookback_days, end_ts=end_ts)
 
         # Build OI dataframe
         oi_df = pd.DataFrame(oi_rows or [])
