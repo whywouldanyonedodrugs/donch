@@ -14,6 +14,9 @@ from functools import wraps
 import ccxt.async_support as ccxt
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
+
+from typing import Optional
+
 LOG = logging.getLogger(__name__)
 
 _TIMEFRAME_MS_CACHE: dict[str, int] = {}
