@@ -2140,7 +2140,7 @@ class LiveTrader:
                 meta_full.update(gov_ctx)
 
             # --- Strict-parity: Entry Quality overlay (overwrites critical fields) ---
-            eq_feats = self.feature_builder.compute_entry_quality_features(df5, decision_ts, meta_dir=bundle.meta_dir)
+            eq_feats = self.feature_builder.compute_entry_quality_features(df5, decision_ts)
             meta_full.update(eq_feats)
 
             # --- Strict-parity: regime-set derivations (includes risk_on / risk_on_1 for scope gating) ---
@@ -2150,8 +2150,9 @@ class LiveTrader:
                 LOG.warning("bundle=%s augment_meta_with_regime_sets failed: %s", getattr(self, "bundle_id", "no_bundle"), e)
 
             # ---- Sprint 2 / Option A: freeze macro regime inputs from golden truth ----
-            macro = macro_regimes_asof(self.bundle, decision_ts)
-            meta_full.update(macro)
+            macro = macro_regimes_asof(self.meta_bundle, decision_ts) if getattr(self, "meta_bundle", None) is not None else {}
+            if isinstance(macro, dict) and macro:
+                meta_full.update(macro)
 
             # Keep regime_up consistent with regime_code_1d (if regime_up is still used downstream)
             # (Adjust mapping only if your offline team defines it differently.)
