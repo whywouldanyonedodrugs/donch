@@ -29,9 +29,10 @@ class OnlinePerformanceState:
       {"ts":"2026-01-30T12:35:00Z","win":1,"pnl":12.34}
     """
 
-    def __init__(self, path: str, max_records: int = 2000):
+    def __init__(self, path: str, max_records: int = 2000, cold_start_winrate: float = float(np.nan)):
         self.path = Path(path)
         self.max_records = int(max_records)
+        self.cold_start_winrate = float(cold_start_winrate)
         self._records: List[TradeOutcome] = []
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._load()
@@ -107,24 +108,23 @@ class OnlinePerformanceState:
                 "recent_winrate_50": float(np.nan),
                 "recent_winrate_ewm_20": float(np.nan),
             }
+        
+        cold = float(self.cold_start_winrate)
+        cold_feats = {
+            "recent_winrate_20": cold,
+            "recent_winrate_50": cold,
+            "recent_winrate_ewm_20": cold,
+        }
 
         prior = [r for r in self._records if r.ts < decision_ts]
         if len(prior) == 0:
-            return {
-                "recent_winrate_20": float(np.nan),
-                "recent_winrate_50": float(np.nan),
-                "recent_winrate_ewm_20": float(np.nan),
-            }
+            return cold_feats
 
         # explicit shift(1)
         if len(prior) >= 1:
             prior = prior[:-1]
         if len(prior) == 0:
-            return {
-                "recent_winrate_20": float(np.nan),
-                "recent_winrate_50": float(np.nan),
-                "recent_winrate_ewm_20": float(np.nan),
-            }
+            return cold_feats
 
         wins = np.array([r.win for r in prior], dtype=float)
 

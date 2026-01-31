@@ -522,7 +522,14 @@ class LiveTrader:
             try:
                 state_path = str(self.cfg.get("ONLINE_STATE_PATH", "results/online_state.jsonl"))
                 max_records = int(self.cfg.get("ONLINE_STATE_MAX_RECORDS", 2000))
-                self.online_state = OnlinePerformanceState(path=state_path, max_records=max_records)
+
+                cold_raw = self.cfg.get("ONLINE_STATE_COLDSTART_WINRATE", float("nan"))
+                try:
+                    cold_f = float(cold_raw)
+                except Exception:
+                    cold_f = float("nan")
+                self.online_state = OnlinePerformanceState(path=state_path, max_records=max_records, cold_start_winrate=cold_f)
+
             except Exception as e:
                 LOG.warning("bundle=%s OnlinePerformanceState init failed (disabling): %s", getattr(self, "bundle_id", None) or "no_bundle", e)
                 self.online_state = None
@@ -832,12 +839,17 @@ class LiveTrader:
 
         Owns Markov 4h (ETH by default) to match canonical offline semantics.
         """
-        # Fetch 5m OHLCV for BTC/ETH
-        df_btc, df_eth = await asyncio.gather(
-            self._fetch_ohlcv_df_simple("BTCUSDT", "5m", limit=1500),
-            self._fetch_ohlcv_df_simple("ETHUSDT", "5m", limit=1500),
-            return_exceptions=False,
-        )
+        # Need enough 5m history to produce >=50 daily bars for cross-asset daily ctx.
+        # 60 days is a safe default (50d windows + buffer).
+        min_days = int(self.cfg.get("GOV_CTX_DAYS_5M", 60))
+        min_bars = int(min_days * 288 + 2 * 288)  # +2d buffer
+
+        df_btc = await self._get_ohlcv("BTCUSDT", "5m", min_bars=min_bars)
+        df_eth = await self._get_ohlcv("ETHUSDT", "5m", min_bars=min_bars)
+
+        # Fail-closed if still missing
+        if df_btc is None or df_btc.empty or df_eth is None or df_eth.empty:
+            return {}
 
         # Determine decision_ts_gov (min last-closed ts across BTC/ETH) to avoid cross-asset lookahead
         decision_ts_gov = None
@@ -2261,6 +2273,27 @@ class LiveTrader:
             eq_feats = self.feature_builder.compute_entry_quality_features(df5, decision_ts)
             meta_full.update(eq_feats)
 
+            # --- Required raw inputs for derived regime interactions (S4/S6) ---
+
+            # crowd_z: use the per-symbol OI z-score already computed by OI/funding block (deterministic).
+            try:
+                meta_full["crowd_z"] = float(meta_full.get("oi_z_7d", np.nan))
+            except Exception:
+                meta_full["crowd_z"] = np.nan
+
+            # compression_pct: use the prebreak congestion measure (builder will provide/alias it).
+            try:
+                meta_full["compression_pct"] = float(meta_full.get("prebreak_congestion", np.nan))
+            except Exception:
+                meta_full["compression_pct"] = np.nan
+
+            # freshness_hours: derived from listing age (already in meta_full as days)
+            try:
+                lad = float(meta_full.get("listing_age_days", np.nan))
+                meta_full["freshness_hours"] = lad * 24.0 if np.isfinite(lad) else np.nan
+            except Exception:
+                meta_full["freshness_hours"] = np.nan
+
             # --- Strict-parity: regime-set derivations (includes risk_on / risk_on_1 for scope gating) ---
             try:
                 self._augment_meta_with_regime_sets(meta_full)
@@ -2269,8 +2302,16 @@ class LiveTrader:
 
             # ---- Sprint 2 / Option A: freeze macro regime inputs from golden truth ----
             if getattr(self, "meta_bundle", None) is not None:
-                macro = macro_regimes_asof(self.meta_bundle, decision_ts)
-                meta_full.update(macro)
+                macro = macro_regimes_asof(bundle_dir=self.bundle_dir, decision_ts=decision_ts, logger=self.log)
+                for k, v in (macro or {}).items():
+                    try:
+                        cur = meta_full.get(k, np.nan)
+                        # keep existing finite values; only fill missing/NaN
+                        if isinstance(cur, (int, float)) and np.isfinite(cur):
+                            continue
+                    except Exception:
+                        pass
+                    meta_full[k] = v
 
             # Keep regime_up consistent with regime_code_1d (if regime_up is still used downstream)
             # (Adjust mapping only if your offline team defines it differently.)
@@ -2279,9 +2320,6 @@ class LiveTrader:
                 meta_full["regime_up"] = 1 if rc in (2, 3) else 0
             except Exception:
                 pass
-            # -------------------------------------------------------------------------
-
-
 
             # ---------------- 10. Strict Slice & Score ----------------
             required = list(getattr(self.winprob, "raw_features", []) or [])
