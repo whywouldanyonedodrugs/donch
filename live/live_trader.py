@@ -63,6 +63,7 @@ from .feature_builder import FeatureBuilder
 from .parity_utils import resample_ohlcv, donchian_upper_days_no_lookahead, eval_meta_scope
 
 from .oi_funding import fetch_series_5m, compute_oi_funding_features, StaleDerivativesDataError
+from .regimes_report import RegimeThresholds
 
 
 import logging
@@ -506,6 +507,13 @@ class LiveTrader:
             # --- NEW: regimes thresholds for deterministic meta feature codes (S2/S3/S4/S6, etc.)
             self.regime_thresholds = self._load_regime_thresholds()
 
+            # RegimeThresholds object required by live/oi_funding.py (attribute access, not dict keys).
+            self.regime_thresholds_obj = None
+            try:
+                self.regime_thresholds_obj = RegimeThresholds(**self.regime_thresholds)
+            except Exception as e:
+                # Fail-closed: if thresholds cannot be constructed, OI/FR features will be omitted.
+                LOG.error("bundle=%s Invalid regime_thresholds (disabling OI/FR features): %s", self.bundle_id, e)
 
             # --- Sprint 2.4: persistent online performance state ---
             try:
@@ -556,16 +564,21 @@ class LiveTrader:
             staleness_max_age = pd.Timedelta(minutes=int(self.cfg.get("DERIV_MAX_AGE_MIN", 30)))
 
             strict = bool(self.cfg.get("STRICT_PARITY_FEATURES", False))
+
+            thr_obj = getattr(self, "regime_thresholds_obj", None)
+            if thr_obj is None:
+                raise ValueError("Regime thresholds object unavailable (RegimeThresholds construction failed)")
+
             feats = compute_oi_funding_features(
                 df5=df5_cut,
                 oi5=oi5,
                 fr5=fr5,
-                thresholds=self.regime_thresholds,
+                thresholds=thr_obj,
                 allow_nans=not strict,
                 staleness_max_age=staleness_max_age,
-            )
-            return feats
 
+            return feats
+            
         except (StaleDerivativesDataError, KeyError, ValueError, TypeError, NotImplementedError) as e:
             LOG.warning("OI/Funding features error for %s at %s: %s", symbol, decision_ts, e)
             return {}
@@ -2211,7 +2224,7 @@ class LiveTrader:
                 meta_full.update(gov_ctx)
 
             # --- Strict-parity: Entry Quality overlay (overwrites critical fields) ---
-            eq_feats = self.feature_builder.compute_entry_quality_features(df5, decision_ts, meta_dir=bundle.meta_dir)
+            eq_feats = self.feature_builder.compute_entry_quality_features(df5, decision_ts)
             meta_full.update(eq_feats)
 
             # --- Strict-parity: regime-set derivations (includes risk_on / risk_on_1 for scope gating) ---
@@ -2221,8 +2234,9 @@ class LiveTrader:
                 LOG.warning("bundle=%s augment_meta_with_regime_sets failed: %s", getattr(self, "bundle_id", "no_bundle"), e)
 
             # ---- Sprint 2 / Option A: freeze macro regime inputs from golden truth ----
-            macro = macro_regimes_asof(self.bundle, decision_ts)
-            meta_full.update(macro)
+            if getattr(self, "meta_bundle", None) is not None:
+                macro = macro_regimes_asof(self.meta_bundle, decision_ts)
+                meta_full.update(macro)
 
             # Keep regime_up consistent with regime_code_1d (if regime_up is still used downstream)
             # (Adjust mapping only if your offline team defines it differently.)
