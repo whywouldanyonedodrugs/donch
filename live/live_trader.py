@@ -4725,20 +4725,21 @@ class LiveTrader:
         # 4) Default
         return "short"
 
-    async def _reporting_loop(self):
 
-        def _ccxt(self):
-            """
-            Return the underlying ccxt exchange instance regardless of whether
-            self.exchange is an ExchangeProxy wrapper or a raw ccxt exchange.
-            """
-            ex = getattr(self.exchange, "_exchange", None)
-            if ex is not None:
-                return ex
-            ex = getattr(self.exchange, "ex", None)
-            if ex is not None:
-                return ex
-            return self.exchange
+    def _ccxt(self):
+        """
+        Return the underlying ccxt exchange instance regardless of whether
+        self.exchange is an ExchangeProxy wrapper or a raw ccxt exchange.
+        """
+        ex = getattr(self.exchange, "_exchange", None)
+        if ex is not None:
+            return ex
+        ex = getattr(self.exchange, "ex", None)
+        if ex is not None:
+            return ex
+        return self.exchange
+
+    async def _reporting_loop(self):
 
         LOG.info("Reporting loop started.")
         last_report_sent = {}
