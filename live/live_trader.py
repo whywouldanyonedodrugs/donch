@@ -401,6 +401,9 @@ class LiveTrader:
         self._listing_dates_cache: Dict[str, datetime.date] = {}
         self.last_exit: Dict[str, datetime] = {}
         self._zero_finalize_backoff: Dict[int, datetime] = {}
+        
+        # In-memory OHLCV cache (keyed by (symbol, tf)); required by _get_ohlcv()
+        self._init_ohlcv_cache()
 
         self._zero_finalize_backoff: Dict[int, datetime] = {}
         self._cancel_cleanup_backoff: Dict[str, datetime] = {}
@@ -649,8 +652,12 @@ class LiveTrader:
         self._ohlcv_cache: dict[tuple[str, str], pd.DataFrame] = {}
 
     async def _get_ohlcv(self, symbol: str, tf: str, min_bars: int) -> Optional[pd.DataFrame]:
+        if not hasattr(self, "_ohlcv_cache"):
+            self._init_ohlcv_cache()
+
         key = (symbol, tf)
         df = self._ohlcv_cache.get(key)
+
 
         if df is None or len(df) < min_bars:
             df = await self._fetch_ohlcv_df_paged(symbol, tf, min_bars)
