@@ -576,9 +576,9 @@ class LiveTrader:
                 thresholds=thr_obj,
                 allow_nans=not strict,
                 staleness_max_age=staleness_max_age,
-
+            )
             return feats
-            
+
         except (StaleDerivativesDataError, KeyError, ValueError, TypeError, NotImplementedError) as e:
             LOG.warning("OI/Funding features error for %s at %s: %s", symbol, decision_ts, e)
             return {}
