@@ -6,6 +6,9 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+import inspect
+
+
 from .regimes_report import RegimeThresholds
 
 

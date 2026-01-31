@@ -1,11 +1,10 @@
 """
-live_trader.py – v4.1 (Clean, YAML sizing + meta gate, robust listing-age)
-=============================================================================
-- Robust UTC-safe listing-age helper (uses cache, then earliest OHLCV bar).
-- Removes utcnow() deprecation warnings (timezone-aware everywhere).
-- Fixes NameError/UnboundLocal (no stray 'sym', no undefined listing_age_days).
-- Filters get the correct listing_age_days from the built signal.
-- Keeps StrategyEngine, YAML scalers, meta-prob gate, DB/Telegram/Bybit V5, etc.
+live_trader.py – v4.2 (Sprint 3.0: Data Clock, Idempotency, Fail-Closed Schema)
+================================================================================
+- Removes wall-clock dependencies (datetime.now) from decisions/orders.
+- Implements "Data Clock" (decision_ts) for deduplication, cooldowns, and timestamps.
+- Deterministic clientOrderId generation via create_entry_cid.
+- Fail-closed validation for required meta features (no NaNs allowed in required cols).
 """
 
 from __future__ import annotations
@@ -18,6 +17,7 @@ import logging
 import os
 import sys
 import traceback
+import hashlib  # Added for deterministic CIDs
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from collections import defaultdict
@@ -75,7 +75,6 @@ REGIME_CODE_MAP = {
     "BULL_HIGH_VOL": 2,
     "BULL_LOW_VOL": 3,
 }
-
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -360,6 +359,7 @@ class LiveTrader:
     def __init__(self, settings: Settings, cfg_dict: Dict[str, Any]):
         self.settings = settings
         self.meta_schema = None  # always defined; assigned after bundle/winprob load if available
+        self._cycle_data_ts: Optional[pd.Timestamp] = None  # Sprint 3.0: Data clock source of truth
 
         # Merge python config defaults (config.py) with YAML overrides into self.cfg
         self.cfg: Dict[str, Any] = {}
@@ -1700,11 +1700,6 @@ class LiveTrader:
         }
         return aliases.get(key_up, key_up)
 
-    @staticmethod
-    def _cid(pid: int, tag: str) -> str:
-        timestamp_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-        return f"bot_{pid}_{tag}_{timestamp_ms}"[:36]
-
     async def _ensure_leverage(self, symbol: str):
         try:
             await self.exchange.set_margin_mode("cross", symbol)
@@ -2192,13 +2187,24 @@ class LiveTrader:
             except Exception:
                 pass
 
-            # Score using the safe wrapper
+            # --- Sprint 3.1: Strict fail-closed schema validation ---
+            # Gate signal immediately if ANY required feature is missing/non-finite
             if required:
-                score_d = self._score_winprob_safe_details(symbol, meta_row)
-                p_cal = score_d.get("p_cal")
-                p_raw = score_d.get("p_raw")
-                schema_ok = score_d.get("schema_ok")
-                meta_err = score_d.get("err")
+                ok_req, miss_req = validate_required_features(meta_row, required)
+                if not ok_req:
+                    schema_ok = False
+                    meta_err = f"missing_required:{miss_req}"
+                    LOG.warning("FEATURE_MISSING bundle=%s symbol=%s decision_ts=%s missing=%s", 
+                                getattr(self, "bundle_id", "no_bundle"), symbol, decision_ts.isoformat(), miss_req)
+                    # Force fail-closed for scoring below
+                    p_cal, p_raw = None, None
+                else:
+                    # Score using the safe wrapper
+                    score_d = self._score_winprob_safe_details(symbol, meta_row)
+                    p_cal = score_d.get("p_cal")
+                    p_raw = score_d.get("p_raw")
+                    schema_ok = score_d.get("schema_ok")
+                    meta_err = score_d.get("err")
             else:
                 # No model loaded or no features required
                 p_cal, p_raw = None, None
@@ -2456,7 +2462,7 @@ class LiveTrader:
             # -------------- Compose Signal object ----------------
             signal_obj = Signal(
                 symbol=symbol,
-                decision_ts=decision_ts,
+                decision_ts=decision_ts,  # Sprint 3.0: Data Clock
                 entry=float(last['close']),
                 atr=float(last['atr_1h']),
                 rsi=float(last['rsi_1h']),
@@ -2775,9 +2781,12 @@ class LiveTrader:
             recent_open = await self.db.pool.fetchval(
                 "SELECT MAX(opened_at) FROM positions WHERE symbol=$1", sig.symbol
             )
-            if recent_open and (datetime.now(timezone.utc) - recent_open) < timedelta(hours=dd_hours):
-                LOG.info("De-dup window: last %s open at %s < %sh → skip.", sig.symbol, recent_open, dd_hours)
-                return
+            # Sprint 3.0: Use data clock (decision_ts) for de-dup window, not wall-clock
+            if recent_open:
+                asof_dt = pd.to_datetime(sig.decision_ts, utc=True).to_pydatetime()
+                if (asof_dt - recent_open) < timedelta(hours=dd_hours):
+                    LOG.info("De-dup window: last %s open at %s < %sh → skip.", sig.symbol, recent_open, dd_hours)
+                    return
         except Exception as _e:
             LOG.warning("De-dup check failed for %s: %s (continuing)", sig.symbol, _e)
 
@@ -3012,7 +3021,8 @@ class LiveTrader:
             return
 
         # --- Entry: market order with unique CID ---
-        entry_cid = create_unique_cid(f"ENTRY_{sig.symbol}")
+        # Sprint 3.0: Deterministic entry CID
+        entry_cid = create_entry_cid(sig.symbol, sig.decision_ts, side_label)
         try:
             await self.exchange.create_market_order(
                 sig.symbol, entry_side, intended_size,
@@ -3052,12 +3062,13 @@ class LiveTrader:
         stop_price = (actual_entry_price - sl_mult * float(sig.atr)) if is_long else (actual_entry_price + sl_mult * float(sig.atr))
 
         # --- Persist to DB (then add order CIDs) ---
-        now = datetime.now(timezone.utc)
+        # Sprint 3.0: Use Data Clock for timestamps
+        opened_at = pd.to_datetime(sig.decision_ts, utc=True).to_pydatetime()
         exit_deadline = None
         if self.cfg.get("TIME_EXIT_HOURS_ENABLED", False):
-            exit_deadline = now + timedelta(hours=int(self.cfg.get("TIME_EXIT_HOURS", 4)))
+            exit_deadline = opened_at + timedelta(hours=int(self.cfg.get("TIME_EXIT_HOURS", 4)))
         elif self.cfg.get("TIME_EXIT_ENABLED", False):
-            exit_deadline = now + timedelta(days=int(self.cfg.get("TIME_EXIT_DAYS", 10)))
+            exit_deadline = opened_at + timedelta(days=int(self.cfg.get("TIME_EXIT_DAYS", 10)))
 
         payload = {
             "symbol": sig.symbol,
@@ -3067,7 +3078,7 @@ class LiveTrader:
             "trailing_active": False,
             "atr": float(sig.atr),
             "status": "OPEN",
-            "opened_at": now,
+            "opened_at": opened_at,
             "exit_deadline": exit_deadline,
             "entry_cid": entry_cid,
             "market_regime_at_entry": sig.market_regime,
@@ -3295,7 +3306,9 @@ class LiveTrader:
 
         if self.cfg.get("TIME_EXIT_ENABLED", cfg.TIME_EXIT_ENABLED):
             ddl = pos.get("exit_deadline")
-            if ddl and datetime.now(timezone.utc) >= ddl:
+            # Sprint 3.0: Use data clock for time exit check
+            asof_dt = pd.to_datetime(self._cycle_data_ts, utc=True).to_pydatetime() if self._cycle_data_ts else None
+            if ddl and asof_dt and asof_dt >= ddl:
                 LOG.info("bundle=%s Time-exit firing on %s (pid %d)", bundle, symbol, pid)
                 await self._force_close_position(pid, pos, tag="TIME_EXIT")
                 return
@@ -3527,7 +3540,16 @@ class LiveTrader:
             avg_exit = (exit_notional / exit_qty_sum) if exit_qty_sum > 0 else entry_price
             closed_at = datetime.fromtimestamp(max(ts for ts, *_ in fills) / 1000.0, tz=timezone.utc)
         else:
-            closed_at = datetime.fromtimestamp(order_last_ts / 1000.0, tz=timezone.utc) if order_last_ts else datetime.now(timezone.utc)
+            # Sprint 3.0: Deterministic close time fallback (last closed 5m bar)
+            try:
+                evt_ts = await self._last_closed_5m_ts(symbol)
+                closed_at = pd.to_datetime(evt_ts, utc=True).to_pydatetime()
+            except Exception:
+                closed_at = opened_at  # deterministic, no wall-clock
+
+            if order_last_ts:
+                closed_at = datetime.fromtimestamp(order_last_ts / 1000.0, tz=timezone.utc)
+
             if exit_price is None:
                 try:
                     tk = await self.exchange.fetch_ticker(symbol)
@@ -3646,7 +3668,14 @@ class LiveTrader:
             exit_price = float((await self.exchange.fetch_ticker(symbol))["last"])
 
         pnl = (entry_price - exit_price) * size if side == "SHORT" else (exit_price - entry_price) * size
-        closed_at = datetime.now(timezone.utc)
+        
+        # Sprint 3.0: Deterministic close time
+        try:
+            evt_ts = await self._last_closed_5m_ts(symbol)
+            closed_at = pd.to_datetime(evt_ts, utc=True).to_pydatetime()
+        except Exception:
+            closed_at = pos.get("opened_at") or datetime.now(timezone.utc)
+
         holding_minutes = (closed_at - pos.get("opened_at", closed_at)).total_seconds()/60.0
 
         await self.db.update_position(
@@ -3688,6 +3717,9 @@ class LiveTrader:
                     raise RuntimeError("GOV_CTX: missing/invalid decision_ts_gov")
 
                 decision_ts_gov = pd.to_datetime(decision_ts_gov, utc=True)
+                
+                # Sprint 3.0: Set Data Clock Source of Truth
+                self._cycle_data_ts = decision_ts_gov
 
                 # Daily regime as-of decision_ts_gov
                 current_market_regime = await self.regime_detector.get_current_regime(decision_ts_gov)
@@ -3726,11 +3758,13 @@ class LiveTrader:
                     if sym in open_symbols:
                         continue
 
-                    # Cooldown fast-skip (existing behavior kept as-is)
+                    # Cooldown fast-skip (Sprint 3.0: Data Clock)
                     cd_h = self.cfg.get("SYMBOL_COOLDOWN_HOURS", cfg.SYMBOL_COOLDOWN_HOURS)
                     last_x = self.last_exit.get(sym)
-                    if last_x and datetime.now(timezone.utc) - last_x < timedelta(hours=cd_h):
-                        continue
+                    if last_x:
+                        asof_dt = pd.to_datetime(self._cycle_data_ts, utc=True).to_pydatetime()
+                        if (asof_dt - last_x) < timedelta(hours=cd_h):
+                            continue
 
                     async with self.symbol_locks[sym]:
                         # Pre-flight: skip if exchange already has a position
@@ -4487,7 +4521,7 @@ class LiveTrader:
         self._listing_dates_cache = await self._load_listing_dates()
 
         await self._resume()
-        await self.tg.send("DONCH v2.1.2 (sprint 2) started successfully.")
+        await self.tg.send("DONCH v4.2 (Sprint 3.0) started successfully.")
 
         try:
             async with asyncio.TaskGroup() as tg:
@@ -4599,11 +4633,38 @@ class LiveTrader:
 # Helpers (module-level)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def create_unique_cid(tag: str) -> str:
-    """Unique client order ID for entries."""
-    timestamp_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    random_suffix = secrets.token_hex(2)
-    return f"bot_{tag}_{timestamp_ms}_{random_suffix}"[:36]
+def create_entry_cid(symbol: str, decision_ts: pd.Timestamp, side: str, tag: str = "ENTRY") -> str:
+    """
+    Deterministic client order ID for entry orders.
+    Stable across retries/restarts for same (symbol, decision_ts, side, tag).
+    Sprint 3.0: Replaces wall-clock random logic.
+    """
+    ts = pd.to_datetime(decision_ts, utc=True).strftime("%Y%m%d%H%M")
+    sym8 = str(symbol).replace("/", "").upper()[:8]
+    side1 = "L" if str(side).upper().startswith("L") else "S"
+    base = f"{tag}|{symbol}|{side}|{ts}"
+    h = hashlib.sha1(base.encode("utf-8")).hexdigest()[:8]
+    return f"bot_{tag}{sym8}{side1}{ts}{h}"[:36]
+
+def validate_required_features(row: dict, required: list) -> tuple[bool, list]:
+    """
+    Fail-closed feature validation (Sprint 3.1).
+    Returns (True, []) if all present and finite.
+    Returns (False, [missing_keys]) if any missing or NaN/Inf.
+    """
+    missing = []
+    for k in required:
+        val = row.get(k)
+        if val is None:
+            missing.append(k)
+            continue
+        try:
+            f = float(val)
+            if not math.isfinite(f):
+                missing.append(k)
+        except (ValueError, TypeError):
+            missing.append(k)
+    return (len(missing) == 0), missing
 
 def create_stable_cid(pid: int, tag: str) -> str:
     """Stable client order ID for SL/TP."""
