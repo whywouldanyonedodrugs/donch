@@ -220,11 +220,17 @@ def compute_entry_quality_required_features(
     don_5m = don_daily.reindex(idx, method="ffill")
 
     touch = high >= don_5m
-    last_touch_ts = pd.Series(pd.NaT, index=idx)
+
+    # IMPORTANT: if we initialize with all-NaT without dtype, pandas may create a tz-naive series.
+    # That breaks subtraction vs tz-aware idx (UTC). Force dtype to match idx.
+    last_touch_ts = pd.Series(pd.NaT, index=idx, dtype=idx.dtype)
     if touch.any():
-        last_touch_ts.loc[touch] = idx[touch.values]
+        last_touch_ts.loc[touch] = idx[touch.to_numpy()]
     last_touch_ts = last_touch_ts.ffill()
-    days_since_prev_break = (idx - last_touch_ts).total_seconds() / 86400.0
+
+    # Subtract as Series to use .dt safely
+    idx_s = idx.to_series()
+    days_since_prev_break = (idx_s - last_touch_ts).dt.total_seconds() / 86400.0
 
     # 5) don_break_level (daily Donch upper, shifted +1 day before join to 5m)
     daily_close = close.resample("1D").last()
