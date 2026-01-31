@@ -1475,8 +1475,6 @@ class LiveTrader:
             blob = {
                 # TTL uses this field (data clock)
                 "computed_asof_ts": computed_asof,
-                # Optional audit only; NEVER used for TTL decisions
-                "computed_at_wall": datetime.now(timezone.utc).isoformat(),
                 "symbols": list(self.symbols),
                 "data": data,
             }
@@ -3977,13 +3975,65 @@ class LiveTrader:
             LOG.info("Scan cycle complete. Sleeping…")
             await asyncio.sleep(self.cfg.get("SCAN_INTERVAL_SEC", 60))
 
+    async def _data_clock_now(self, preferred_symbol: str | None = None) -> datetime | None:
+        """
+        Return a timezone-aware datetime derived from data timestamps (no wall-clock).
+
+        Priority:
+          1) self._cycle_asof_ts (scan-loop gov clock)
+          2) last closed 5m bar for preferred_symbol (or cfg EQUITY_CLOCK_SYMBOL / BTCUSDT)
+          3) latest equity_snapshots.ts in DB
+          4) latest positions.closed_at in DB
+        """
+        # 1) Cycle data clock (preferred)
+        asof_ts = getattr(self, "_cycle_asof_ts", None)
+        if asof_ts is not None and not pd.isna(asof_ts):
+            try:
+                return pd.to_datetime(asof_ts, utc=True).to_pydatetime()
+            except Exception:
+                pass
+
+        # 2) Last closed 5m bar on a canonical symbol (still data-derived)
+        sym = preferred_symbol
+        if not sym:
+            sym = str(self.cfg.get("EQUITY_CLOCK_SYMBOL", "") or "").strip() or "BTCUSDT"
+        try:
+            ts = await self._last_closed_5m_ts(sym)
+            if ts is not None and not pd.isna(ts):
+                return pd.to_datetime(ts, utc=True).to_pydatetime()
+        except Exception:
+            pass
+
+        # 3–4) DB-derived fallbacks (still not wall-clock)
+        try:
+            if getattr(self, "db", None) is not None and getattr(self.db, "pool", None) is not None:
+                ts = await self.db.pool.fetchval("SELECT ts FROM equity_snapshots ORDER BY ts DESC LIMIT 1")
+                if ts:
+                    return pd.to_datetime(ts, utc=True).to_pydatetime()
+
+                ts = await self.db.pool.fetchval(
+                    "SELECT closed_at FROM positions "
+                    "WHERE status='CLOSED' AND closed_at IS NOT NULL "
+                    "ORDER BY closed_at DESC LIMIT 1"
+                )
+                if ts:
+                    return pd.to_datetime(ts, utc=True).to_pydatetime()
+        except Exception:
+            pass
+
+        return None
 
     async def _equity_loop(self):
         while True:
             try:
                 bal = await self._fetch_platform_balance()
                 current_equity = bal["total"].get("USDT", 0.0)
-                await self.db.snapshot_equity(current_equity, datetime.now(timezone.utc))
+
+                clock_dt = await self._data_clock_now()
+                if clock_dt is None:
+                    LOG.warning("Equity snapshot skipped: no data-derived clock available.")
+                else:
+                    await self.db.snapshot_equity(current_equity, clock_dt)
 
                 if current_equity > self.peak_equity:
                     self.peak_equity = current_equity
@@ -4389,7 +4439,9 @@ class LiveTrader:
         LOG.info("<-- Resume complete.")
 
     async def _generate_summary_report(self, period: str) -> str:
-        now = datetime.now(timezone.utc)
+        now = await self._data_clock_now()
+        if now is None:
+            return "Error: no data-derived clock available for reporting."
         period_map = {
             '6h': timedelta(hours=6),
             'daily': timedelta(days=1),
@@ -4455,7 +4507,10 @@ class LiveTrader:
         Uses equity_snapshots when available (preferred for CAGR/Sharpe/MAR),
         otherwise synthesizes an equity curve from closed trades.
         """
-        now = datetime.now(timezone.utc)
+        now = await self._data_clock_now()
+        if now is None:
+            return "Error: no data-derived clock available for reporting."
+
         window_map = {
             '6h': timedelta(hours=6),
             'daily': timedelta(days=1),
@@ -4672,7 +4727,9 @@ class LiveTrader:
         last_report_sent = {}
         while True:
             await asyncio.sleep(60 * 5)
-            now = datetime.now(timezone.utc)
+            now = await self._data_clock_now()
+            if now is None:
+                continue
             periods_to_check = {
                 '6h': now.hour % 6 == 0,
                 'daily': now.hour == 0,
