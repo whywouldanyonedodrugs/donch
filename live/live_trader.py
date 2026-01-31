@@ -1409,28 +1409,42 @@ class LiveTrader:
         return d["p_cal"] if d.get("schema_ok") else None
 
 
-    def _load_universe_cache_if_fresh(self) -> Optional[dict]:
-        """Return {symbol: {rs_pct, median_24h_turnover_usd}} if cache exists & fresh & symbols match."""
+    def _load_universe_cache_if_fresh(self, asof_ts: pd.Timestamp | None = None) -> Optional[dict]:
+        """Return {symbol: {rs_pct, median_24h_turnover_usd}} if cache exists & fresh & symbols match.
+
+        IMPORTANT: freshness is evaluated in DATA TIME (decision_ts), not wall-clock.
+        If no data-derived asof_ts is available, treat cache as not usable.
+        """
         if not bool(self.cfg.get("UNIVERSE_CACHE_ENABLED", True)):
             return None
         p = Path(self.cfg.get("UNIVERSE_CACHE_PATH", UNIVERSE_CACHE_PATH))
         if not p.exists():
             return None
+
+        # Determine data clock for TTL comparisons.
+        asof = pd.to_datetime(
+            asof_ts if asof_ts is not None else getattr(self, "_cycle_asof_ts", None),
+            utc=True,
+            errors="coerce",
+        )
+        if asof is pd.NaT or pd.isna(asof):
+            return None
+
         try:
             raw = json.loads(p.read_text())
             ttl_min = int(self.cfg.get("UNIVERSE_CACHE_TTL_MIN", 1440))  # default: 24h
-            ts = raw.get("computed_at")
+
+            # Prefer data-clock timestamp; fall back to legacy key if present.
+            ts = raw.get("computed_asof_ts") or raw.get("computed_at")
             if not ts:
                 return None
-            # tolerate "Z" suffix or naive
-            try:
-                computed_at = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-            except Exception:
-                computed_at = datetime.fromisoformat(ts)
-            if computed_at.tzinfo is None:
-                computed_at = computed_at.replace(tzinfo=timezone.utc)
 
-            if datetime.now(timezone.utc) - computed_at > timedelta(minutes=ttl_min):
+            computed_at = pd.to_datetime(str(ts).replace("Z", "+00:00"), utc=True, errors="coerce")
+            if computed_at is pd.NaT or pd.isna(computed_at):
+                return None
+
+            # DATA-TIME TTL check (no wall-clock leakage)
+            if (asof - computed_at) > pd.Timedelta(minutes=ttl_min):
                 return None
 
             if bool(self.cfg.get("UNIVERSE_CACHE_REQUIRE_SYMBOLS_MATCH", True)):
@@ -1444,13 +1458,25 @@ class LiveTrader:
             LOG.warning("Universe cache load failed: %s", e)
             return None
 
-    def _save_universe_cache(self, data: dict) -> None:
+
+    def _save_universe_cache(self, data: dict, asof_ts: pd.Timestamp | None = None) -> None:
+        """Persist universe cache with a DATA-TIME timestamp for TTL comparisons."""
         if not bool(self.cfg.get("UNIVERSE_CACHE_ENABLED", True)):
             return
         p = Path(self.cfg.get("UNIVERSE_CACHE_PATH", UNIVERSE_CACHE_PATH))
         try:
+            asof = pd.to_datetime(
+                asof_ts if asof_ts is not None else getattr(self, "_cycle_asof_ts", None),
+                utc=True,
+                errors="coerce",
+            )
+            computed_asof = None if (asof is pd.NaT or pd.isna(asof)) else asof.isoformat()
+
             blob = {
-                "computed_at": datetime.now(timezone.utc).isoformat(),
+                # TTL uses this field (data clock)
+                "computed_asof_ts": computed_asof,
+                # Optional audit only; NEVER used for TTL decisions
+                "computed_at_wall": datetime.now(timezone.utc).isoformat(),
                 "symbols": list(self.symbols),
                 "data": data,
             }
@@ -1458,6 +1484,7 @@ class LiveTrader:
             LOG.info("Universe context cached to %s (%d symbols).", p, len(data))
         except Exception as e:
             LOG.warning("Failed to write universe cache: %s", e)
+
 
 
     async def _build_universe_context(self) -> dict[str, dict]:
@@ -1631,8 +1658,28 @@ class LiveTrader:
             ts = pd.to_datetime(asof_ts, utc=True, errors="coerce")
             if ts is not pd.NaT and not pd.isna(ts):
                 today = ts.date()
+
+        # If asof_ts not provided, derive from the most recent bar in dfs (data-derived).
+        if today is None and dfs:
+            try:
+                if "1d" in dfs and isinstance(dfs["1d"], pd.DataFrame) and not dfs["1d"].empty:
+                    today = pd.to_datetime(dfs["1d"].index[-1], utc=True).date()
+                else:
+                    latest = None
+                    for df in dfs.values():
+                        if isinstance(df, pd.DataFrame) and (not df.empty):
+                            t = pd.to_datetime(df.index[-1], utc=True, errors="coerce")
+                            if t is not pd.NaT and not pd.isna(t):
+                                if latest is None or t > latest:
+                                    latest = t
+                    if latest is not None:
+                        today = latest.date()
+            except Exception:
+                today = None
+
+        # Fail-closed: do not use wall-clock.
         if today is None:
-            today = datetime.now(timezone.utc).date()
+            return None
 
         # 1) cache
         d = self._listing_dates_cache.get(symbol)
@@ -1641,6 +1688,7 @@ class LiveTrader:
                 return (today - d).days
             except Exception:
                 pass
+
 
         # 2) infer from dataframes (earliest bar)
         if dfs:
@@ -3390,7 +3438,29 @@ class LiveTrader:
                 LOG.warning("bundle=%s Failed to fetch TP1 order %s for %s: %s", bundle, pos["tp1_cid"], symbol, e)
 
             if (filled_qty or 0.0) > 0.0 and (fill_price is not None):
-                await self.db.add_fill(pid, "TP1", float(fill_price), float(filled_qty), datetime.now(timezone.utc))
+                # Prefer exchange timestamp; otherwise use data clock (cycle asof / last closed 5m).
+                fill_ts = None
+                try:
+                    ts_ms = o.get("timestamp") or o.get("lastTradeTimestamp") or o.get("lastUpdateTimestamp")
+                    if ts_ms:
+                        fill_ts = datetime.fromtimestamp(int(ts_ms) / 1000.0, tz=timezone.utc)
+                except Exception:
+                    fill_ts = None
+
+                if fill_ts is None:
+                    asof_ts = getattr(self, "_cycle_asof_ts", None)
+                    if asof_ts is None:
+                        try:
+                            asof_ts = await self._last_closed_5m_ts(symbol)
+                        except Exception:
+                            asof_ts = None
+                    if asof_ts is not None and not pd.isna(asof_ts):
+                        fill_ts = pd.to_datetime(asof_ts, utc=True).to_pydatetime()
+                    else:
+                        # last resort: use opened_at (should already be data-derived)
+                        fill_ts = pos.get("opened_at")
+
+                await self.db.add_fill(pid, "TP1", float(fill_price), float(filled_qty), fill_ts)
                 await self.db.update_position(pid, trailing_active=True)
                 pos["trailing_active"] = True
                 trailing_active = True
@@ -3728,12 +3798,21 @@ class LiveTrader:
 
         evt_ts = await self._last_closed_5m_ts(symbol)
         if evt_ts is None or pd.isna(evt_ts):
-            closed_at = pos.get("opened_at", datetime.now(timezone.utc))  # should already be data-derived
+            # No wall-clock fallback. Prefer opened_at; if missing, use exchange trade timestamp if available.
+            closed_at = pos.get("opened_at")
+            if closed_at is None:
+                try:
+                    if closing_trade and closing_trade.get("timestamp"):
+                        closed_at = datetime.fromtimestamp(int(closing_trade["timestamp"]) / 1000.0, tz=timezone.utc)
+                except Exception:
+                    closed_at = None
+            if closed_at is None:
+                # last resort (should be unreachable in normal operation): use opened_at again
+                closed_at = pos.get("opened_at")
         else:
             closed_at = pd.to_datetime(evt_ts, utc=True).to_pydatetime()
 
         holding_minutes = (closed_at - pos.get("opened_at", closed_at)).total_seconds() / 60.0
-
 
         await self.db.update_position(
             pid, status="CLOSED", closed_at=closed_at, pnl=pnl,
@@ -3741,7 +3820,6 @@ class LiveTrader:
         )
         await self.db.add_fill(pid, tag, exit_price, size, closed_at)
         await self.risk.on_trade_close(pnl, self.tg)
-
 
         # Sprint 2.4: record outcome (ts derived from last closed 5m bar; no wall-clock)
         try:
@@ -3915,17 +3993,33 @@ class LiveTrader:
         Finalize a position whose exchange size is zero.
         Single source of truth for zero-size finalization to avoid divergent code paths.
         """
-        bundle = getattr(self, "bundle_id", None) or "no_bundle"
-        now = datetime.now(timezone.utc)
+         bundle = getattr(self, "bundle_id", None) or "no_bundle"
+
+        # Data-time debounce (no wall-clock leakage)
+        asof_ts = getattr(self, "_cycle_asof_ts", None)
+        if asof_ts is None:
+            try:
+                asof_ts = await self._last_closed_5m_ts(symbol)
+            except Exception:
+                asof_ts = None
+
+        now = None
+        if asof_ts is not None and not pd.isna(asof_ts):
+            now = pd.to_datetime(asof_ts, utc=True).to_pydatetime()
+        else:
+            # last resort: use opened_at (should be data-derived); if missing, skip debounce
+            now = pos.get("opened_at")
 
         # Debounce finalize attempts
         if not hasattr(self, "_zero_finalize_backoff"):
             self._zero_finalize_backoff = {}
         last_try = self._zero_finalize_backoff.get(pid)
-        if last_try and (now - last_try).total_seconds() < float(self.cfg.get("FINALIZE_BACKOFF_SEC", 120)):
+        if now is not None and last_try and (now - last_try).total_seconds() < float(self.cfg.get("FINALIZE_BACKOFF_SEC", 120)):
             LOG.info("bundle=%s Position size is 0 for %s; finalize debounced.", bundle, symbol)
             return
-        self._zero_finalize_backoff[pid] = now
+        if now is not None:
+            self._zero_finalize_backoff[pid] = now
+
 
         # Infer exit reason by checking our known clientOrderIds
         exit_kind = "MANUAL_CLOSE"
@@ -4157,7 +4251,6 @@ class LiveTrader:
         # 2) Reconcile & identify valid order CIDs
         LOG.info("Reconciling and identifying valid protective orders…")
         valid_cids = set()
-        now_utc = datetime.now(timezone.utc)
 
         for symbol, pos_data in open_exchange_positions.items():
             if symbol not in db_positions:
@@ -4172,10 +4265,27 @@ class LiveTrader:
                     LOG.error("Failed to force-close orphan position %s: %s", symbol, e)
 
         for symbol, pos_row in list(db_positions.items()):
-            pid = pos_row["id"]
             if symbol not in open_exchange_positions:
                 LOG.warning("DB/EX mismatch: %s OPEN in DB but not on exchange. Closing in DB.", symbol)
-                await self.db.update_position(pid, status="CLOSED", closed_at=now_utc, pnl=0, exit_reason="RECONCILE_CLOSE")
+
+                # Data-derived closed_at: use last closed 5m bar if available; else fall back to opened_at.
+                closed_at_dt = None
+                try:
+                    evt_ts = await self._last_closed_5m_ts(symbol)
+                    if evt_ts is not None and not pd.isna(evt_ts):
+                        closed_at_dt = pd.to_datetime(evt_ts, utc=True).to_pydatetime()
+                except Exception:
+                    closed_at_dt = None
+                if closed_at_dt is None:
+                    closed_at_dt = pos_row.get("opened_at")
+
+                await self.db.update_position(
+                    pid,
+                    status="CLOSED",
+                    closed_at=closed_at_dt,
+                    pnl=0,
+                    exit_reason="RECONCILE_CLOSE",
+                )
                 del db_positions[symbol]
                 continue
 
@@ -4243,11 +4353,14 @@ class LiveTrader:
 
         LOG.info("Loading recent exit timestamps for cooldowns…")
         cd_h = int(self.cfg.get("SYMBOL_COOLDOWN_HOURS", cfg.SYMBOL_COOLDOWN_HOURS))
+
         rows = await self.db.pool.fetch(
-            "SELECT symbol, closed_at FROM positions "
-            "WHERE status='CLOSED' AND closed_at > (NOW() AT TIME ZONE 'utc') - $1::interval",
-            timedelta(hours=cd_h),
-        )
+            "SELECT DISTINCT ON (symbol) symbol, closed_at "
+            "FROM positions "
+            "WHERE status='CLOSED' AND closed_at IS NOT NULL "
+            "ORDER BY symbol, closed_at DESC"
+        )           
+
         for r in rows:
             self.last_exit[r["symbol"]] = r["closed_at"]
 
