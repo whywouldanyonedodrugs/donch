@@ -37,6 +37,18 @@ except ImportError:
 __all__ = ["ema", "atr", "rsi", "macd", "bollinger", "lbr_310", "adx"]
 
 
+def sma(x: pd.Series, length: int) -> pd.Series:
+    """
+    Simple moving average.
+    Returns a Series aligned to x's index with NaN until `length` observations exist.
+    """
+    length = int(length)
+    if length <= 0:
+        raise ValueError("length must be > 0")
+    s = pd.to_numeric(x, errors="coerce").astype(float)
+    return s.rolling(length, min_periods=length).mean()
+
+
 def ema(series: pd.Series, span: int) -> pd.Series:
     if _HAS_TA:
         return pd.Series(talib.EMA(series, timeperiod=span), index=series.index)
