@@ -3003,7 +3003,7 @@ class LiveTrader:
         intended_size = max(risk_usd / stop_dist, 0.0)
 
         try:
-            mkt = self.exchange._exchange.market(sig.symbol)  # unified market
+            mkt = self._ccxt().market(sig.symbol)  # unified market
         except Exception:
             mkt = None
 
@@ -3021,9 +3021,10 @@ class LiveTrader:
         # Round to precision grid first (truncates down), then bump up if below min
         size_prec = intended_size
         try:
-            size_prec = float(self.exchange._exchange.amount_to_precision(sig.symbol, intended_size))
+            size_prec = float(self._ccxt().amount_to_precision(sig.symbol, intended_size))
         except Exception:
             pass
+
 
         # If the precision rounding pushed us below min amount, bump to min (or ceil to the next step)
         def _ceil_to_step(x: float, step: Optional[float]) -> float:
@@ -3075,7 +3076,7 @@ class LiveTrader:
 
         # Final safety: re-apply ccxt precision to the adjusted size
         try:
-            size_prec = float(self.exchange._exchange.amount_to_precision(sig.symbol, size_prec))
+            size_prec = float(self._ccxt().amount_to_precision(sig.symbol, size_prec))
         except Exception:
             pass
 
@@ -4725,6 +4726,20 @@ class LiveTrader:
         return "short"
 
     async def _reporting_loop(self):
+
+        def _ccxt(self):
+            """
+            Return the underlying ccxt exchange instance regardless of whether
+            self.exchange is an ExchangeProxy wrapper or a raw ccxt exchange.
+            """
+            ex = getattr(self.exchange, "_exchange", None)
+            if ex is not None:
+                return ex
+            ex = getattr(self.exchange, "ex", None)
+            if ex is not None:
+                return ex
+            return self.exchange
+
         LOG.info("Reporting loop started.")
         last_report_sent = {}
         while True:
@@ -4767,8 +4782,10 @@ class LiveTrader:
             LOG.warning("="*60)
 
         LOG.info("Loading exchange markets…")
+        LOG.info("exchange obj=%s", type(self.exchange))
+
         try:
-            await self.exchange._exchange.load_markets()
+            await self._ccxt().load_markets()
             LOG.info("Markets loaded.")
         except Exception as e:
             LOG.error("Could not load markets: %s. Exiting.", e)
