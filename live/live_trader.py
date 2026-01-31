@@ -1768,8 +1768,7 @@ class LiveTrader:
 
     @staticmethod
     def _cid(pid: int, tag: str) -> str:
-        timestamp_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-        return f"bot_{pid}_{tag}_{timestamp_ms}"[:36]
+        raise RuntimeError("_cid() is deprecated; use deterministic create_stable_cid/create_entry_cid.")
 
     async def _ensure_leverage(self, symbol: str):
         try:
@@ -3373,16 +3372,31 @@ class LiveTrader:
                 position_size = float(positions[0].get("info", {}).get("size", 0))
 
             if position_size == 0:
-                # 1) Sweep & cancel stale reduce-only/children (throttled)
+                # 1) Sweep & cancel stale reduce-only/children (throttled, data-clock)
                 if not hasattr(self, "_cancel_cleanup_backoff"):
                     self._cancel_cleanup_backoff = {}
-                _now = datetime.now(timezone.utc)
-                _last_cancel = self._cancel_cleanup_backoff.get(symbol)
-                if (not _last_cancel) or (_now - _last_cancel).total_seconds() >= float(self.cfg.get("CANCEL_CLEANUP_BACKOFF_SEC", 180)):
+
+                # Use cycle data clock; if unavailable, fall back to last closed 5m bar for this symbol.
+                asof_ts = getattr(self, "_cycle_asof_ts", None)
+                if asof_ts is None:
                     try:
-                        await self._cancel_reducing_orders(symbol, pos)
-                    finally:
-                        self._cancel_cleanup_backoff[symbol] = _now
+                        asof_ts = await self._last_closed_5m_ts(symbol)
+                    except Exception:
+                        asof_ts = None
+
+                if asof_ts is not None and not pd.isna(asof_ts):
+                    now_ts = pd.to_datetime(asof_ts, utc=True)
+                    last_ts = self._cancel_cleanup_backoff.get(symbol)
+                    last_ts = pd.to_datetime(last_ts, utc=True, errors="coerce") if last_ts is not None else None
+
+                    backoff_sec = float(self.cfg.get("CANCEL_CLEANUP_BACKOFF_SEC", 180))
+                    should_run = (last_ts is None) or ((now_ts - last_ts) >= pd.Timedelta(seconds=backoff_sec))
+
+                    if should_run:
+                        try:
+                            await self._cancel_reducing_orders(symbol, pos)
+                        finally:
+                            self._cancel_cleanup_backoff[symbol] = now_ts
 
                 # 2) Single finalize path for zero-size positions
                 LOG.info("bundle=%s Position size for %s is 0. Finalizing via _finalize_zero_position_safe…", bundle, symbol)
