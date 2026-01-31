@@ -503,7 +503,18 @@ class LiveTrader:
             try:
                 state_path = str(self.cfg.get("ONLINE_STATE_PATH", "results/online_state.jsonl"))
                 max_records = int(self.cfg.get("ONLINE_STATE_MAX_RECORDS", 2000))
-                self.online_state = OnlinePerformanceState(path=state_path, max_records=max_records)
+                cold_raw = self.cfg.get("ONLINE_STATE_COLDSTART_WINRATE", 0.25)
+                try:
+                    cold_f = float(cold_raw)
+                except Exception:
+                    cold_f = 0.25
+
+                self.online_state = OnlinePerformanceState(
+                    path=state_path,
+                    max_records=max_records,
+                    cold_start_winrate=cold_f,
+                )
+               
             except Exception as e:
                 LOG.warning("bundle=%s OnlinePerformanceState init failed (disabling): %s", getattr(self, "bundle_id", None) or "no_bundle", e)
                 self.online_state = None
@@ -576,8 +587,19 @@ class LiveTrader:
             tf_ms = int(_tf_to_timedelta(tf).total_seconds() * 1000)
 
             need = int(limit) + 2  # +2 for safety; we drop last bar later
-            since = None
             rows: list[list] = []
+
+            # Start far enough back to cover `need` candles.
+            # Bybit returns the most recent candles when since=None; so we must anchor since in the past.
+            try:
+                now_ms = int(self.exchange.milliseconds())
+            except Exception:
+                import time
+                now_ms = int(time.time() * 1000)
+
+            # Extra buffer helps if the exchange drops a few candles around boundaries.
+            start_ms = now_ms - int((need + page_limit) * tf_ms)
+            since = start_ms
 
             while len(rows) < need:
                 batch = await self.exchange.fetch_ohlcv(symbol, tf, since=since, limit=min(page_limit, need - len(rows)))
@@ -593,6 +615,7 @@ class LiveTrader:
 
                 rows.extend(batch)
                 since = rows[-1][0] + tf_ms
+
 
             if len(rows) < 2:
                 return None
@@ -809,8 +832,11 @@ class LiveTrader:
         """
         # Fetch 5m OHLCV for BTC/ETH
         df_btc, df_eth = await asyncio.gather(
-            self._fetch_ohlcv_df_simple("BTCUSDT", "5m", limit=1500),
-            self._fetch_ohlcv_df_simple("ETHUSDT", "5m", limit=1500),
+            days = int(self.cfg.get("GOV_CTX_DAYS_5M", 60))
+            min_bars = days * 288 + 500
+            self._fetch_ohlcv_df_paged("BTCUSDT", "5m", limit=min_bars),
+            self._fetch_ohlcv_df_paged("ETHUSDT", "5m", limit=min_bars),
+
             return_exceptions=False,
         )
 
