@@ -7,7 +7,7 @@ from typing import Dict, Optional
 
 from . import indicators as ta
 from .indicators import vwap_stack_features
-
+from .macro_offline_parity import compute_entry_quality_required_features
 
 def _resample_ohlcv(df5: pd.DataFrame, rule: str) -> pd.DataFrame:
     """
@@ -173,6 +173,10 @@ class FeatureBuilder:
                     out["gap_from_1d_ma"] = float("nan")
             except Exception:
                 out["gap_from_1d_ma"] = float("nan")
+
+        # --- Offline-parity required entry-quality features (strict definitions) ---
+        req_eq = compute_entry_quality_required_features(df5, decision_ts, cfg=self.cfg)
+        out.update(req_eq)
 
         # -------- Prebreak congestion (expected name)
         try:

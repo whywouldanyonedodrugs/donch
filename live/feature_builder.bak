@@ -1,200 +1,309 @@
 # live/feature_builder.py
 from __future__ import annotations
 
-import logging
-from pathlib import Path
-from typing import Dict, Any, Optional
-
 import numpy as np
 import pandas as pd
-
-from live.regime_truth import macro_regimes_asof
+from typing import Dict, Optional
 
 from . import indicators as ta
-from .parity_utils import resample_ohlcv, map_to_left_index, donchian_upper_days_no_lookahead
+from .indicators import vwap_stack_features
+from .macro_offline_parity import compute_entry_quality_required_features
 
-from live.regimes_report import load_regime_thresholds
-from live.oi_funding import oi_funding_features_at_decision, StaleDerivativesDataError
+def _resample_ohlcv(df5: pd.DataFrame, rule: str) -> pd.DataFrame:
+    """
+    Deterministic resample of 5m OHLCV to a higher timeframe.
+    Bars are labeled at the RIGHT edge and closed on the RIGHT edge, matching live strict-par conventions.
+    """
+    o = df5["open"].resample(rule, label="right", closed="right").first()
+    h = df5["high"].resample(rule, label="right", closed="right").max()
+    l = df5["low"].resample(rule, label="right", closed="right").min()
+    c = df5["close"].resample(rule, label="right", closed="right").last()
+    v = df5["volume"].resample(rule, label="right", closed="right").sum()
+    out = pd.DataFrame({"open": o, "high": h, "low": l, "close": c, "volume": v})
+    out = out.dropna()
+    return out
 
 
-LOG = logging.getLogger("feature_builder")
+def _last_ts_asof(df: pd.DataFrame, decision_ts: pd.Timestamp) -> Optional[pd.Timestamp]:
+    sub = df.loc[df.index <= decision_ts]
+    if sub.empty:
+        return None
+    return sub.index[-1]
 
+def _prebreak_congestion_atr_15m(
+    df5: pd.DataFrame,
+    decision_ts: pd.Timestamp,
+    atr_len: int,
+    lookback_bars_15m: int,
+) -> Optional[float]:
+    """
+    Deterministic, as-of decision_ts:
+    - Resample 5m -> 15m with label='right', closed='right'
+    - Take last closed 15m bar <= decision_ts
+    - Compute (max(high)-min(low)) over last N 15m bars
+    - Divide by ATR(15m, atr_len) at that as-of 15m timestamp
+    """
+    if df5 is None or df5.empty:
+        return None
+
+    df15 = _resample_ohlcv(df5, "15min")
+    ts15 = _last_ts_asof(df15, decision_ts)
+    if ts15 is None:
+        return None
+
+    win = df15.loc[:ts15].tail(int(lookback_bars_15m))
+    if win.empty:
+        return None
+
+    rng = float(win["high"].max() - win["low"].min())
+    if not np.isfinite(rng):
+        return None
+
+    try:
+        atr15 = ta.atr(df15[["open", "high", "low", "close"]], int(atr_len))
+        a = float(atr15.loc[ts15])
+    except Exception:
+        return None
+
+    if (not np.isfinite(a)) or a == 0.0:
+        return None
+
+    return float(rng / a)
 
 class FeatureBuilder:
     """
-    Strict-parity feature builder.
-    Computes specific feature families using exact offline semantics.
+    Deterministic feature computations for live strict-par meta rows.
+    All features must be computed "as-of decision_ts" with no wall-clock leakage.
     """
 
-    def __init__(self, cfg: Dict[str, Any]):
-        self.cfg = cfg
-        self.atr_len = int(cfg.get("ATR_LEN", 14))
-        self.rsi_len = int(cfg.get("RSI_LEN", 14))
-        self.adx_len = int(cfg.get("ADX_LEN", 14))
-        self.vol_lookback = int(cfg.get("VOL_LOOKBACK_DAYS", 30))
-        self.don_days = int(cfg.get("DON_N_DAYS", 20))
-        self.pullback_win = int(cfg.get("PULLBACK_WINDOW_BARS", 12))
+    def __init__(self, cfg: dict, logger=None):
+        self.cfg = cfg or {}
+        self.log = logger
 
-        # thresholds cache (bundle-specific; keyed by meta_dir)
-        self._thr_meta_dir: Optional[Path] = None
-        self._thr_obj = None
-
-    def _get_regime_thresholds(self, meta_dir: Path):
-        meta_dir = Path(meta_dir).resolve()
-        if self._thr_meta_dir is None or self._thr_obj is None or meta_dir != self._thr_meta_dir:
-            self._thr_obj = load_regime_thresholds(meta_dir)
-            self._thr_meta_dir = meta_dir
-        return self._thr_obj
+    def _days_since_last_break(self, break_series: pd.Series, asof_day: pd.Timestamp) -> float:
+        """
+        days since most recent True in break_series up to asof_day (inclusive).
+        Returns NaN if no break exists in available history.
+        """
+        try:
+            s = break_series.loc[:asof_day]
+            if s.empty:
+                return float("nan")
+            idx = s[s.astype(bool)].index
+            if len(idx) == 0:
+                return float("nan")
+            last_break = idx[-1]
+            return float((asof_day - last_break).days)
+        except Exception:
+            return float("nan")
 
     def compute_entry_quality_features(self, df5: pd.DataFrame, decision_ts: pd.Timestamp) -> Dict[str, float]:
         """
-        Computes 'Entry Quality' features for the bar at decision_ts.
-        Matches scout.py logic exactly (rolling windows, min_periods, NaNs).
+        Computes per-symbol features from 5m history at decision_ts:
+          - Donchian-related: don_break_level, don_dist_atr, days_since_prev_break
+          - VWAP stack metrics (already used elsewhere)
+          - Prebreak congestion (aliased to expected name)
+          - Gap from 1D MA (expected name)
+          - Asset multi-TF indicators (expected names):
+              asset_rsi_15m, asset_rsi_4h,
+              asset_macd_line_1h, asset_macd_signal_1h, asset_macd_hist_1h, asset_macd_slope_1h,
+              asset_macd_line_4h, asset_macd_signal_4h, asset_macd_hist_4h, asset_macd_slope_4h,
+              asset_vol_1h, asset_vol_4h
         """
         out: Dict[str, float] = {}
 
-        if df5.empty or decision_ts not in df5.index:
+        if df5 is None or df5.empty:
             return out
 
-        bars_per_day = 288
+        # Ensure sorted index
+        df5 = df5.sort_index()
+        df5 = df5.loc[df5.index <= decision_ts]
+        if df5.empty:
+            return out
 
-        # --- 1) 1h Context (ATR, RSI, ADX) ---
-        df1h = resample_ohlcv(df5, "1h")
-        if not df1h.empty:
-            atr1h_s = ta.atr(df1h, self.atr_len)
-            rsi1h_s = ta.rsi(df1h["close"], self.rsi_len)
-            adx1h_s = ta.adx(df1h, self.adx_len)
+        atr_len = int(self.cfg.get("ATR_LEN", 14))
+        rsi_len = int(self.cfg.get("RSI_LEN", 14))
+        don_n_days = int(self.cfg.get("DON_N_DAYS", 20))
+        gap_ma_len = int(self.cfg.get("GAP_1D_MA_LEN", 20))
 
-            atr1h_5m = map_to_left_index(df5.index, atr1h_s)
-            rsi1h_5m = map_to_left_index(df5.index, rsi1h_s)
-            adx1h_5m = map_to_left_index(df5.index, adx1h_s)
+        # -------- Daily resample for Donchian + gap-to-MA
+        df1d = _resample_ohlcv(df5, "1D")
+        ts_1d = _last_ts_asof(df1d, decision_ts)
+        if ts_1d is not None:
+            asof_day = ts_1d  # label is bar close (right-labeled), safe for as-of lookup
 
-            out["atr_1h"] = float(atr1h_5m.loc[decision_ts])
-            out["rsi_1h"] = float(rsi1h_5m.loc[decision_ts])
-            out["adx_1h"] = float(adx1h_5m.loc[decision_ts])
+            # Donchian upper (shifted to avoid look-ahead)
+            don_upper = df1d["high"].rolling(don_n_days, min_periods=don_n_days).max().shift(1)
+            atr_1d = ta.atr(df1d[["open", "high", "low", "close"]], atr_len)
 
-            close_now = float(df5.loc[decision_ts, "close"])
-            out["atr_pct"] = (out["atr_1h"] / close_now) if close_now > 0 else 0.0
-        else:
-            out["atr_1h"] = np.nan
-            out["rsi_1h"] = np.nan
-            out["adx_1h"] = np.nan
-            out["atr_pct"] = np.nan
+            try:
+                don_level = float(don_upper.loc[asof_day])
+            except Exception:
+                don_level = float("nan")
 
-        # --- 2) Volume Multiple ---
-        vol_lb_bars = bars_per_day * self.vol_lookback
-        min_periods = max(5, vol_lb_bars // 10)
-        vol_med = df5["volume"].rolling(vol_lb_bars, min_periods=min_periods).median()
-        vol_mult_s = df5["volume"] / vol_med.replace(0.0, np.nan)
-        out["vol_mult"] = float(vol_mult_s.loc[decision_ts])
+            try:
+                close_1d = float(df1d["close"].loc[asof_day])
+            except Exception:
+                close_1d = float("nan")
 
-        # --- 3) Days Since Prev Break (Left/Left daily highs) ---
-        daily_high = df5["high"].resample("1D", label="left", closed="left").max().dropna()
-        don_daily = daily_high.rolling(self.don_days, min_periods=self.don_days).max().shift(1)
-        don_5m = don_daily.reindex(df5.index, method="ffill")
+            try:
+                atrv = float(atr_1d.loc[asof_day])
+            except Exception:
+                atrv = float("nan")
 
-        touch = df5["high"] >= don_5m
-        touch_upto = touch.loc[:decision_ts]
-        if touch_upto.any():
-            last_touch_ts = touch_upto[touch_upto].index[-1]
-            delta = (decision_ts - last_touch_ts).total_seconds() / 86400.0
-            out["days_since_prev_break"] = float(delta)
-        else:
-            out["days_since_prev_break"] = np.nan
+            out["don_break_level"] = don_level
 
-        # --- 4) Consolidation Range ATR ---
-        high_win = df5["high"].rolling(self.pullback_win).max()
-        low_win = df5["low"].rolling(self.pullback_win).min()
-        cons_range = high_win - low_win
+            # Distance from Donchian upper in ATR units (close - don_upper) / ATR
+            if np.isfinite(close_1d) and np.isfinite(don_level) and np.isfinite(atrv) and atrv != 0.0:
+                out["don_dist_atr"] = float((close_1d - don_level) / atrv)
+            else:
+                out["don_dist_atr"] = float("nan")
 
-        val = cons_range.loc[decision_ts]
-        if "atr1h_5m" in locals():
-            atr_series = atr1h_5m
-        else:
-            atr_series = pd.Series(np.nan, index=df5.index)
+            # Days since previous break (close > don_upper)
+            break_series = (df1d["close"] > don_upper).astype(float)
+            out["days_since_prev_break"] = self._days_since_last_break(break_series, asof_day)
 
-        atr_safe = atr_series.replace(0.0, np.nan)
-        if np.isfinite(atr_safe.loc[decision_ts]):
-            out["consolidation_range_atr"] = float(val / atr_safe.loc[decision_ts])
-        else:
-            out["consolidation_range_atr"] = np.nan
+            # Gap from 1D MA ( (close - MA)/MA ) at last closed 1D bar
+            ma = ta.sma(df1d["close"], gap_ma_len)
+            try:
+                ma_val = float(ma.loc[asof_day])
+                if np.isfinite(close_1d) and np.isfinite(ma_val) and ma_val != 0.0:
+                    out["gap_from_1d_ma"] = float((close_1d - ma_val) / ma_val)
+                else:
+                    out["gap_from_1d_ma"] = float("nan")
+            except Exception:
+                out["gap_from_1d_ma"] = float("nan")
 
-        # --- 5) Prior 1d Return ---
-        prior_ret_s = df5["close"] / df5["close"].shift(bars_per_day) - 1.0
-        out["prior_1d_ret"] = float(prior_ret_s.loc[decision_ts])
+        # --- Offline-parity required entry-quality features (strict definitions) ---
+        req_eq = compute_entry_quality_required_features(df5, decision_ts, cfg=self.cfg)
+        out.update(req_eq)
 
-        # --- 6) Realized Vol (3d), explicit ddof=1 ---
-        rv_win = 3 * bars_per_day
-        log_ret = np.log(df5["close"]).diff()
-        rv_3d_s = log_ret.rolling(rv_win).std(ddof=1)
-        out["rv_3d"] = float(rv_3d_s.loc[decision_ts])
+        # -------- Prebreak congestion (expected name)
+        try:
+            # Existing deterministic helper based on 15m congestion range vs ATR
+            cong_len = int(self.cfg.get("PREBREAK_CONGESTION_N15", 12))
+            cong = _prebreak_congestion_atr_15m(df5, decision_ts=decision_ts, atr_len=atr_len, lookback_bars_15m=cong_len)
+            out["congestion_range_atr"] = float(cong) if cong is not None else float("nan")
+        except Exception:
+            out["congestion_range_atr"] = float("nan")
 
-        # --- 7) Donch Break Level (Right/Right completed days) ---
-        don_upper_s = donchian_upper_days_no_lookahead(df5["high"], self.don_days)
-        out["don_break_level"] = float(don_upper_s.loc[decision_ts])
-        out["don_break_len"] = float(self.don_days)
+        # Alias to the model-expected name
+        out["prebreak_congestion"] = float(out.get("congestion_range_atr", float("nan")))
 
-        # --- 8) Donch Dist ATR ---
-        if np.isfinite(out.get("don_break_level", np.nan)) and np.isfinite(out.get("atr_1h", np.nan)) and out["atr_1h"] > 0:
-            close_now = float(df5.loc[decision_ts, "close"])
-            out["don_dist_atr"] = (close_now - out["don_break_level"]) / out["atr_1h"]
-        else:
-            out["don_dist_atr"] = np.nan
+        # -------- VWAP stack features (already used for other features/DB columns)
+        try:
+            vwap_lb = int(self.cfg.get("VWAP_LOOKBACK_BARS", 12))
+            vwap_band = float(self.cfg.get("VWAP_BAND_PCT", 0.004))
+            df5_cut = df5.loc[:decision_ts]
+            vwap = vwap_stack_features(df5_cut, lookback_bars=vwap_lb, band_pct=vwap_band)
+            for k, v in vwap.items():
+                out[k] = float(v) if v is not None else float("nan")
+        except Exception:
+            pass
 
-        return out
+        # -------- Multi-TF indicators
 
-    def compute_oi_funding_features(
-        self,
-        df5: pd.DataFrame,
-        decision_ts: pd.Timestamp,
-        *,
-        meta_dir: Path,
-    ) -> Dict[str, float]:
-        """
-        Computes OI/Funding features at decision_ts with strict as-of semantics.
-        Fail-closed on missing required raw cols or stale feeds by raising.
-        """
-        thr = self._get_regime_thresholds(Path(meta_dir))
+        # 15m RSI
+        try:
+            df15 = _resample_ohlcv(df5, "15min")
+            ts15 = _last_ts_asof(df15, decision_ts)
+            if ts15 is not None:
+                rsi15 = ta.rsi(df15["close"], rsi_len)
+                out["asset_rsi_15m"] = float(rsi15.loc[ts15])
+            else:
+                out["asset_rsi_15m"] = float("nan")
+        except Exception:
+            out["asset_rsi_15m"] = float("nan")
 
-        # Default staleness: 8h unless configured; use None to disable.
-        max_age_raw = self.cfg.get("DERIV_MAX_AGE", "8h")
-        staleness_max_age = pd.Timedelta(max_age_raw) if max_age_raw else None
+        # 4h RSI
+        try:
+            df4h = _resample_ohlcv(df5, "4h")
+            ts4h = _last_ts_asof(df4h, decision_ts)
+            if ts4h is not None:
+                rsi4h = ta.rsi(df4h["close"], rsi_len)
+                out["asset_rsi_4h"] = float(rsi4h.loc[ts4h])
+            else:
+                out["asset_rsi_4h"] = float("nan")
+        except Exception:
+            out["asset_rsi_4h"] = float("nan")
+
+        # 1h MACD (+ slope as last hist diff)
+        try:
+            df1h = _resample_ohlcv(df5, "1h")
+            macd1 = ta.macd(df1h["close"])
+            m1 = macd1.loc[:decision_ts].tail(2)
+            if len(m1) >= 1:
+                last = m1.iloc[-1]
+                out["asset_macd_line_1h"] = float(last["macd"])
+                out["asset_macd_signal_1h"] = float(last["signal"])
+                out["asset_macd_hist_1h"] = float(last["hist"])
+                if len(m1) >= 2:
+                    prev = m1.iloc[-2]
+                    out["asset_macd_slope_1h"] = float(last["hist"] - prev["hist"])
+                else:
+                    out["asset_macd_slope_1h"] = float("nan")
+            else:
+                out["asset_macd_line_1h"] = float("nan")
+                out["asset_macd_signal_1h"] = float("nan")
+                out["asset_macd_hist_1h"] = float("nan")
+                out["asset_macd_slope_1h"] = float("nan")
+        except Exception:
+            out["asset_macd_line_1h"] = float("nan")
+            out["asset_macd_signal_1h"] = float("nan")
+            out["asset_macd_hist_1h"] = float("nan")
+            out["asset_macd_slope_1h"] = float("nan")
+
+        # 4h MACD (+ slope)
+        try:
+            df4h = _resample_ohlcv(df5, "4h")
+            macd4 = ta.macd(df4h["close"])
+            m4 = macd4.loc[:decision_ts].tail(2)
+            if len(m4) >= 1:
+                last = m4.iloc[-1]
+                out["asset_macd_line_4h"] = float(last["macd"])
+                out["asset_macd_signal_4h"] = float(last["signal"])
+                out["asset_macd_hist_4h"] = float(last["hist"])
+                if len(m4) >= 2:
+                    prev = m4.iloc[-2]
+                    out["asset_macd_slope_4h"] = float(last["hist"] - prev["hist"])
+                else:
+                    out["asset_macd_slope_4h"] = float("nan")
+            else:
+                out["asset_macd_line_4h"] = float("nan")
+                out["asset_macd_signal_4h"] = float("nan")
+                out["asset_macd_hist_4h"] = float("nan")
+                out["asset_macd_slope_4h"] = float("nan")
+        except Exception:
+            out["asset_macd_line_4h"] = float("nan")
+            out["asset_macd_signal_4h"] = float("nan")
+            out["asset_macd_hist_4h"] = float("nan")
+            out["asset_macd_slope_4h"] = float("nan")
+
+        # 1h / 4h volatility proxy: ATR% (ATR / close * 100)
+        try:
+            df1h = _resample_ohlcv(df5, "1h")
+            ts1h = _last_ts_asof(df1h, decision_ts)
+            if ts1h is not None:
+                atr1 = ta.atr(df1h[["open", "high", "low", "close"]], atr_len)
+                c1 = float(df1h["close"].loc[ts1h])
+                a1 = float(atr1.loc[ts1h])
+                out["asset_vol_1h"] = float((a1 / c1) * 100.0) if np.isfinite(a1) and np.isfinite(c1) and c1 != 0.0 else float("nan")
+            else:
+                out["asset_vol_1h"] = float("nan")
+        except Exception:
+            out["asset_vol_1h"] = float("nan")
 
         try:
-            return oi_funding_features_at_decision(
-                df5,
-                decision_ts,
-                thresholds=thr,
-                staleness_max_age=staleness_max_age,
-            )
-        except StaleDerivativesDataError:
-            # Upstream must treat as safe-mode/no trade
-            raise
-        except KeyError:
-            # Missing required raw -> fail-closed (upstream safe-mode/no trade)
-            raise
-
-    def compute_features_for_decision(
-        self,
-        df5: pd.DataFrame,
-        decision_ts: pd.Timestamp,
-        *,
-        meta_dir: Path,
-        include_entry_quality: bool = True,
-        include_oi_funding: bool = True,
-    ) -> Dict[str, float]:
-        """
-        Aggregates feature families into a single feature dict for scoring.
-        This method is the intended integration point for Sprint 2.2.
-
-        It does NOT use wall-clock time. Everything is as-of decision_ts.
-        """
-        out: Dict[str, float] = {}
-
-        if include_entry_quality:
-            out.update(self.compute_entry_quality_features(df5, decision_ts))
-
-        if include_oi_funding:
-            out.update(self.compute_oi_funding_features(df5, decision_ts, meta_dir=meta_dir))
+            df4h = _resample_ohlcv(df5, "4h")
+            ts4h = _last_ts_asof(df4h, decision_ts)
+            if ts4h is not None:
+                atr4 = ta.atr(df4h[["open", "high", "low", "close"]], atr_len)
+                c4 = float(df4h["close"].loc[ts4h])
+                a4 = float(atr4.loc[ts4h])
+                out["asset_vol_4h"] = float((a4 / c4) * 100.0) if np.isfinite(a4) and np.isfinite(c4) and c4 != 0.0 else float("nan")
+            else:
+                out["asset_vol_4h"] = float("nan")
+        except Exception:
+            out["asset_vol_4h"] = float("nan")
 
         return out

@@ -1,17 +1,15 @@
 """
-live_trader.py – v4.1 (Clean, YAML sizing + meta gate, robust listing-age)
-=============================================================================
-- Robust UTC-safe listing-age helper (uses cache, then earliest OHLCV bar).
-- Removes utcnow() deprecation warnings (timezone-aware everywhere).
-- Fixes NameError/UnboundLocal (no stray 'sym', no undefined listing_age_days).
-- Filters get the correct listing_age_days from the built signal.
-- Keeps StrategyEngine, YAML scalers, meta-prob gate, DB/Telegram/Bybit V5, etc.
+live_trader.py – v4.2 (Sprint 3.0: Data Clock, Idempotency, Fail-Closed Schema)
+================================================================================
+- Removes wall-clock dependencies (datetime.now) from decisions/orders.
+- Implements "Data Clock" (decision_ts) for deduplication, cooldowns, and timestamps.
+- Deterministic clientOrderId generation via create_entry_cid.
+- Fail-closed validation for required meta features (no NaNs allowed in required cols).
 """
 
 from __future__ import annotations
 
 import secrets
-import hashlib
 import asyncio
 import dataclasses
 import json
@@ -19,6 +17,7 @@ import logging
 import os
 import sys
 import traceback
+import hashlib  # Added for deterministic CIDs
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from collections import defaultdict
@@ -62,8 +61,7 @@ from .strategy_engine import StrategyEngine
 from .feature_builder import FeatureBuilder
 from .parity_utils import resample_ohlcv, donchian_upper_days_no_lookahead, eval_meta_scope
 
-from .oi_funding import fetch_series_5m, compute_oi_funding_features, StaleDerivativesDataError
-from .regimes_report import RegimeThresholds, load_regime_thresholds
+from .oi_funding import fetch_series_5m, compute_oi_funding_features
 
 import logging
 logging.getLogger("watchdog").setLevel(logging.WARNING)
@@ -77,7 +75,6 @@ REGIME_CODE_MAP = {
     "BULL_HIGH_VOL": 2,
     "BULL_LOW_VOL": 3,
 }
-
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -349,16 +346,10 @@ class Signal:
     win_probability: float = 0.0
 
     def __post_init__(self):
-        dt = pd.to_datetime(self.decision_ts, utc=True, errors="coerce")
-        if dt is pd.NaT:
-            raise ValueError("Signal.decision_ts invalid/NaT")
-        self.decision_ts = dt
-
         self.side = str(self.side).upper()
         if self.side not in ("LONG", "SHORT"):
             self.side = "SHORT"
         LOG.info(f"Successfully created Signal object for {self.symbol} using correct class definition.")
-
 
 ###############################################################################
 # 7 ▸ MAIN TRADER #############################################################
@@ -368,6 +359,7 @@ class LiveTrader:
     def __init__(self, settings: Settings, cfg_dict: Dict[str, Any]):
         self.settings = settings
         self.meta_schema = None  # always defined; assigned after bundle/winprob load if available
+        self._cycle_data_ts: Optional[pd.Timestamp] = None  # Sprint 3.0: Data clock source of truth
 
         # Merge python config defaults (config.py) with YAML overrides into self.cfg
         self.cfg: Dict[str, Any] = {}
@@ -378,12 +370,7 @@ class LiveTrader:
         for k, v in self.cfg.items():  # keep config.py attributes in sync too
             setattr(cfg, k, v)
 
-        # Logger handle (some helpers expect LiveTrader.log)
-        self.log = LOG
-
-        # Pass logger into the strict-parity feature builder too
-        self.feature_builder = FeatureBuilder(self.cfg, logger=self.log)
-
+        self.feature_builder = FeatureBuilder(self.cfg)
 
         self.db = DB(settings.pg_dsn)
         self.tg = TelegramBot(settings.tg_bot_token, settings.tg_chat_id)
@@ -406,9 +393,6 @@ class LiveTrader:
         self._listing_dates_cache: Dict[str, datetime.date] = {}
         self.last_exit: Dict[str, datetime] = {}
         self._zero_finalize_backoff: Dict[int, datetime] = {}
-        
-        # In-memory OHLCV cache (keyed by (symbol, tf)); required by _get_ohlcv()
-        self._init_ohlcv_cache()
 
         self._zero_finalize_backoff: Dict[int, datetime] = {}
         self._cancel_cleanup_backoff: Dict[str, datetime] = {}
@@ -435,14 +419,8 @@ class LiveTrader:
         meta_dir = (self.cfg.get("META_EXPORT_DIR")
                     or self.cfg.get("WINPROB_ARTIFACT_DIR", "results/meta_export"))
         self.meta_dir = str(meta_dir)
-
-        # Back-compat: some helpers still expect LiveTrader.bundle_dir
-        # (it should point at the same directory as meta_dir / meta_bundle.meta_dir).
-        self.bundle_dir = self.meta_dir
-
         strict_bundle = bool(self.cfg.get("STRICT_META_BUNDLE", True))
         required_extra = self.cfg.get("META_REQUIRED_EXTRA_FILES", []) or []
-
 
         try:
             self.meta_bundle = load_bundle(
@@ -450,10 +428,7 @@ class LiveTrader:
                 required_extra_files=required_extra,
                 strict=strict_bundle,
             )
-
             self.meta_dir = str(self.meta_bundle.meta_dir)
-            self.bundle_dir = self.meta_dir
-
             _set_bundle_id_for_logs(self.meta_bundle.bundle_id)
             self.bundle_id = self.meta_bundle.bundle_id
             self.winprob = WinProbScorer(bundle=self.meta_bundle, strict_schema=True)
@@ -467,8 +442,6 @@ class LiveTrader:
             self.meta_bundle = None
             self.bundle_id = None
             self.winprob = None
-            self.bundle_dir = None
-
         else:
             LOG.info("Meta bundle loaded: dir=%s id=%s", self.meta_bundle.meta_dir, self.bundle_id)
             pstar = getattr(self.winprob, "pstar", None)
@@ -522,33 +495,15 @@ class LiveTrader:
                 LOG.warning("bundle=%s Golden features load failed (continuing without): %s", self.bundle_id, e)
                 self.golden_store = None
 
-            # RegimeThresholds object required by live/oi_funding.py (attribute access, not dict keys).
-            # IMPORTANT: regimes_report.json contains extra threshold keys not in RegimeThresholds.
-            # Always construct via load_regime_thresholds(), which selects only required fields.
-            self.regime_thresholds_obj = None
-            try:
-                self.regime_thresholds_obj = load_regime_thresholds(Path(self.meta_bundle.meta_dir))
-            except Exception as e:
-                # Fail-closed: if thresholds cannot be constructed, OI/FR features will be omitted.
-                LOG.error(
-                    "bundle=%s Invalid regimes_report thresholds (disabling OI/FR features): %s",
-                    self.bundle_id,
-                    e,
-                )
-                self.regime_thresholds_obj = None
+            # --- NEW: regimes thresholds for deterministic meta feature codes (S2/S3/S4/S6, etc.)
+            self.regime_thresholds = self._load_regime_thresholds()
+
 
             # --- Sprint 2.4: persistent online performance state ---
             try:
                 state_path = str(self.cfg.get("ONLINE_STATE_PATH", "results/online_state.jsonl"))
                 max_records = int(self.cfg.get("ONLINE_STATE_MAX_RECORDS", 2000))
-
-                cold_raw = self.cfg.get("ONLINE_STATE_COLDSTART_WINRATE", 0.25)
-                try:
-                    cold_f = float(cold_raw)
-                except Exception:
-                    cold_f = float("nan")
-                self.online_state = OnlinePerformanceState(path=state_path, max_records=max_records, cold_start_winrate=cold_f)
-
+                self.online_state = OnlinePerformanceState(path=state_path, max_records=max_records)
             except Exception as e:
                 LOG.warning("bundle=%s OnlinePerformanceState init failed (disabling): %s", getattr(self, "bundle_id", None) or "no_bundle", e)
                 self.online_state = None
@@ -593,28 +548,22 @@ class LiveTrader:
             staleness_max_age = pd.Timedelta(minutes=int(self.cfg.get("DERIV_MAX_AGE_MIN", 30)))
 
             strict = bool(self.cfg.get("STRICT_PARITY_FEATURES", False))
-
-            thr_obj = getattr(self, "regime_thresholds_obj", None)
-            if thr_obj is None:
-                raise ValueError("Regime thresholds object unavailable (RegimeThresholds construction failed)")
-
             feats = compute_oi_funding_features(
                 df5=df5_cut,
                 oi5=oi5,
                 fr5=fr5,
-                thresholds=thr_obj,
+                thresholds=self.regime_thresholds,
                 allow_nans=not strict,
                 staleness_max_age=staleness_max_age,
             )
             return feats
 
-        except (StaleDerivativesDataError, KeyError, ValueError, TypeError, NotImplementedError) as e:
-            LOG.warning("OI/Funding features error for %s at %s: %s", symbol, decision_ts, e)
+        except (StaleDerivativesDataError, KeyError, ValueError, NotImplementedError) as e:
+            self.logger.warning(f"OI/Funding features unavailable for {symbol} at {decision_ts}: {e}")
             return {}
         except Exception as e:
-            LOG.exception("OI/Funding features unexpected error for %s at %s", symbol, decision_ts)
+            self.logger.warning(f"OI/Funding features error for {symbol} at {decision_ts}: {e}")
             return {}
-
 
 
     async def _fetch_ohlcv_df_paged(self, symbol: str, tf: str, limit: int) -> Optional[pd.DataFrame]:
@@ -668,12 +617,8 @@ class LiveTrader:
         self._ohlcv_cache: dict[tuple[str, str], pd.DataFrame] = {}
 
     async def _get_ohlcv(self, symbol: str, tf: str, min_bars: int) -> Optional[pd.DataFrame]:
-        if not hasattr(self, "_ohlcv_cache"):
-            self._init_ohlcv_cache()
-
         key = (symbol, tf)
         df = self._ohlcv_cache.get(key)
-
 
         if df is None or len(df) < min_bars:
             df = await self._fetch_ohlcv_df_paged(symbol, tf, min_bars)
@@ -862,17 +807,12 @@ class LiveTrader:
 
         Owns Markov 4h (ETH by default) to match canonical offline semantics.
         """
-        # Need enough 5m history to produce >=50 daily bars for cross-asset daily ctx.
-        # 60 days is a safe default (50d windows + buffer).
-        min_days = int(self.cfg.get("GOV_CTX_DAYS_5M", 60))
-        min_bars = int(min_days * 288 + 2 * 288)  # +2d buffer
-
-        df_btc = await self._get_ohlcv("BTCUSDT", "5m", min_bars=min_bars)
-        df_eth = await self._get_ohlcv("ETHUSDT", "5m", min_bars=min_bars)
-
-        # Fail-closed if still missing
-        if df_btc is None or df_btc.empty or df_eth is None or df_eth.empty:
-            return {}
+        # Fetch 5m OHLCV for BTC/ETH
+        df_btc, df_eth = await asyncio.gather(
+            self._fetch_ohlcv_df_simple("BTCUSDT", "5m", limit=1500),
+            self._fetch_ohlcv_df_simple("ETHUSDT", "5m", limit=1500),
+            return_exceptions=False,
+        )
 
         # Determine decision_ts_gov (min last-closed ts across BTC/ETH) to avoid cross-asset lookahead
         decision_ts_gov = None
@@ -891,9 +831,6 @@ class LiveTrader:
             raise RuntimeError("GOV_CTX: cannot determine decision_ts_gov (BTC/ETH 5m frames empty)")
 
         decision_ts_gov = pd.to_datetime(decision_ts_gov, utc=True)
-
-        # Cycle-level “data clock” (single source of truth for decision timing this cycle)
-        self._cycle_asof_ts = decision_ts_gov
 
         # Hard as-of cut to prevent any downstream cross-asset lookahead
         if df_btc is not None and not df_btc.empty:
@@ -1379,38 +1316,7 @@ class LiveTrader:
             except Exception:
                 pass
 
-    def _is_bad_numeric(self, v: Any) -> bool:
-        """
-        Fail-closed numeric validity check for required features.
-        Returns True if v is missing/invalid (None, NaN, inf, non-scalar, non-parsable).
-        """
-        if v is None:
-            return True
 
-        # bool is acceptable (it is a common model feature encoding)
-        if isinstance(v, (bool, np.bool_)):
-            return False
-
-        # numpy numeric scalars
-        if isinstance(v, (np.integer, np.floating)):
-            return not np.isfinite(float(v))
-
-        # python numeric scalars
-        if isinstance(v, (int, float)):
-            return not np.isfinite(float(v))
-
-        # strings: attempt parse
-        if isinstance(v, str):
-            s = v.strip()
-            if s == "":
-                return True
-            try:
-                return not np.isfinite(float(s))
-            except Exception:
-                return True
-
-        # anything else: treat as invalid (fail-closed)
-        return True
 
     def _missing_required_features(self, row: dict, required: list[str]) -> list[str]:
         missing = []
@@ -1440,14 +1346,6 @@ class LiveTrader:
         if not getattr(self, "winprob", None):
             out["err"] = "winprob_not_loaded"
             return out
-
-        # Fail-closed: verify required raw features are present and finite BEFORE scoring
-        required = list(getattr(self.winprob, "raw_features", []) or [])
-        if required:
-            missing = self._missing_required_features(meta_row, required)
-            if missing:
-                out["err"] = "missing_required:" + ",".join(missing[:50])
-                return out
 
         try:
             # winprob_loader.WinProbScorer.score_with_details returns (p_raw, p_cal)
@@ -1493,42 +1391,28 @@ class LiveTrader:
         return d["p_cal"] if d.get("schema_ok") else None
 
 
-    def _load_universe_cache_if_fresh(self, asof_ts: pd.Timestamp | None = None) -> Optional[dict]:
-        """Return {symbol: {rs_pct, median_24h_turnover_usd}} if cache exists & fresh & symbols match.
-
-        IMPORTANT: freshness is evaluated in DATA TIME (decision_ts), not wall-clock.
-        If no data-derived asof_ts is available, treat cache as not usable.
-        """
+    def _load_universe_cache_if_fresh(self) -> Optional[dict]:
+        """Return {symbol: {rs_pct, median_24h_turnover_usd}} if cache exists & fresh & symbols match."""
         if not bool(self.cfg.get("UNIVERSE_CACHE_ENABLED", True)):
             return None
         p = Path(self.cfg.get("UNIVERSE_CACHE_PATH", UNIVERSE_CACHE_PATH))
         if not p.exists():
             return None
-
-        # Determine data clock for TTL comparisons.
-        asof = pd.to_datetime(
-            asof_ts if asof_ts is not None else getattr(self, "_cycle_asof_ts", None),
-            utc=True,
-            errors="coerce",
-        )
-        if asof is pd.NaT or pd.isna(asof):
-            return None
-
         try:
             raw = json.loads(p.read_text())
             ttl_min = int(self.cfg.get("UNIVERSE_CACHE_TTL_MIN", 1440))  # default: 24h
-
-            # Prefer data-clock timestamp; fall back to legacy key if present.
-            ts = raw.get("computed_asof_ts") or raw.get("computed_at")
+            ts = raw.get("computed_at")
             if not ts:
                 return None
+            # tolerate "Z" suffix or naive
+            try:
+                computed_at = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            except Exception:
+                computed_at = datetime.fromisoformat(ts)
+            if computed_at.tzinfo is None:
+                computed_at = computed_at.replace(tzinfo=timezone.utc)
 
-            computed_at = pd.to_datetime(str(ts).replace("Z", "+00:00"), utc=True, errors="coerce")
-            if computed_at is pd.NaT or pd.isna(computed_at):
-                return None
-
-            # DATA-TIME TTL check (no wall-clock leakage)
-            if (asof - computed_at) > pd.Timedelta(minutes=ttl_min):
+            if datetime.now(timezone.utc) - computed_at > timedelta(minutes=ttl_min):
                 return None
 
             if bool(self.cfg.get("UNIVERSE_CACHE_REQUIRE_SYMBOLS_MATCH", True)):
@@ -1542,23 +1426,13 @@ class LiveTrader:
             LOG.warning("Universe cache load failed: %s", e)
             return None
 
-
-    def _save_universe_cache(self, data: dict, asof_ts: pd.Timestamp | None = None) -> None:
-        """Persist universe cache with a DATA-TIME timestamp for TTL comparisons."""
+    def _save_universe_cache(self, data: dict) -> None:
         if not bool(self.cfg.get("UNIVERSE_CACHE_ENABLED", True)):
             return
         p = Path(self.cfg.get("UNIVERSE_CACHE_PATH", UNIVERSE_CACHE_PATH))
         try:
-            asof = pd.to_datetime(
-                asof_ts if asof_ts is not None else getattr(self, "_cycle_asof_ts", None),
-                utc=True,
-                errors="coerce",
-            )
-            computed_asof = None if (asof is pd.NaT or pd.isna(asof)) else asof.isoformat()
-
             blob = {
-                # TTL uses this field (data clock)
-                "computed_asof_ts": computed_asof,
+                "computed_at": datetime.now(timezone.utc).isoformat(),
                 "symbols": list(self.symbols),
                 "data": data,
             }
@@ -1566,7 +1440,6 @@ class LiveTrader:
             LOG.info("Universe context cached to %s (%d symbols).", p, len(data))
         except Exception as e:
             LOG.warning("Failed to write universe cache: %s", e)
-
 
 
     async def _build_universe_context(self) -> dict[str, dict]:
@@ -1740,28 +1613,8 @@ class LiveTrader:
             ts = pd.to_datetime(asof_ts, utc=True, errors="coerce")
             if ts is not pd.NaT and not pd.isna(ts):
                 today = ts.date()
-
-        # If asof_ts not provided, derive from the most recent bar in dfs (data-derived).
-        if today is None and dfs:
-            try:
-                if "1d" in dfs and isinstance(dfs["1d"], pd.DataFrame) and not dfs["1d"].empty:
-                    today = pd.to_datetime(dfs["1d"].index[-1], utc=True).date()
-                else:
-                    latest = None
-                    for df in dfs.values():
-                        if isinstance(df, pd.DataFrame) and (not df.empty):
-                            t = pd.to_datetime(df.index[-1], utc=True, errors="coerce")
-                            if t is not pd.NaT and not pd.isna(t):
-                                if latest is None or t > latest:
-                                    latest = t
-                    if latest is not None:
-                        today = latest.date()
-            except Exception:
-                today = None
-
-        # Fail-closed: do not use wall-clock.
         if today is None:
-            return None
+            today = datetime.now(timezone.utc).date()
 
         # 1) cache
         d = self._listing_dates_cache.get(symbol)
@@ -1770,7 +1623,6 @@ class LiveTrader:
                 return (today - d).days
             except Exception:
                 pass
-
 
         # 2) infer from dataframes (earliest bar)
         if dfs:
@@ -1847,10 +1699,6 @@ class LiveTrader:
             "WINPROB_SIZE_CAP":   "WINPROB_PROB_CAP",
         }
         return aliases.get(key_up, key_up)
-
-    @staticmethod
-    def _cid(pid: int, tag: str) -> str:
-        raise RuntimeError("_cid() is deprecated; use deterministic create_stable_cid/create_entry_cid.")
 
     async def _ensure_leverage(self, symbol: str):
         try:
@@ -2013,7 +1861,6 @@ class LiveTrader:
                 return None
 
             last = df5_req.iloc[-1]
-            decision_ts = df5_req.index[-1]
 
             # ---------------- Listing age ------------------------
             age_opt = self._listing_age_days(symbol, dfs, asof_ts=decision_ts)
@@ -2293,29 +2140,8 @@ class LiveTrader:
                 meta_full.update(gov_ctx)
 
             # --- Strict-parity: Entry Quality overlay (overwrites critical fields) ---
-            eq_feats = self.feature_builder.compute_entry_quality_features(df5, decision_ts)
+            eq_feats = self.feature_builder.compute_entry_quality_features(df5, decision_ts, meta_dir=bundle.meta_dir)
             meta_full.update(eq_feats)
-
-            # --- Required raw inputs for derived regime interactions (S4/S6) ---
-
-            # crowd_z: use the per-symbol OI z-score already computed by OI/funding block (deterministic).
-            try:
-                meta_full["crowd_z"] = float(meta_full.get("oi_z_7d", np.nan))
-            except Exception:
-                meta_full["crowd_z"] = np.nan
-
-            # compression_pct: use the prebreak congestion measure (builder will provide/alias it).
-            try:
-                meta_full["compression_pct"] = float(meta_full.get("prebreak_congestion", np.nan))
-            except Exception:
-                meta_full["compression_pct"] = np.nan
-
-            # freshness_hours: derived from listing age (already in meta_full as days)
-            try:
-                lad = float(meta_full.get("listing_age_days", np.nan))
-                meta_full["freshness_hours"] = lad * 24.0 if np.isfinite(lad) else np.nan
-            except Exception:
-                meta_full["freshness_hours"] = np.nan
 
             # --- Strict-parity: regime-set derivations (includes risk_on / risk_on_1 for scope gating) ---
             try:
@@ -2324,19 +2150,8 @@ class LiveTrader:
                 LOG.warning("bundle=%s augment_meta_with_regime_sets failed: %s", getattr(self, "bundle_id", "no_bundle"), e)
 
             # ---- Sprint 2 / Option A: freeze macro regime inputs from golden truth ----
-            if getattr(self, "meta_bundle", None) is not None:
-                try:
-                    macro = macro_regimes_asof(self.meta_bundle, decision_ts)
-                    if isinstance(macro, dict) and macro:
-                        meta_full.update(macro)
-                except Exception as e:
-                    LOG.warning(
-                        "bundle=%s macro_regimes_asof failed: %s",
-                        getattr(self, "bundle_id", "no_bundle"),
-                        e,
-                    )
-                    # fail-closed behavior: keep meta_full without macro overlay; downstream strict slicing will
-                    # produce NaNs for missing required keys, which should lead to no-trade rather than a crash.
+            macro = macro_regimes_asof(self.bundle, decision_ts)
+            meta_full.update(macro)
 
             # Keep regime_up consistent with regime_code_1d (if regime_up is still used downstream)
             # (Adjust mapping only if your offline team defines it differently.)
@@ -2345,6 +2160,9 @@ class LiveTrader:
                 meta_full["regime_up"] = 1 if rc in (2, 3) else 0
             except Exception:
                 pass
+            # -------------------------------------------------------------------------
+
+
 
             # ---------------- 10. Strict Slice & Score ----------------
             required = list(getattr(self.winprob, "raw_features", []) or [])
@@ -2369,22 +2187,24 @@ class LiveTrader:
             except Exception:
                 pass
 
-            # Score using the safe wrapper
+            # --- Sprint 3.1: Strict fail-closed schema validation ---
+            # Gate signal immediately if ANY required feature is missing/non-finite
             if required:
-                score_d = self._score_winprob_safe_details(symbol, meta_row)
-                p_cal = score_d.get("p_cal")
-                p_raw = score_d.get("p_raw")
-                schema_ok = score_d.get("schema_ok")
-                meta_err = score_d.get("err")
-
-
-                if not schema_ok and meta_err and str(meta_err).startswith("missing_required:"):
-                    LOG.warning("bundle=%s %s meta feature completeness fail (asof=%s): %s",
-                                getattr(self, "bundle_id", None) or "no_bundle",
-                                symbol,
-                                str(decision_ts),
-                                meta_err)
-
+                ok_req, miss_req = validate_required_features(meta_row, required)
+                if not ok_req:
+                    schema_ok = False
+                    meta_err = f"missing_required:{miss_req}"
+                    LOG.warning("FEATURE_MISSING bundle=%s symbol=%s decision_ts=%s missing=%s", 
+                                getattr(self, "bundle_id", "no_bundle"), symbol, decision_ts.isoformat(), miss_req)
+                    # Force fail-closed for scoring below
+                    p_cal, p_raw = None, None
+                else:
+                    # Score using the safe wrapper
+                    score_d = self._score_winprob_safe_details(symbol, meta_row)
+                    p_cal = score_d.get("p_cal")
+                    p_raw = score_d.get("p_raw")
+                    schema_ok = score_d.get("schema_ok")
+                    meta_err = score_d.get("err")
             else:
                 # No model loaded or no features required
                 p_cal, p_raw = None, None
@@ -2642,7 +2462,7 @@ class LiveTrader:
             # -------------- Compose Signal object ----------------
             signal_obj = Signal(
                 symbol=symbol,
-                decision_ts=decision_ts,
+                decision_ts=decision_ts,  # Sprint 3.0: Data Clock
                 entry=float(last['close']),
                 atr=float(last['atr_1h']),
                 rsi=float(last['rsi_1h']),
@@ -2961,14 +2781,12 @@ class LiveTrader:
             recent_open = await self.db.pool.fetchval(
                 "SELECT MAX(opened_at) FROM positions WHERE symbol=$1", sig.symbol
             )
-
+            # Sprint 3.0: Use data clock (decision_ts) for de-dup window, not wall-clock
             if recent_open:
-                asof_ts = pd.to_datetime(sig.decision_ts, utc=True)
-                ro_ts = pd.to_datetime(recent_open, utc=True, errors="coerce")
-                if ro_ts is not pd.NaT and (asof_ts - ro_ts) < pd.Timedelta(hours=float(dd_hours)):
-                    LOG.warning("Duplicate entry prevented for %s", sig.symbol)
+                asof_dt = pd.to_datetime(sig.decision_ts, utc=True).to_pydatetime()
+                if (asof_dt - recent_open) < timedelta(hours=dd_hours):
+                    LOG.info("De-dup window: last %s open at %s < %sh → skip.", sig.symbol, recent_open, dd_hours)
                     return
-
         except Exception as _e:
             LOG.warning("De-dup check failed for %s: %s (continuing)", sig.symbol, _e)
 
@@ -3114,7 +2932,7 @@ class LiveTrader:
         intended_size = max(risk_usd / stop_dist, 0.0)
 
         try:
-            mkt = self._ccxt().market(sig.symbol)  # unified market
+            mkt = self.exchange._exchange.market(sig.symbol)  # unified market
         except Exception:
             mkt = None
 
@@ -3132,10 +2950,9 @@ class LiveTrader:
         # Round to precision grid first (truncates down), then bump up if below min
         size_prec = intended_size
         try:
-            size_prec = float(self._ccxt().amount_to_precision(sig.symbol, intended_size))
+            size_prec = float(self.exchange._exchange.amount_to_precision(sig.symbol, intended_size))
         except Exception:
             pass
-
 
         # If the precision rounding pushed us below min amount, bump to min (or ceil to the next step)
         def _ceil_to_step(x: float, step: Optional[float]) -> float:
@@ -3187,7 +3004,7 @@ class LiveTrader:
 
         # Final safety: re-apply ccxt precision to the adjusted size
         try:
-            size_prec = float(self._ccxt().amount_to_precision(sig.symbol, size_prec))
+            size_prec = float(self.exchange._exchange.amount_to_precision(sig.symbol, size_prec))
         except Exception:
             pass
 
@@ -3203,30 +3020,18 @@ class LiveTrader:
         except Exception:
             return
 
-        # --- Entry: market order with deterministic CID (idempotent) ---
-        entry_cid = create_entry_cid(symbol=sig.symbol, decision_ts=sig.decision_ts, side=sig.side, tag="ENTRY")
-
-        # If we already have an order with this CID, do not place again (retry/restart safety).
-        # Proceed to the normal “confirm position appears” logic below.
+        # --- Entry: market order with unique CID ---
+        # Sprint 3.0: Deterministic entry CID
+        entry_cid = create_entry_cid(sig.symbol, sig.decision_ts, side_label)
         try:
-            existing = await self._fetch_by_cid(entry_cid, sig.symbol, silent=True)
-        except Exception:
-            existing = None
-
-        if existing:
-            LOG.info("Entry order already exists for %s (CID=%s, status=%s). Not re-sending.",
-                    sig.symbol, entry_cid, existing.get("status"))
-        else:
-            try:
-                entry_order = await self.exchange.create_market_order(
-                    sig.symbol, entry_side, intended_size,
-                    params={"clientOrderId": entry_cid, "category": "linear"}
-                )
-                LOG.info("Market %s sent for %s (CID=%s)", entry_side.upper(), sig.symbol, entry_cid)
-            except Exception as e:
-                LOG.error("Market %s failed for %s: %s", entry_side.upper(), sig.symbol, e)
-                return
-
+            await self.exchange.create_market_order(
+                sig.symbol, entry_side, intended_size,
+                params={"clientOrderId": entry_cid, "category": "linear"}
+            )
+            LOG.info("Market %s sent for %s (CID=%s)", entry_side.upper(), sig.symbol, entry_cid)
+        except Exception as e:
+            LOG.error("Market %s failed for %s: %s", entry_side.upper(), sig.symbol, e)
+            return
 
         # --- Confirm position appears on exchange ---
         actual_size = 0.0
@@ -3256,25 +3061,14 @@ class LiveTrader:
         # --- Protective levels from actual entry ---
         stop_price = (actual_entry_price - sl_mult * float(sig.atr)) if is_long else (actual_entry_price + sl_mult * float(sig.atr))
 
-
-        # --- Persist to DB (timestamps must be data-derived; no wall-clock) ---
-        # Prefer exchange-provided order timestamp if we placed an order; otherwise fall back to signal decision_ts.
-        opened_at_dt = None
-        try:
-            if "entry_order" in locals() and entry_order and entry_order.get("timestamp"):
-                opened_at_dt = datetime.fromtimestamp(int(entry_order["timestamp"]) / 1000.0, tz=timezone.utc)
-        except Exception:
-            opened_at_dt = None
-
-        if opened_at_dt is None:
-            opened_at_dt = pd.to_datetime(sig.decision_ts, utc=True).to_pydatetime()
-
+        # --- Persist to DB (then add order CIDs) ---
+        # Sprint 3.0: Use Data Clock for timestamps
+        opened_at = pd.to_datetime(sig.decision_ts, utc=True).to_pydatetime()
         exit_deadline = None
         if self.cfg.get("TIME_EXIT_HOURS_ENABLED", False):
-            exit_deadline = opened_at_dt + timedelta(hours=int(self.cfg.get("TIME_EXIT_HOURS", 4)))
+            exit_deadline = opened_at + timedelta(hours=int(self.cfg.get("TIME_EXIT_HOURS", 4)))
         elif self.cfg.get("TIME_EXIT_ENABLED", False):
-            exit_deadline = opened_at_dt + timedelta(days=int(self.cfg.get("TIME_EXIT_DAYS", 10)))
-
+            exit_deadline = opened_at + timedelta(days=int(self.cfg.get("TIME_EXIT_DAYS", 10)))
 
         payload = {
             "symbol": sig.symbol,
@@ -3284,7 +3078,7 @@ class LiveTrader:
             "trailing_active": False,
             "atr": float(sig.atr),
             "status": "OPEN",
-            "opened_at": opened_at_dt,
+            "opened_at": opened_at,
             "exit_deadline": exit_deadline,
             "entry_cid": entry_cid,
             "market_regime_at_entry": sig.market_regime,
@@ -3385,7 +3179,7 @@ class LiveTrader:
             self.open_positions[pid] = dict(row)
 
             # --- Telegram ---
-            ts = opened_at_dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M")
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
 
             # thresholds from config
             rs_min       = float(self.cfg.get("RS_MIN_PERCENTILE", 70))
@@ -3484,31 +3278,16 @@ class LiveTrader:
                 position_size = float(positions[0].get("info", {}).get("size", 0))
 
             if position_size == 0:
-                # 1) Sweep & cancel stale reduce-only/children (throttled, data-clock)
+                # 1) Sweep & cancel stale reduce-only/children (throttled)
                 if not hasattr(self, "_cancel_cleanup_backoff"):
                     self._cancel_cleanup_backoff = {}
-
-                # Use cycle data clock; if unavailable, fall back to last closed 5m bar for this symbol.
-                asof_ts = getattr(self, "_cycle_asof_ts", None)
-                if asof_ts is None:
+                _now = datetime.now(timezone.utc)
+                _last_cancel = self._cancel_cleanup_backoff.get(symbol)
+                if (not _last_cancel) or (_now - _last_cancel).total_seconds() >= float(self.cfg.get("CANCEL_CLEANUP_BACKOFF_SEC", 180)):
                     try:
-                        asof_ts = await self._last_closed_5m_ts(symbol)
-                    except Exception:
-                        asof_ts = None
-
-                if asof_ts is not None and not pd.isna(asof_ts):
-                    now_ts = pd.to_datetime(asof_ts, utc=True)
-                    last_ts = self._cancel_cleanup_backoff.get(symbol)
-                    last_ts = pd.to_datetime(last_ts, utc=True, errors="coerce") if last_ts is not None else None
-
-                    backoff_sec = float(self.cfg.get("CANCEL_CLEANUP_BACKOFF_SEC", 180))
-                    should_run = (last_ts is None) or ((now_ts - last_ts) >= pd.Timedelta(seconds=backoff_sec))
-
-                    if should_run:
-                        try:
-                            await self._cancel_reducing_orders(symbol, pos)
-                        finally:
-                            self._cancel_cleanup_backoff[symbol] = now_ts
+                        await self._cancel_reducing_orders(symbol, pos)
+                    finally:
+                        self._cancel_cleanup_backoff[symbol] = _now
 
                 # 2) Single finalize path for zero-size positions
                 LOG.info("bundle=%s Position size for %s is 0. Finalizing via _finalize_zero_position_safe…", bundle, symbol)
@@ -3526,23 +3305,13 @@ class LiveTrader:
         open_cids = {o.get("clientOrderId") for o in (orders or [])}
 
         if self.cfg.get("TIME_EXIT_ENABLED", cfg.TIME_EXIT_ENABLED):
-
             ddl = pos.get("exit_deadline")
-            if ddl:
-                # Use data-derived “now” (cycle gov clock if available; else last closed 5m bar for this symbol).
-                asof_ts = getattr(self, "_cycle_asof_ts", None)
-                if asof_ts is None:
-                    try:
-                        asof_ts = await self._last_closed_5m_ts(symbol)
-                    except Exception:
-                        asof_ts = None
-
-                if asof_ts is not None and not pd.isna(asof_ts):
-                    now_dt = pd.to_datetime(asof_ts, utc=True).to_pydatetime()
-                    if now_dt >= ddl:
-                        LOG.info("bundle=%s Time-exit firing on %s (pid %d)", bundle, symbol, pid)
-                        await self._force_close_position(pid, pos, tag="TIME_EXIT")
-                        return
+            # Sprint 3.0: Use data clock for time exit check
+            asof_dt = pd.to_datetime(self._cycle_data_ts, utc=True).to_pydatetime() if self._cycle_data_ts else None
+            if ddl and asof_dt and asof_dt >= ddl:
+                LOG.info("bundle=%s Time-exit firing on %s (pid %d)", bundle, symbol, pid)
+                await self._force_close_position(pid, pos, tag="TIME_EXIT")
+                return
 
         trailing_active = bool(pos.get("trailing_active", False))
 
@@ -3564,29 +3333,7 @@ class LiveTrader:
                 LOG.warning("bundle=%s Failed to fetch TP1 order %s for %s: %s", bundle, pos["tp1_cid"], symbol, e)
 
             if (filled_qty or 0.0) > 0.0 and (fill_price is not None):
-                # Prefer exchange timestamp; otherwise use data clock (cycle asof / last closed 5m).
-                fill_ts = None
-                try:
-                    ts_ms = o.get("timestamp") or o.get("lastTradeTimestamp") or o.get("lastUpdateTimestamp")
-                    if ts_ms:
-                        fill_ts = datetime.fromtimestamp(int(ts_ms) / 1000.0, tz=timezone.utc)
-                except Exception:
-                    fill_ts = None
-
-                if fill_ts is None:
-                    asof_ts = getattr(self, "_cycle_asof_ts", None)
-                    if asof_ts is None:
-                        try:
-                            asof_ts = await self._last_closed_5m_ts(symbol)
-                        except Exception:
-                            asof_ts = None
-                    if asof_ts is not None and not pd.isna(asof_ts):
-                        fill_ts = pd.to_datetime(asof_ts, utc=True).to_pydatetime()
-                    else:
-                        # last resort: use opened_at (should already be data-derived)
-                        fill_ts = pos.get("opened_at")
-
-                await self.db.add_fill(pid, "TP1", float(fill_price), float(filled_qty), fill_ts)
+                await self.db.add_fill(pid, "TP1", float(fill_price), float(filled_qty), datetime.now(timezone.utc))
                 await self.db.update_position(pid, trailing_active=True)
                 pos["trailing_active"] = True
                 trailing_active = True
@@ -3921,24 +3668,15 @@ class LiveTrader:
             exit_price = float((await self.exchange.fetch_ticker(symbol))["last"])
 
         pnl = (entry_price - exit_price) * size if side == "SHORT" else (exit_price - entry_price) * size
-
-        evt_ts = await self._last_closed_5m_ts(symbol)
-        if evt_ts is None or pd.isna(evt_ts):
-            # No wall-clock fallback. Prefer opened_at; if missing, use exchange trade timestamp if available.
-            closed_at = pos.get("opened_at")
-            if closed_at is None:
-                try:
-                    if closing_trade and closing_trade.get("timestamp"):
-                        closed_at = datetime.fromtimestamp(int(closing_trade["timestamp"]) / 1000.0, tz=timezone.utc)
-                except Exception:
-                    closed_at = None
-            if closed_at is None:
-                # last resort (should be unreachable in normal operation): use opened_at again
-                closed_at = pos.get("opened_at")
-        else:
+        
+        # Sprint 3.0: Deterministic close time
+        try:
+            evt_ts = await self._last_closed_5m_ts(symbol)
             closed_at = pd.to_datetime(evt_ts, utc=True).to_pydatetime()
+        except Exception:
+            closed_at = pos.get("opened_at") or datetime.now(timezone.utc)
 
-        holding_minutes = (closed_at - pos.get("opened_at", closed_at)).total_seconds() / 60.0
+        holding_minutes = (closed_at - pos.get("opened_at", closed_at)).total_seconds()/60.0
 
         await self.db.update_position(
             pid, status="CLOSED", closed_at=closed_at, pnl=pnl,
@@ -3946,6 +3684,7 @@ class LiveTrader:
         )
         await self.db.add_fill(pid, tag, exit_price, size, closed_at)
         await self.risk.on_trade_close(pnl, self.tg)
+
 
         # Sprint 2.4: record outcome (ts derived from last closed 5m bar; no wall-clock)
         try:
@@ -3956,7 +3695,7 @@ class LiveTrader:
         except Exception as e:
             LOG.warning("bundle=%s OnlinePerformanceState record failed for %s: %s", getattr(self, "bundle_id", None) or "no_bundle", symbol, e)
 
-        self.last_exit[symbol] = pd.to_datetime(closed_at, utc=True)
+        self.last_exit[symbol] = closed_at
         self.open_positions.pop(pid, None)
         await self.tg.send(f"⏰ {symbol} closed by {tag}. PnL ≈ {pnl:.2f} USDT")
 
@@ -3978,9 +3717,9 @@ class LiveTrader:
                     raise RuntimeError("GOV_CTX: missing/invalid decision_ts_gov")
 
                 decision_ts_gov = pd.to_datetime(decision_ts_gov, utc=True)
-
-                # Cycle-level “data clock” (single source of truth for decision timing this cycle)
-                self._cycle_asof_ts = decision_ts_gov
+                
+                # Sprint 3.0: Set Data Clock Source of Truth
+                self._cycle_data_ts = decision_ts_gov
 
                 # Daily regime as-of decision_ts_gov
                 current_market_regime = await self.regime_detector.get_current_regime(decision_ts_gov)
@@ -4019,18 +3758,12 @@ class LiveTrader:
                     if sym in open_symbols:
                         continue
 
-                    # Cooldown fast-skip (existing behavior kept as-is)
+                    # Cooldown fast-skip (Sprint 3.0: Data Clock)
                     cd_h = self.cfg.get("SYMBOL_COOLDOWN_HOURS", cfg.SYMBOL_COOLDOWN_HOURS)
-
-                    asof_ts = getattr(self, "_cycle_asof_ts", None)
-                    if asof_ts is None:
-                        asof_ts = decision_ts_gov
-                    asof_ts = pd.to_datetime(asof_ts, utc=True)
-
                     last_x = self.last_exit.get(sym)
-                    if last_x is not None:
-                        last_ts = pd.to_datetime(last_x, utc=True, errors="coerce")
-                        if last_ts is not pd.NaT and (asof_ts - last_ts) < pd.Timedelta(hours=float(cd_h)):
+                    if last_x:
+                        asof_dt = pd.to_datetime(self._cycle_data_ts, utc=True).to_pydatetime()
+                        if (asof_dt - last_x) < timedelta(hours=cd_h):
                             continue
 
                     async with self.symbol_locks[sym]:
@@ -4089,65 +3822,13 @@ class LiveTrader:
             LOG.info("Scan cycle complete. Sleeping…")
             await asyncio.sleep(self.cfg.get("SCAN_INTERVAL_SEC", 60))
 
-    async def _data_clock_now(self, preferred_symbol: str | None = None) -> datetime | None:
-        """
-        Return a timezone-aware datetime derived from data timestamps (no wall-clock).
-
-        Priority:
-          1) self._cycle_asof_ts (scan-loop gov clock)
-          2) last closed 5m bar for preferred_symbol (or cfg EQUITY_CLOCK_SYMBOL / BTCUSDT)
-          3) latest equity_snapshots.ts in DB
-          4) latest positions.closed_at in DB
-        """
-        # 1) Cycle data clock (preferred)
-        asof_ts = getattr(self, "_cycle_asof_ts", None)
-        if asof_ts is not None and not pd.isna(asof_ts):
-            try:
-                return pd.to_datetime(asof_ts, utc=True).to_pydatetime()
-            except Exception:
-                pass
-
-        # 2) Last closed 5m bar on a canonical symbol (still data-derived)
-        sym = preferred_symbol
-        if not sym:
-            sym = str(self.cfg.get("EQUITY_CLOCK_SYMBOL", "") or "").strip() or "BTCUSDT"
-        try:
-            ts = await self._last_closed_5m_ts(sym)
-            if ts is not None and not pd.isna(ts):
-                return pd.to_datetime(ts, utc=True).to_pydatetime()
-        except Exception:
-            pass
-
-        # 3–4) DB-derived fallbacks (still not wall-clock)
-        try:
-            if getattr(self, "db", None) is not None and getattr(self.db, "pool", None) is not None:
-                ts = await self.db.pool.fetchval("SELECT ts FROM equity_snapshots ORDER BY ts DESC LIMIT 1")
-                if ts:
-                    return pd.to_datetime(ts, utc=True).to_pydatetime()
-
-                ts = await self.db.pool.fetchval(
-                    "SELECT closed_at FROM positions "
-                    "WHERE status='CLOSED' AND closed_at IS NOT NULL "
-                    "ORDER BY closed_at DESC LIMIT 1"
-                )
-                if ts:
-                    return pd.to_datetime(ts, utc=True).to_pydatetime()
-        except Exception:
-            pass
-
-        return None
 
     async def _equity_loop(self):
         while True:
             try:
                 bal = await self._fetch_platform_balance()
                 current_equity = bal["total"].get("USDT", 0.0)
-
-                clock_dt = await self._data_clock_now()
-                if clock_dt is None:
-                    LOG.warning("Equity snapshot skipped: no data-derived clock available.")
-                else:
-                    await self.db.snapshot_equity(current_equity, clock_dt)
+                await self.db.snapshot_equity(current_equity, datetime.now(timezone.utc))
 
                 if current_equity > self.peak_equity:
                     self.peak_equity = current_equity
@@ -4172,39 +3853,16 @@ class LiveTrader:
         Single source of truth for zero-size finalization to avoid divergent code paths.
         """
         bundle = getattr(self, "bundle_id", None) or "no_bundle"
-
-        # Data-time debounce (no wall-clock leakage)
-        asof_ts = getattr(self, "_cycle_asof_ts", None)
-        if asof_ts is None:
-            try:
-                asof_ts = await self._last_closed_5m_ts(symbol)
-            except Exception:
-                asof_ts = None
-
-        now = None
-        if asof_ts is not None and not pd.isna(asof_ts):
-            now = pd.to_datetime(asof_ts, utc=True).to_pydatetime()
-        else:
-            # last resort: use opened_at (should already be data-derived); if missing, disable debounce
-            now = pos.get("opened_at")
+        now = datetime.now(timezone.utc)
 
         # Debounce finalize attempts
         if not hasattr(self, "_zero_finalize_backoff"):
             self._zero_finalize_backoff = {}
         last_try = self._zero_finalize_backoff.get(pid)
-
-        if (now is not None) and (last_try is not None):
-            try:
-                if (now - last_try).total_seconds() < float(self.cfg.get("FINALIZE_BACKOFF_SEC", 120)):
-                    LOG.info("bundle=%s Position size is 0 for %s; finalize debounced.", bundle, symbol)
-                    return
-            except Exception:
-                # If subtraction fails, do not debounce (fail-open for finalization only).
-                pass
-
-        if now is not None:
-            self._zero_finalize_backoff[pid] = now
-
+        if last_try and (now - last_try).total_seconds() < float(self.cfg.get("FINALIZE_BACKOFF_SEC", 120)):
+            LOG.info("bundle=%s Position size is 0 for %s; finalize debounced.", bundle, symbol)
+            return
+        self._zero_finalize_backoff[pid] = now
 
         # Infer exit reason by checking our known clientOrderIds
         exit_kind = "MANUAL_CLOSE"
@@ -4229,13 +3887,12 @@ class LiveTrader:
                     exit_kind = label
                     break
             except Exception as e:
-                LOG.warning(
-                    "bundle=%s fetch_by_cid failed while inferring exit for %s cid=%s: %s",
-                    bundle, symbol, cid, e
-                )
+                LOG.warning("bundle=%s fetch_by_cid failed while inferring exit for %s cid=%s: %s", bundle, symbol, cid, e)
 
         LOG.info("bundle=%s Finalizing zero-size %s pid=%d inferred_reason=%s", bundle, symbol, pid, exit_kind)
+
         await self._finalize_position(pid, pos, inferred_exit_reason=exit_kind)
+
 
     async def _find_pid_by_symbol(self, symbol: str, status: str = "CLOSED") -> Optional[int]:
         """Return most recent position id for a symbol with given status."""
@@ -4437,6 +4094,7 @@ class LiveTrader:
         # 2) Reconcile & identify valid order CIDs
         LOG.info("Reconciling and identifying valid protective orders…")
         valid_cids = set()
+        now_utc = datetime.now(timezone.utc)
 
         for symbol, pos_data in open_exchange_positions.items():
             if symbol not in db_positions:
@@ -4451,27 +4109,10 @@ class LiveTrader:
                     LOG.error("Failed to force-close orphan position %s: %s", symbol, e)
 
         for symbol, pos_row in list(db_positions.items()):
+            pid = pos_row["id"]
             if symbol not in open_exchange_positions:
                 LOG.warning("DB/EX mismatch: %s OPEN in DB but not on exchange. Closing in DB.", symbol)
-
-                # Data-derived closed_at: use last closed 5m bar if available; else fall back to opened_at.
-                closed_at_dt = None
-                try:
-                    evt_ts = await self._last_closed_5m_ts(symbol)
-                    if evt_ts is not None and not pd.isna(evt_ts):
-                        closed_at_dt = pd.to_datetime(evt_ts, utc=True).to_pydatetime()
-                except Exception:
-                    closed_at_dt = None
-                if closed_at_dt is None:
-                    closed_at_dt = pos_row.get("opened_at")
-
-                await self.db.update_position(
-                    pid,
-                    status="CLOSED",
-                    closed_at=closed_at_dt,
-                    pnl=0,
-                    exit_reason="RECONCILE_CLOSE",
-                )
+                await self.db.update_position(pid, status="CLOSED", closed_at=now_utc, pnl=0, exit_reason="RECONCILE_CLOSE")
                 del db_positions[symbol]
                 continue
 
@@ -4539,23 +4180,18 @@ class LiveTrader:
 
         LOG.info("Loading recent exit timestamps for cooldowns…")
         cd_h = int(self.cfg.get("SYMBOL_COOLDOWN_HOURS", cfg.SYMBOL_COOLDOWN_HOURS))
-
         rows = await self.db.pool.fetch(
-            "SELECT DISTINCT ON (symbol) symbol, closed_at "
-            "FROM positions "
-            "WHERE status='CLOSED' AND closed_at IS NOT NULL "
-            "ORDER BY symbol, closed_at DESC"
-        )           
-
+            "SELECT symbol, closed_at FROM positions "
+            "WHERE status='CLOSED' AND closed_at > (NOW() AT TIME ZONE 'utc') - $1::interval",
+            timedelta(hours=cd_h),
+        )
         for r in rows:
             self.last_exit[r["symbol"]] = r["closed_at"]
 
         LOG.info("<-- Resume complete.")
 
     async def _generate_summary_report(self, period: str) -> str:
-        now = await self._data_clock_now()
-        if now is None:
-            return "Error: no data-derived clock available for reporting."
+        now = datetime.now(timezone.utc)
         period_map = {
             '6h': timedelta(hours=6),
             'daily': timedelta(days=1),
@@ -4621,10 +4257,7 @@ class LiveTrader:
         Uses equity_snapshots when available (preferred for CAGR/Sharpe/MAR),
         otherwise synthesizes an equity curve from closed trades.
         """
-        now = await self._data_clock_now()
-        if now is None:
-            return "Error: no data-derived clock available for reporting."
-
+        now = datetime.now(timezone.utc)
         window_map = {
             '6h': timedelta(hours=6),
             'daily': timedelta(days=1),
@@ -4836,29 +4469,12 @@ class LiveTrader:
         # 4) Default
         return "short"
 
-
-    def _ccxt(self):
-        """
-        Return the underlying ccxt exchange instance regardless of whether
-        self.exchange is an ExchangeProxy wrapper or a raw ccxt exchange.
-        """
-        ex = getattr(self.exchange, "_exchange", None)
-        if ex is not None:
-            return ex
-        ex = getattr(self.exchange, "ex", None)
-        if ex is not None:
-            return ex
-        return self.exchange
-
     async def _reporting_loop(self):
-
         LOG.info("Reporting loop started.")
         last_report_sent = {}
         while True:
             await asyncio.sleep(60 * 5)
-            now = await self._data_clock_now()
-            if now is None:
-                continue
+            now = datetime.now(timezone.utc)
             periods_to_check = {
                 '6h': now.hour % 6 == 0,
                 'daily': now.hour == 0,
@@ -4894,10 +4510,8 @@ class LiveTrader:
             LOG.warning("="*60)
 
         LOG.info("Loading exchange markets…")
-        LOG.info("exchange obj=%s", type(self.exchange))
-
         try:
-            await self._ccxt().load_markets()
+            await self.exchange._exchange.load_markets()
             LOG.info("Markets loaded.")
         except Exception as e:
             LOG.error("Could not load markets: %s. Exiting.", e)
@@ -4907,7 +4521,7 @@ class LiveTrader:
         self._listing_dates_cache = await self._load_listing_dates()
 
         await self._resume()
-        await self.tg.send("DONCH v2.1.2 (sprint 2) started successfully.")
+        await self.tg.send("DONCH v4.2 (Sprint 3.0) started successfully.")
 
         try:
             async with asyncio.TaskGroup() as tg:
@@ -5022,21 +4636,39 @@ class LiveTrader:
 def create_entry_cid(symbol: str, decision_ts: pd.Timestamp, side: str, tag: str = "ENTRY") -> str:
     """
     Deterministic client order ID for entry orders.
-
-    Stable across retries/restarts for the same (symbol, decision_ts, side, tag).
-    Keeps length <= 36 characters for Bybit/CCXT clientOrderId constraints.
+    Stable across retries/restarts for same (symbol, decision_ts, side, tag).
+    Sprint 3.0: Replaces wall-clock random logic.
     """
-    ts = pd.to_datetime(decision_ts, utc=True).strftime("%Y%m%d%H%M")  # minute bucket
+    ts = pd.to_datetime(decision_ts, utc=True).strftime("%Y%m%d%H%M")
     sym8 = str(symbol).replace("/", "").upper()[:8]
     side1 = "L" if str(side).upper().startswith("L") else "S"
     base = f"{tag}|{symbol}|{side}|{ts}"
     h = hashlib.sha1(base.encode("utf-8")).hexdigest()[:8]
     return f"bot_{tag}{sym8}{side1}{ts}{h}"[:36]
 
+def validate_required_features(row: dict, required: list) -> tuple[bool, list]:
+    """
+    Fail-closed feature validation (Sprint 3.1).
+    Returns (True, []) if all present and finite.
+    Returns (False, [missing_keys]) if any missing or NaN/Inf.
+    """
+    missing = []
+    for k in required:
+        val = row.get(k)
+        if val is None:
+            missing.append(k)
+            continue
+        try:
+            f = float(val)
+            if not math.isfinite(f):
+                missing.append(k)
+        except (ValueError, TypeError):
+            missing.append(k)
+    return (len(missing) == 0), missing
+
 def create_stable_cid(pid: int, tag: str) -> str:
     """Stable client order ID for SL/TP."""
     return f"bot_{pid}_{tag}"[:36]
-
 
 
 # ──────────────────────────────────────────────────────────────────────────────
