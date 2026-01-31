@@ -3273,7 +3273,7 @@ class LiveTrader:
             self.open_positions[pid] = dict(row)
 
             # --- Telegram ---
-            ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+            ts = opened_at_dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M")
 
             # thresholds from config
             rs_min       = float(self.cfg.get("RS_MIN_PERCENTILE", 70))
@@ -4021,18 +4021,26 @@ class LiveTrader:
         if asof_ts is not None and not pd.isna(asof_ts):
             now = pd.to_datetime(asof_ts, utc=True).to_pydatetime()
         else:
-            # last resort: use opened_at (should be data-derived); if missing, skip debounce
+            # last resort: use opened_at (should already be data-derived); if missing, disable debounce
             now = pos.get("opened_at")
 
         # Debounce finalize attempts
         if not hasattr(self, "_zero_finalize_backoff"):
             self._zero_finalize_backoff = {}
         last_try = self._zero_finalize_backoff.get(pid)
-        if now is not None and last_try and (now - last_try).total_seconds() < float(self.cfg.get("FINALIZE_BACKOFF_SEC", 120)):
-            LOG.info("bundle=%s Position size is 0 for %s; finalize debounced.", bundle, symbol)
-            return
+
+        if (now is not None) and (last_try is not None):
+            try:
+                if (now - last_try).total_seconds() < float(self.cfg.get("FINALIZE_BACKOFF_SEC", 120)):
+                    LOG.info("bundle=%s Position size is 0 for %s; finalize debounced.", bundle, symbol)
+                    return
+            except Exception:
+                # If subtraction fails, do not debounce (fail-open for finalization only).
+                pass
+
         if now is not None:
             self._zero_finalize_backoff[pid] = now
+
 
         # Infer exit reason by checking our known clientOrderIds
         exit_kind = "MANUAL_CLOSE"
