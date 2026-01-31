@@ -103,7 +103,13 @@ def compute_daily_regime_series(
     close = pd.to_numeric(df["close"], errors="coerce").astype(float)
 
     tma = close.rolling(int(ma_period), min_periods=max(5, int(ma_period) // 5)).mean()
-    atr = ta.atr(df["high"], df["low"], df["close"], int(atr_period))
+
+    ohlc_cols = ["open", "high", "low", "close"]
+    if all(c in df.columns for c in ohlc_cols):
+        atr = ta.atr(df[ohlc_cols], int(atr_period))
+    else:
+        atr = ta.atr(df[["high", "low", "close"]], int(atr_period))
+
     upper = tma + float(atr_mult) * atr
     lower = tma - float(atr_mult) * atr
 
