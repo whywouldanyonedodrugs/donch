@@ -3353,23 +3353,22 @@ class LiveTrader:
 
         if self.cfg.get("TIME_EXIT_ENABLED", cfg.TIME_EXIT_ENABLED):
 
+            ddl = pos.get("exit_deadline")
+            if ddl:
+                # Use data-derived “now” (cycle gov clock if available; else last closed 5m bar for this symbol).
+                asof_ts = getattr(self, "_cycle_asof_ts", None)
+                if asof_ts is None:
+                    try:
+                        asof_ts = await self._last_closed_5m_ts(symbol)
+                    except Exception:
+                        asof_ts = None
 
-        ddl = pos.get("exit_deadline")
-        if ddl:
-            # Use data-derived “now” (cycle gov clock if available; else last closed 5m bar for this symbol).
-            asof_ts = getattr(self, "_cycle_asof_ts", None)
-            if asof_ts is None:
-                try:
-                    asof_ts = await self._last_closed_5m_ts(symbol)
-                except Exception:
-                    asof_ts = None
-
-            if asof_ts is not None and not pd.isna(asof_ts):
-                now_dt = pd.to_datetime(asof_ts, utc=True).to_pydatetime()
-                if now_dt >= ddl:
-                    LOG.info("bundle=%s Time-exit firing on %s (pid %d)", bundle, symbol, pid)
-                    await self._force_close_position(pid, pos, tag="TIME_EXIT")
-                    return
+                if asof_ts is not None and not pd.isna(asof_ts):
+                    now_dt = pd.to_datetime(asof_ts, utc=True).to_pydatetime()
+                    if now_dt >= ddl:
+                        LOG.info("bundle=%s Time-exit firing on %s (pid %d)", bundle, symbol, pid)
+                        await self._force_close_position(pid, pos, tag="TIME_EXIT")
+                        return
 
         trailing_active = bool(pos.get("trailing_active", False))
 
