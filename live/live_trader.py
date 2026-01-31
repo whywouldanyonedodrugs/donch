@@ -2325,16 +2325,18 @@ class LiveTrader:
 
             # ---- Sprint 2 / Option A: freeze macro regime inputs from golden truth ----
             if getattr(self, "meta_bundle", None) is not None:
-                macro = macro_regimes_asof(bundle_dir=self.bundle_dir, decision_ts=decision_ts, logger=self.log)
-                for k, v in (macro or {}).items():
-                    try:
-                        cur = meta_full.get(k, np.nan)
-                        # keep existing finite values; only fill missing/NaN
-                        if isinstance(cur, (int, float)) and np.isfinite(cur):
-                            continue
-                    except Exception:
-                        pass
-                    meta_full[k] = v
+                try:
+                    macro = macro_regimes_asof(self.meta_bundle, decision_ts)
+                    if isinstance(macro, dict) and macro:
+                        meta_full.update(macro)
+                except Exception as e:
+                    LOG.warning(
+                        "bundle=%s macro_regimes_asof failed: %s",
+                        getattr(self, "bundle_id", "no_bundle"),
+                        e,
+                    )
+                    # fail-closed behavior: keep meta_full without macro overlay; downstream strict slicing will
+                    # produce NaNs for missing required keys, which should lead to no-trade rather than a crash.
 
             # Keep regime_up consistent with regime_code_1d (if regime_up is still used downstream)
             # (Adjust mapping only if your offline team defines it differently.)
