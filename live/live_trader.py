@@ -63,8 +63,7 @@ from .feature_builder import FeatureBuilder
 from .parity_utils import resample_ohlcv, donchian_upper_days_no_lookahead, eval_meta_scope
 
 from .oi_funding import fetch_series_5m, compute_oi_funding_features, StaleDerivativesDataError
-from .regimes_report import RegimeThresholds
-
+from .regimes_report import RegimeThresholds, load_regime_thresholds
 
 import logging
 logging.getLogger("watchdog").setLevel(logging.WARNING)
@@ -504,16 +503,20 @@ class LiveTrader:
                 LOG.warning("bundle=%s Golden features load failed (continuing without): %s", self.bundle_id, e)
                 self.golden_store = None
 
-            # --- NEW: regimes thresholds for deterministic meta feature codes (S2/S3/S4/S6, etc.)
-            self.regime_thresholds = self._load_regime_thresholds()
-
             # RegimeThresholds object required by live/oi_funding.py (attribute access, not dict keys).
+            # IMPORTANT: regimes_report.json contains extra threshold keys not in RegimeThresholds.
+            # Always construct via load_regime_thresholds(), which selects only required fields.
             self.regime_thresholds_obj = None
             try:
-                self.regime_thresholds_obj = RegimeThresholds(**self.regime_thresholds)
+                self.regime_thresholds_obj = load_regime_thresholds(Path(self.meta_bundle.meta_dir))
             except Exception as e:
                 # Fail-closed: if thresholds cannot be constructed, OI/FR features will be omitted.
-                LOG.error("bundle=%s Invalid regime_thresholds (disabling OI/FR features): %s", self.bundle_id, e)
+                LOG.error(
+                    "bundle=%s Invalid regimes_report thresholds (disabling OI/FR features): %s",
+                    self.bundle_id,
+                    e,
+                )
+                self.regime_thresholds_obj = None
 
             # --- Sprint 2.4: persistent online performance state ---
             try:
@@ -1341,7 +1344,38 @@ class LiveTrader:
             except Exception:
                 pass
 
+    def _is_bad_numeric(self, v: Any) -> bool:
+        """
+        Fail-closed numeric validity check for required features.
+        Returns True if v is missing/invalid (None, NaN, inf, non-scalar, non-parsable).
+        """
+        if v is None:
+            return True
 
+        # bool is acceptable (it is a common model feature encoding)
+        if isinstance(v, (bool, np.bool_)):
+            return False
+
+        # numpy numeric scalars
+        if isinstance(v, (np.integer, np.floating)):
+            return not np.isfinite(float(v))
+
+        # python numeric scalars
+        if isinstance(v, (int, float)):
+            return not np.isfinite(float(v))
+
+        # strings: attempt parse
+        if isinstance(v, str):
+            s = v.strip()
+            if s == "":
+                return True
+            try:
+                return not np.isfinite(float(s))
+            except Exception:
+                return True
+
+        # anything else: treat as invalid (fail-closed)
+        return True
 
     def _missing_required_features(self, row: dict, required: list[str]) -> list[str]:
         missing = []
