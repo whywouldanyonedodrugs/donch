@@ -7,7 +7,6 @@ import numpy as np
 import pandas as pd
 
 import inspect
-import os
 
 
 from .regimes_report import RegimeThresholds
@@ -329,45 +328,19 @@ def compute_oi_funding_features(
     oi_s = _extract_series(oi5, preferred_cols=["open_interest", "openInterest", "oi", "value"])
     fr_s = _extract_series(fr5, preferred_cols=["funding_rate", "fundingRate", "fr", "value"])
 
-    # Staleness check must be based on raw series, not on ffilled grids.
-    #
-    # Funding cadence on Bybit perps is typically 8h. Offline pipelines often forward-fill the
-    # last printed funding rate across 5m decision grids. To preserve strict "as-of" semantics
-    # while avoiding unnecessary vetoes, allow configuring OI vs Funding staleness separately
-    # via environment variables:
-    #   - DONCH_OI_MAX_AGE_MIN
-    #   - DONCH_FUNDING_MAX_AGE_MIN
-    #
-    # If env vars are not set, both fall back to `staleness_max_age` (legacy behavior).
+    # Staleness check must be based on raw series, not on ffilled grids
     if staleness_max_age is not None:
-        oi_max_age = staleness_max_age
-        fr_max_age = staleness_max_age
-
-        try:
-            v = os.getenv('DONCH_OI_MAX_AGE_MIN')
-            if v is not None and str(v).strip() != '':
-                oi_max_age = pd.Timedelta(minutes=int(v))
-        except Exception:
-            pass
-
-        try:
-            v = os.getenv('DONCH_FUNDING_MAX_AGE_MIN')
-            if v is not None and str(v).strip() != '':
-                fr_max_age = pd.Timedelta(minutes=int(v))
-        except Exception:
-            pass
-
         last_oi = oi_s.dropna().index.max() if len(oi_s.dropna()) else None
         last_fr = fr_s.dropna().index.max() if len(fr_s.dropna()) else None
         if last_oi is None or last_fr is None:
-            raise StaleDerivativesDataError('Derivatives series missing raw observations (OI/FR)')
-        if (decision_ts - last_oi) > oi_max_age:
+            raise StaleDerivativesDataError("Derivatives series missing raw observations (OI/FR)")
+        if (decision_ts - last_oi) > staleness_max_age:
             raise StaleDerivativesDataError(
-                f"OI stale: last={last_oi} decision_ts={decision_ts} max_age={oi_max_age}"
+                f"OI stale: last={last_oi} decision_ts={decision_ts} max_age={staleness_max_age}"
             )
-        if (decision_ts - last_fr) > fr_max_age:
+        if (decision_ts - last_fr) > staleness_max_age:
             raise StaleDerivativesDataError(
-                f"Funding stale: last={last_fr} decision_ts={decision_ts} max_age={fr_max_age}"
+                f"Funding stale: last={last_fr} decision_ts={decision_ts} max_age={staleness_max_age}"
             )
 
     # As-of mapping onto decision grid
