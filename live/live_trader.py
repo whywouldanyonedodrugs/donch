@@ -430,8 +430,14 @@ class LiveTrader:
         meta_dir = (self.cfg.get("META_EXPORT_DIR")
                     or self.cfg.get("WINPROB_ARTIFACT_DIR", "results/meta_export"))
         self.meta_dir = str(meta_dir)
+
+        # Back-compat: some helpers still expect LiveTrader.bundle_dir
+        # (it should point at the same directory as meta_dir / meta_bundle.meta_dir).
+        self.bundle_dir = self.meta_dir
+
         strict_bundle = bool(self.cfg.get("STRICT_META_BUNDLE", True))
         required_extra = self.cfg.get("META_REQUIRED_EXTRA_FILES", []) or []
+
 
         try:
             self.meta_bundle = load_bundle(
@@ -439,7 +445,10 @@ class LiveTrader:
                 required_extra_files=required_extra,
                 strict=strict_bundle,
             )
+
             self.meta_dir = str(self.meta_bundle.meta_dir)
+            self.bundle_dir = self.meta_dir
+
             _set_bundle_id_for_logs(self.meta_bundle.bundle_id)
             self.bundle_id = self.meta_bundle.bundle_id
             self.winprob = WinProbScorer(bundle=self.meta_bundle, strict_schema=True)
@@ -453,6 +462,8 @@ class LiveTrader:
             self.meta_bundle = None
             self.bundle_id = None
             self.winprob = None
+            self.bundle_dir = None
+
         else:
             LOG.info("Meta bundle loaded: dir=%s id=%s", self.meta_bundle.meta_dir, self.bundle_id)
             pstar = getattr(self.winprob, "pstar", None)
