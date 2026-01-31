@@ -378,7 +378,12 @@ class LiveTrader:
         for k, v in self.cfg.items():  # keep config.py attributes in sync too
             setattr(cfg, k, v)
 
-        self.feature_builder = FeatureBuilder(self.cfg)
+        # Logger handle (some helpers expect LiveTrader.log)
+        self.log = LOG
+
+        # Pass logger into the strict-parity feature builder too
+        self.feature_builder = FeatureBuilder(self.cfg, logger=self.log)
+
 
         self.db = DB(settings.pg_dsn)
         self.tg = TelegramBot(settings.tg_bot_token, settings.tg_chat_id)
