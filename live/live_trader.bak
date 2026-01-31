@@ -47,12 +47,19 @@ from .database import DB
 from .telegram import TelegramBot
 from .winprob_loader import WinProbScorer
 from .golden_features import GoldenFeatureStore
+from .regime_features import compute_daily_regime_snapshot, compute_markov4h_snapshot, drop_incomplete_last_bar
+from .regime_truth import macro_regimes_asof
+
+from .online_state import OnlinePerformanceState
 
 from .artifact_bundle import load_bundle, BundleError, SchemaError
 
 from pydantic import Field, ValidationError
 from pydantic_settings import BaseSettings
 from .strategy_engine import StrategyEngine
+
+from .feature_builder import FeatureBuilder
+from .parity_utils import resample_ohlcv, donchian_upper_days_no_lookahead, eval_meta_scope
 
 from .oi_funding import fetch_series_5m, compute_oi_funding_features
 
@@ -219,45 +226,30 @@ class RiskManager:
 
 class RegimeDetector:
     """
-    Computes a daily combined regime on a benchmark symbol and exposes:
-      - trend_regime_1d (str)
-      - vol_regime_1d (str)
-      - vol_prob_low_1d (float)
-      - regime_code_1d (int)
-      - markov_state_4h (int)
-      - markov_prob_up_4h (float)
+    Daily combined regime detector (trend + volatility) computed strictly as-of an explicit timestamp.
 
-    These are intended to be injected into gov_ctx so the meta feature builder
-    can satisfy the feature_manifest schema.
+    - No wall-clock time.
+    - Cache key is deterministic: asof_ts.floor('D') (daily regime only changes when a full day closes).
+    - Markov 4h is NOT computed here to avoid overwriting ETH-based Markov features owned by _get_gov_ctx().
     """
 
-    def __init__(self, exchange, benchmark_symbol="BTCUSDT", cache_minutes: int = 60):
+    def __init__(self, exchange, benchmark_symbol: str = "BTCUSDT", cache_minutes: int = 60):
         self.exchange = exchange
-        self.benchmark_symbol = benchmark_symbol
-        self.cache_minutes = cache_minutes
-        self.markov4h_alpha = float(getattr(cfg, "MARKOV4H_PROB_EWMA_ALPHA", 0.2)) if "cfg" in globals() else 0.2
+        self.benchmark_symbol = str(benchmark_symbol).upper()
 
-        self.last_update = None
-        self.cached_regime = None
+        # deterministic cache
+        self._cached_day_key: Optional[pd.Timestamp] = None
+        self._cached_regime: Optional[str] = None
 
-        # Latest primitives (populated on successful recompute)
         self.latest_meta = {
             "trend_regime_1d": None,
             "vol_regime_1d": None,
             "vol_prob_low_1d": None,
             "regime_code_1d": None,
-            "markov_state_4h": None,
-            "markov_prob_up_4h": None,
             "daily_regime_str_1d": None,
         }
 
-    def _cache_expired(self) -> bool:
-        if self.last_update is None:
-            return True
-        return (datetime.now(timezone.utc) - self.last_update).total_seconds() > (self.cache_minutes * 60)
-
     def get_latest_meta_features(self) -> dict:
-        # Return a shallow copy so callers can safely update() it.
         return dict(self.latest_meta)
 
     def _to_ohlcv_df(self, ohlcv) -> pd.DataFrame:
@@ -267,199 +259,59 @@ class RegimeDetector:
         df = df[~df.index.duplicated(keep="last")]
         return df
 
-    def _drop_incomplete_last_bar(self, df: pd.DataFrame, tf: str, asof_ts: pd.Timestamp) -> pd.DataFrame:
+    async def get_current_regime(self, asof_ts: pd.Timestamp) -> str:
         """
-        CCXT candles are typically timestamped at bar OPEN.
-        If the last bar open is >= floor(tf) of asof_ts, it is the currently-forming bar and should be excluded.
+        Returns combined daily regime string (e.g., 'BEAR_HIGH_VOL') for the latest fully-closed daily bar
+        as-of `asof_ts` (decision_ts semantics).
         """
-        if df.empty:
-            return df
-        if tf == "1d":
-            floor = asof_ts.floor("D")
-        elif tf == "4h":
-            floor = asof_ts.floor("4h")
+        asof_ts = pd.to_datetime(asof_ts, utc=True, errors="coerce")
+        if pd.isna(asof_ts):
+            raise ValueError("RegimeDetector requires a valid asof_ts (UTC)")
+
+        day_key = asof_ts.floor("D")
+        if day_key.tz is None:
+            day_key = day_key.tz_localize("UTC")
         else:
-            return df
-        if df.index[-1] >= floor:
-            return df.iloc[:-1]
-        return df
+            day_key = day_key.tz_convert("UTC")
 
-    def _calculate_trend_regime(self, df_daily: pd.DataFrame) -> pd.Series:
-        """
-        Offline parity: no RANGE state. Set BULL/BEAR only when price breaches channel,
-        otherwise NaN, then ffill/bfill.
-        """
-        close = df_daily["close"].astype(float)
-        high = df_daily["high"].astype(float)
-        low = df_daily["low"].astype(float)
+        if self._cached_day_key is not None and self._cached_day_key == day_key and self._cached_regime is not None:
+            return self._cached_regime
 
-        mid = (high + low) / 2.0
-        tma20 = triangular_moving_average(mid, 20)
-
-        atr20 = ta.atr(df_daily, 20)
-        upper = tma20 + (1.5 * atr20)
-        lower = tma20 - (1.5 * atr20)
-
-        trend = pd.Series(index=df_daily.index, dtype="object")
-        trend.loc[close > upper] = "BULL"
-        trend.loc[close < lower] = "BEAR"
-        trend = trend.ffill().bfill()
-        return trend
-
-
-    def _calculate_vol_regime_and_prob(self, daily_returns: pd.Series) -> tuple[pd.Series, pd.Series]:
-        """
-        Fits MarkovRegression(k_regimes=2, switching_variance=True) and returns:
-          - vol_regime: LOW_VOL / HIGH_VOL (by low-prob > 0.5)
-          - vol_prob_low: P(low-vol regime), smoothed
-        Uses weighted variance to identify which regime is "low vol" (robust).
-        """
-        rets = daily_returns.dropna()
-        if len(rets) < 200:
-            # Too little data for stable 2-state regime; return NaNs aligned to rets
-            vol_regime = pd.Series(index=rets.index, data=np.nan, name="vol_regime")
-            vol_prob_low = pd.Series(index=rets.index, data=np.nan, name="vol_prob_low")
-            return vol_regime, vol_prob_low
-
-        model = sm.tsa.MarkovRegression(rets, k_regimes=2, switching_variance=True, trend="c")
-        res = model.fit(disp=False, maxiter=200)
-
-        probs = res.smoothed_marginal_probabilities
-        if not isinstance(probs, pd.DataFrame) or probs.shape[1] != 2:
-            vol_regime = pd.Series(index=rets.index, data=np.nan, name="vol_regime")
-            vol_prob_low = pd.Series(index=rets.index, data=np.nan, name="vol_prob_low")
-            return vol_regime, vol_prob_low
-
-        # Weighted variance per regime to decide which state is low-vol
-        var_est = []
-        r = rets.values
-        for i in range(2):
-            p = probs[i].reindex(rets.index).fillna(0.0).values
-            denom = np.sum(p)
-            if denom <= 0:
-                var_est.append(np.inf)
-                continue
-            mu = float(np.sum(p * r) / denom)
-            v = float(np.sum(p * (r - mu) ** 2) / denom)
-            var_est.append(v)
-
-        low_idx = int(np.argmin(var_est))
-        low_prob = probs[low_idx].reindex(rets.index).astype(float).clip(0.0, 1.0)
-
-        vol_regime = pd.Series(
-            index=rets.index,
-            data=np.where(low_prob.values > 0.5, "LOW_VOL", "HIGH_VOL"),
-            name="vol_regime",
-        )
-        vol_prob_low = pd.Series(index=rets.index, data=low_prob.values, name="vol_prob_low")
-        return vol_regime, vol_prob_low
-
-    def _calculate_markov_4h_state_and_prob(self, df4h: pd.DataFrame) -> tuple[int | None, float | None]:
-        """
-        Offline parity: 2-state Markov on 4h close-to-close LOG returns.
-        Use FILTERED (past-only) probabilities and apply light EWM smoothing.
-        Returns: (markov_state_4h, markov_prob_up_4h).
-        """
-        if df4h is None or df4h.empty or len(df4h) < 200:
-            return None, None
-
-        close = df4h["close"].astype(float)
-        ret = np.log(close).diff().dropna()
-        if len(ret) < 150:
-            return None, None
-
-        alpha = float(getattr(self, "markov4h_alpha", None) or 0.2)
         try:
-            mod = sm.tsa.MarkovRegression(ret, k_regimes=2, switching_variance=True, trend="c")
-            res = mod.fit(disp=False, maxiter=200)
+            # Fetch daily candles and drop the currently-forming day
+            ohlcv_d = await self.exchange.fetch_ohlcv(self.benchmark_symbol, timeframe="1d", limit=900)
+            df_d = self._to_ohlcv_df(ohlcv_d)
+            df_d = drop_incomplete_last_bar(df_d, "1d", asof_ts)
 
-            # FILTERED probs (past-only)
-            filt_probs = [res.filtered_marginal_probabilities[i] for i in range(2)]
+            ma_period = int(getattr(cfg, "REGIME_MA_PERIOD", 100))
+            atr_period = int(getattr(cfg, "REGIME_ATR_PERIOD", 20))
+            atr_mult = float(getattr(cfg, "REGIME_ATR_MULT", 2.0))
 
-            # Identify "UP" state as higher weighted mean return
-            means = []
-            for p in filt_probs:
-                w = p.values
-                r = ret.reindex(p.index).values
-                mu = float(np.sum(w * r) / max(float(np.sum(w)), 1e-12))
-                means.append(mu)
-            up_idx = int(np.argmax(means))
+            snap = compute_daily_regime_snapshot(
+                df_d,
+                asof_ts=asof_ts,
+                ma_period=ma_period,
+                atr_period=atr_period,
+                atr_mult=atr_mult,
+            )
 
-            prob_up = filt_probs[up_idx].clip(0.0, 1.0)
-            prob_up = prob_up.ewm(alpha=alpha, adjust=False).mean().clip(0.0, 1.0)
+            self._cached_regime = str(snap["daily_regime_str_1d"])
+            self._cached_day_key = day_key
 
-            last_prob = float(prob_up.iloc[-1])
-            last_state = int(last_prob > 0.5)
-            return last_state, last_prob
+            self.latest_meta["trend_regime_1d"] = snap["trend_regime_1d"]
+            self.latest_meta["vol_regime_1d"] = snap["vol_regime_1d"]
+            self.latest_meta["vol_prob_low_1d"] = float(snap["vol_prob_low_1d"])
+            self.latest_meta["daily_regime_str_1d"] = snap["daily_regime_str_1d"]
+            self.latest_meta["regime_code_1d"] = int(snap["regime_code_1d"])
+
+            return self._cached_regime
 
         except Exception:
-            return None, None
+            LOG.exception("Regime detector error (daily)")
+            if self._cached_regime is None:
+                self._cached_regime = "UNKNOWN"
+            return self._cached_regime
 
-
-    async def get_current_regime(self, asof_ts: pd.Timestamp | None = None) -> str:
-        if asof_ts is None:
-            asof_ts = pd.Timestamp(datetime.now(timezone.utc))
-
-        if not self._cache_expired() and self.cached_regime is not None:
-            return self.cached_regime
-
-        LOG.info("Regime cache expired/empty. Recomputing…")
-        try:
-            # DAILY
-            ohlcv_d = await self.exchange.fetch_ohlcv(self.benchmark_symbol, timeframe="1d", limit=600)
-            df_d = self._to_ohlcv_df(ohlcv_d)
-            df_d = self._drop_incomplete_last_bar(df_d, "1d", asof_ts)
-
-            if len(df_d) < 250:
-                raise RuntimeError(f"Not enough daily bars for regime ({len(df_d)})")
-
-            df_d["trend_regime"] = self._calculate_trend_regime(df_d)
-
-            daily_returns = df_d["close"].pct_change()
-            vol_regime, vol_prob_low = self._calculate_vol_regime_and_prob(daily_returns.dropna())
-
-            df_d.loc[vol_regime.index, "vol_regime"] = vol_regime
-            df_d.loc[vol_prob_low.index, "vol_prob_low"] = vol_prob_low
-
-            df_d["combined_regime"] = df_d["trend_regime"].astype(str) + "_" + df_d["vol_regime"].astype(str)
-
-            df_ok = df_d.dropna(subset=["trend_regime", "vol_regime", "vol_prob_low", "combined_regime"])
-            if df_ok.empty:
-                raise RuntimeError("No valid daily regime rows after dropna")
-
-            last = df_ok.iloc[-1]
-            combined = str(last["combined_regime"])
-
-            code_map = {"BEAR_HIGH_VOL": 0, "BEAR_LOW_VOL": 1, "BULL_HIGH_VOL": 2, "BULL_LOW_VOL": 3}
-            regime_code = code_map.get(combined, None)
-
-            # 4H Markov (benchmark)
-            ohlcv_4h = await self.exchange.fetch_ohlcv(self.benchmark_symbol, timeframe="4h", limit=900)
-            df4h = self._to_ohlcv_df(ohlcv_4h)
-            df4h = self._drop_incomplete_last_bar(df4h, "4h", asof_ts)
-            m_state, m_prob = self._calculate_markov_4h_state_and_prob(df4h)
-
-            # Publish cache
-            self.cached_regime = combined
-            self.last_update = datetime.now(timezone.utc)
-
-            self.latest_meta["trend_regime_1d"] = str(last["trend_regime"])
-            self.latest_meta["vol_regime_1d"] = str(last["vol_regime"])
-            self.latest_meta["vol_prob_low_1d"] = float(last["vol_prob_low"])
-            self.latest_meta["daily_regime_str_1d"] = combined
-            self.latest_meta["regime_code_1d"] = int(regime_code) if regime_code is not None else None
-            self.latest_meta["markov_state_4h"] = int(m_state) if m_state is not None else None
-            self.latest_meta["markov_prob_up_4h"] = float(m_prob) if m_prob is not None else None
-
-            LOG.info(f"New market regime: {self.cached_regime}")
-            return self.cached_regime
-
-        except Exception as e:
-            LOG.exception("Regime detector error")
-            # Do not update cached_regime on failure; keep previous if any.
-            if self.cached_regime is None:
-                self.cached_regime = "UNKNOWN"
-            return self.cached_regime
 
 
 ###############################################################################
@@ -470,6 +322,7 @@ class RegimeDetector:
 class Signal:
     # Required
     symbol: str
+    decision_ts: pd.Timestamp
     entry: float
     atr: float
     rsi: float
@@ -516,6 +369,8 @@ class LiveTrader:
         self.cfg.update(cfg_dict)
         for k, v in self.cfg.items():  # keep config.py attributes in sync too
             setattr(cfg, k, v)
+
+        self.feature_builder = FeatureBuilder(self.cfg)
 
         self.db = DB(settings.pg_dsn)
         self.tg = TelegramBot(settings.tg_bot_token, settings.tg_chat_id)
@@ -642,26 +497,74 @@ class LiveTrader:
 
             # --- NEW: regimes thresholds for deterministic meta feature codes (S2/S3/S4/S6, etc.)
             self.regime_thresholds = self._load_regime_thresholds()
-            
 
 
+            # --- Sprint 2.4: persistent online performance state ---
+            try:
+                state_path = str(self.cfg.get("ONLINE_STATE_PATH", "results/online_state.jsonl"))
+                max_records = int(self.cfg.get("ONLINE_STATE_MAX_RECORDS", 2000))
+                self.online_state = OnlinePerformanceState(path=state_path, max_records=max_records)
+            except Exception as e:
+                LOG.warning("bundle=%s OnlinePerformanceState init failed (disabling): %s", getattr(self, "bundle_id", None) or "no_bundle", e)
+                self.online_state = None
 
 
-    async def _build_oi_funding_features(self, symbol: str, df5: "pd.DataFrame") -> dict:
+    async def _build_oi_funding_features(
+        self,
+        symbol: str,
+        df5: pd.DataFrame,
+        decision_ts: pd.Timestamp,
+    ) -> Dict[str, float]:
         """
-        Pull 5m OI & funding, align to df5, and compute the 13 features.
-        Fills NaNs to 0.0 when strict parity is enabled in the WinProbScorer.
+        OI/funding features computed strictly "as-of decision_ts" (no wall-clock leakage).
+
+        Fail-closed:
+          - if series fetch fails
+          - if staleness check fails
+          - if required raw is missing at decision_ts
+          - if STRICT_PARITY_FEATURES is enabled and any derived feature is NaN
         """
         try:
-            oi_days = int(self.cfg.get("OI_LOOKBACK_DAYS", 7))
-            fr_days = int(self.cfg.get("FUNDING_LOOKBACK_DAYS", 7))
-            oi5, fr5 = await fetch_series_5m(self.exchange, symbol, lookback_oi_days=oi_days, lookback_fr_days=fr_days)
-            allow_nans = not bool(getattr(self.winprob, "strict_parity", False))
-            feats = compute_oi_funding_features(df5, oi5, fr5, allow_nans=allow_nans)
+            if df5 is None or df5.empty:
+                raise ValueError("df5 is empty")
+
+            if decision_ts not in df5.index:
+                # Enforce strict as-of semantics: we only compute on decision grid.
+                raise KeyError(f"decision_ts not in df5.index: {decision_ts}")
+
+            # Hard as-of cut (prevents leakage if caller accidentally passes a longer frame).
+            df5_cut = df5.loc[:decision_ts].copy()
+            if df5_cut.empty:
+                raise ValueError("df5_cut is empty after slicing to decision_ts")
+
+            oi5, fr5 = await fetch_series_5m(
+                self.exchange,
+                symbol,
+                lookback_oi_days=int(self.cfg.get("OI_LOOKBACK_DAYS", 8)),
+                lookback_fr_days=int(self.cfg.get("FUNDING_LOOKBACK_DAYS", 8)),
+                end_ts=decision_ts,  # enforce as-of on the fetch side too
+            )
+
+            staleness_max_age = pd.Timedelta(minutes=int(self.cfg.get("DERIV_MAX_AGE_MIN", 30)))
+
+            strict = bool(self.cfg.get("STRICT_PARITY_FEATURES", False))
+            feats = compute_oi_funding_features(
+                df5=df5_cut,
+                oi5=oi5,
+                fr5=fr5,
+                thresholds=self.regime_thresholds,
+                allow_nans=not strict,
+                staleness_max_age=staleness_max_age,
+            )
             return feats
-        except Exception as e:
-            LOG.debug("OI/Funding feature pack failed for %s: %s", symbol, e)
+
+        except (StaleDerivativesDataError, KeyError, ValueError, NotImplementedError) as e:
+            self.logger.warning(f"OI/Funding features unavailable for {symbol} at {decision_ts}: {e}")
             return {}
+        except Exception as e:
+            self.logger.warning(f"OI/Funding features error for {symbol} at {decision_ts}: {e}")
+            return {}
+
 
     async def _fetch_ohlcv_df_paged(self, symbol: str, tf: str, limit: int) -> Optional[pd.DataFrame]:
         """
@@ -753,51 +656,165 @@ class LiveTrader:
             df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
             df = df.set_index("timestamp").sort_index()
 
-            # Drop last bar if it is still forming (open-labeled semantics)
+            # Drop last bar deterministically (conservative; avoids wall-clock leakage)
             if len(df) > 1:
-                now_ts = pd.Timestamp(datetime.now(timezone.utc))
-                freq = {"5m": "5min", "15m": "15min", "30m": "30min", "1h": "1h", "4h": "4h", "1d": "D"}.get(tf)
-                if freq is None:
-                    # Fallback: conservative behavior
-                    df = df.iloc[:-1]
-                else:
-                    floor = now_ts.floor(freq)
-                    if df.index[-1] >= floor:
-                        df = df.iloc[:-1]
+                df = df.iloc[:-1]
 
             return df
         except Exception as e:
             LOG.debug("OHLCV fetch failed %s %s: %s", symbol, tf, e)
             return None
 
+    def _asof_series_value(self, s: pd.Series, ts: pd.Timestamp) -> float:
+        """
+        Deterministic as-of lookup: last finite value with index <= ts.
+        Returns np.nan if none.
+        """
+        try:
+            ts = pd.to_datetime(ts, utc=True, errors="coerce")
+            if pd.isna(ts):
+                return float(np.nan)
+
+            if s is None or len(s) == 0:
+                return float(np.nan)
+
+            if not isinstance(s.index, pd.DatetimeIndex):
+                return float(np.nan)
+
+            idx = s.index
+            if idx.tz is None:
+                idx = idx.tz_localize("UTC")
+                s = s.copy()
+                s.index = idx
+            else:
+                s = s.copy()
+                s.index = idx.tz_convert("UTC")
+
+            s = s.sort_index()
+            s = s.replace([np.inf, -np.inf], np.nan).dropna()
+            if s.empty:
+                return float(np.nan)
+
+            pos = int(s.index.searchsorted(ts, side="right") - 1)
+            if pos < 0:
+                return float(np.nan)
+            return float(s.iloc[pos])
+        except Exception:
+            return float(np.nan)
+
+    async def _compute_cross_asset_daily_ctx(self, asset: str, asof_ts: pd.Timestamp, df5: Optional[pd.DataFrame] = None) -> dict:
+        """
+        Offline-parity cross-asset DAILY context (scout.py logic):
+        - vol_regime_level: (ATR20/close) / expanding_median(min_periods=50), then shift(1)
+        - trend_slope: diff( MA20 - MA50 ), then shift(1)
+
+        IMPORTANT:
+        - Do NOT drop today's (forming) 1D candle, because shift(1) makes today's value depend only on yesterday.
+        - As-of mapping uses last index <= decision_ts (intraday).
+        """
+        out: dict = {}
+        asset = str(asset).upper()
+        prefix = asset.lower()  # "btcusdt" / "ethusdt"
+
+        asof_ts = pd.to_datetime(asof_ts, utc=True, errors="coerce")
+        if pd.isna(asof_ts):
+            return out
+        try:
+            # Offline parity: build DAILY bars from the 5m stream using pandas resample defaults
+            # (label=left, closed=left). Fall back to exchange-provided 1d candles only if df5 is unavailable.
+            if df5 is not None and isinstance(df5, pd.DataFrame) and not df5.empty:
+                _df5 = df5.copy()
+                if _df5.index.tz is None:
+                    _df5.index = _df5.index.tz_localize("UTC")
+                else:
+                    _df5.index = _df5.index.tz_convert("UTC")
+                _df5 = _df5.sort_index()
+                _df5 = _df5[~_df5.index.duplicated(keep="last")]
+
+                needed_5m = ("open", "high", "low", "close", "volume")
+                if any(c not in _df5.columns for c in needed_5m):
+                    raise ValueError("df5 missing required OHLCV columns")
+
+                daily = _df5[list(needed_5m)].resample("1D").agg({
+                    "open": "first",
+                    "high": "max",
+                    "low": "min",
+                    "close": "last",
+                    "volume": "sum",
+                })
+                df = daily.dropna(subset=["open", "high", "low", "close"])
+                if df.empty:
+                    return out
+
+            else:
+                ohlcv_d = await self.exchange.fetch_ohlcv(asset, timeframe="1d", limit=650)
+                if not ohlcv_d:
+                    return out
+
+                df = pd.DataFrame(ohlcv_d, columns=["ts", "open", "high", "low", "close", "volume"])
+                df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+                df = df.set_index("ts").sort_index()
+                df = df[~df.index.duplicated(keep="last")]
+
+            needed = ("open", "high", "low", "close")
+            if any(c not in df.columns for c in needed):
+                return out
+
+            # Compute daily ATR% and vol_regime_level (shift(1) is the no-lookahead guard)
+            # IMPORTANT: call ATR with positional period to avoid keyword incompatibilities across ta/indicator impls.
+            atr1d = ta.atr(df[["open", "high", "low", "close"]], 20)
+            close = df["close"].astype(float).replace(0.0, np.nan)
+            atr_pct = (atr1d.astype(float) / close)
+
+            base = atr_pct.expanding(min_periods=50).median().replace(0.0, np.nan)
+            vol_regime_level = (atr_pct / (base + 1e-12)).shift(1)
+
+            # Trend slope (shift(1) is the no-lookahead guard)
+            ma20 = close.rolling(20, min_periods=20).mean()
+            ma50 = close.rolling(50, min_periods=50).mean()
+            trend_slope = (ma20 - ma50).diff().shift(1)
+
+            out[f"{prefix}_vol_regime_level"] = self._asof_series_value(vol_regime_level, asof_ts)
+            out[f"{prefix}_trend_slope"] = self._asof_series_value(trend_slope, asof_ts)
+
+            # Manifest-friendly aliases (offline uses prefixed series, scorer may require short btc_/eth_ keys)
+            short = None
+            up = asset.upper()
+            if up.startswith("BTC"):
+                short = "btc"
+            elif up.startswith("ETH"):
+                short = "eth"
+
+            if short is not None:
+                out[f"{short}_vol_regime_level"] = out[f"{prefix}_vol_regime_level"]
+                out[f"{short}_trend_slope"] = out[f"{prefix}_trend_slope"]
+
+            return out
+
+
+        except Exception as e:
+            LOG.warning("Cross-asset daily ctx failed for %s: %s", asset, e)
+            return out
 
     async def _get_gov_ctx(self) -> dict:
         """
         Cycle-level context needed by the meta model.
 
-        MUST populate any manifest-required "global" features, including Markov 4h regime probability.
-        Uses as-of semantics: only fully closed bars (our fetch helper drops last partial bar).
-        Cached to avoid per-symbol recomputation.
+        Deterministic caching:
+        - Computed once per scan cycle and reused across symbols.
+        - Cache key is the cycle's `decision_ts_gov` (min last-closed 5m ts among BTC/ETH frames).
+        - No wall-clock TTL.
+
+        Owns Markov 4h (ETH by default) to match canonical offline semantics.
         """
-        ttl_sec = int(self.cfg.get("GOV_CTX_TTL_SEC", 60) or 60)
-        now = datetime.now(timezone.utc)
-
-        if hasattr(self, "_gov_ctx_cache") and hasattr(self, "_gov_ctx_cache_ts"):
-            age = (now - self._gov_ctx_cache_ts).total_seconds()
-            if age < ttl_sec:
-                return dict(self._gov_ctx_cache)
-
-        # Fetch 5m OHLCV for BTC/ETH (same limit pattern as base tf elsewhere)
+        # Fetch 5m OHLCV for BTC/ETH
         df_btc, df_eth = await asyncio.gather(
             self._fetch_ohlcv_df_simple("BTCUSDT", "5m", limit=1500),
             self._fetch_ohlcv_df_simple("ETHUSDT", "5m", limit=1500),
             return_exceptions=False,
         )
 
-        ctx: dict = {}
-
-        # Choose a conservative "as-of" timestamp for gov features:
-        # use the earliest available last-closed 5m timestamp among BTC/ETH so we do not look ahead vs either.
+        # Determine decision_ts_gov (min last-closed ts across BTC/ETH) to avoid cross-asset lookahead
         decision_ts_gov = None
         try:
             candidates = []
@@ -810,74 +827,150 @@ class LiveTrader:
         except Exception:
             decision_ts_gov = None
 
-        if df_btc is not None:
-            btc_feats = await self._build_oi_funding_features("BTCUSDT", df_btc)
+        if decision_ts_gov is None or pd.isna(pd.to_datetime(decision_ts_gov, utc=True, errors="coerce")):
+            raise RuntimeError("GOV_CTX: cannot determine decision_ts_gov (BTC/ETH 5m frames empty)")
+
+        decision_ts_gov = pd.to_datetime(decision_ts_gov, utc=True)
+
+        # Hard as-of cut to prevent any downstream cross-asset lookahead
+        if df_btc is not None and not df_btc.empty:
+            df_btc = df_btc.loc[:decision_ts_gov].copy()
+        if df_eth is not None and not df_eth.empty:
+            df_eth = df_eth.loc[:decision_ts_gov].copy()
+
+
+        # Deterministic per-cycle cache
+        if hasattr(self, "_gov_ctx_cache_key") and hasattr(self, "_gov_ctx_cache"):
+            if getattr(self, "_gov_ctx_cache_key") == decision_ts_gov:
+                return dict(self._gov_ctx_cache)
+
+        ctx: dict = {}
+        ctx["decision_ts_gov"] = decision_ts_gov  # for downstream as-of usage/logging
+
+        # Cross-asset DAILY context (scout parity): btcusdt_/ethusdt_ vol_regime_level + trend_slope
+        # Deterministic day-cache: values only change when a new day opens (shift(1) features).
+        try:
+            day_key = decision_ts_gov.floor("D")
+            if day_key.tz is None:
+                day_key = day_key.tz_localize("UTC")
+            else:
+                day_key = day_key.tz_convert("UTC")
+
+            if hasattr(self, "_cross_asset_daily_cache_key") and hasattr(self, "_cross_asset_daily_cache_val"):
+                if getattr(self, "_cross_asset_daily_cache_key") == day_key:
+                    ctx.update(dict(getattr(self, "_cross_asset_daily_cache_val") or {}))
+                else:
+                    raise KeyError("cross_asset_daily_cache_miss")
+            else:
+                raise KeyError("cross_asset_daily_cache_missing")
+
+        except KeyError:
+            try:
+                btc_ctx, eth_ctx = await asyncio.gather(
+                    self._compute_cross_asset_daily_ctx("BTCUSDT", decision_ts_gov, df5=df_btc),
+                    self._compute_cross_asset_daily_ctx("ETHUSDT", decision_ts_gov, df5=df_eth),
+                    return_exceptions=False,
+                )
+                merged = {}
+                merged.update(btc_ctx or {})
+                merged.update(eth_ctx or {})
+                ctx.update(merged)
+
+                self._cross_asset_daily_cache_key = day_key
+                self._cross_asset_daily_cache_val = dict(merged)
+
+            except Exception as e:
+                LOG.warning("GOV_CTX: cross-asset daily ctx computation failed: %s", e)
+
+        # OI/Funding (existing behavior)
+        if df_btc is not None and not df_btc.empty:
+
+            btc_feats = await self._build_oi_funding_features("BTCUSDT", df_btc, decision_ts_gov)
+
             if btc_feats:
                 if "funding_rate" in btc_feats:
                     ctx["btc_funding_rate"] = float(btc_feats["funding_rate"])
                 if "oi_z_7d" in btc_feats:
                     ctx["btc_oi_z_7d"] = float(btc_feats["oi_z_7d"])
 
-        if df_eth is not None:
-            eth_feats = await self._build_oi_funding_features("ETHUSDT", df_eth)
+        if df_eth is not None and not df_eth.empty:
+
+            eth_feats = await self._build_oi_funding_features("ETHUSDT", df_eth, decision_ts_gov)
+
             if eth_feats:
                 if "funding_rate" in eth_feats:
                     ctx["eth_funding_rate"] = float(eth_feats["funding_rate"])
                 if "oi_z_7d" in eth_feats:
                     ctx["eth_oi_z_7d"] = float(eth_feats["oi_z_7d"])
 
-        # ------------------------------------------------------------------
-        # Markov 4h regime probability on ETH close-to-close returns
-        # Required by manifest: markov_prob_up_4h (numeric, finite)
-        # Also provide markov_state_up_4h (categorical/int) if present in manifests.
-        # ------------------------------------------------------------------
+        # Markov 4h regime probability (ETH by default; configurable)
         try:
+            markov_asset = str(self.cfg.get("MARKOV4H_ASSET", "ETHUSDT") or "ETHUSDT").upper()
             markov_limit = int(self.cfg.get("MARKOV4H_LIMIT", 500) or 500)
-            df4 = await self._fetch_ohlcv_df_simple("ETHUSDT", "4h", limit=markov_limit)
+            alpha = float(self.cfg.get("MARKOV4H_PROB_EWMA_ALPHA", 0.2) or 0.2)
 
-            if df4 is not None and not df4.empty and len(df4) >= 60:
-                if decision_ts_gov is not None:
-                    df4 = df4.loc[df4.index <= decision_ts_gov]
-                if len(df4) >= 60:
-                    close = df4["close"].astype(float)
-                    ret = np.log(close).diff().dropna()
+            # deterministic sub-cache keyed by 4h bucket to avoid refit every 5m
+            key4 = decision_ts_gov.floor("4h")
+            if hasattr(self, "_markov_cache_key") and hasattr(self, "_markov_cache_val"):
+                if getattr(self, "_markov_cache_key") == key4:
+                    ctx.update(dict(self._markov_cache_val))
+                else:
+                    raise KeyError("markov_cache_miss")
+            else:
+                raise KeyError("markov_cache_missing")
 
-                    if len(ret) >= 50:
-                        alpha = float(self.cfg.get("MARKOV4H_PROB_EWMA_ALPHA", 0.2) or 0.2)
+        except KeyError:
+            # compute markov
+            try:
+                df4 = await self._fetch_ohlcv_df_simple(markov_asset, "4h", limit=markov_limit)
+                if df4 is None or df4.empty:
+                    raise RuntimeError("empty 4h frame")
 
-                        mod = sm.tsa.MarkovRegression(ret, k_regimes=2, switching_variance=True, trend="c")
-                        res = mod.fit(disp=False, maxiter=200)
+                df4 = drop_incomplete_last_bar(df4, "4h", decision_ts_gov)
+                snap = compute_markov4h_snapshot(df4, asof_ts=decision_ts_gov, alpha=alpha)
+                ctx["markov_prob_up_4h"] = float(snap["markov_prob_up_4h"])
+                ctx["markov_state_4h"] = int(snap["markov_state_4h"])
+                ctx.setdefault("markov_state_up_4h", int(snap["markov_state_4h"]))
 
-                        # FILTERED (past-only) probs
-                        filt_probs = [res.filtered_marginal_probabilities[i] for i in range(2)]
+                # store deterministic sub-cache
+                self._markov_cache_key = decision_ts_gov.floor("4h")
+                self._markov_cache_val = {
+                    "markov_prob_up_4h": ctx["markov_prob_up_4h"],
+                    "markov_state_4h": ctx["markov_state_4h"],
+                    "markov_state_up_4h": ctx["markov_state_up_4h"],
+                }
 
-                        # identify UP state as higher weighted mean return
-                        means = []
-                        for p in filt_probs:
-                            w = p.values
-                            r = ret.reindex(p.index).values
-                            denom = float(np.sum(w))
-                            mu = float(np.sum(w * r) / (denom if denom > 1e-12 else 1.0))
-                            means.append(mu)
+            except Exception as e:
+                LOG.warning("GOV_CTX: Markov 4h computation failed: %s", e)
 
-                        up_idx = int(np.argmax(means))
-                        prob_up = filt_probs[up_idx].clip(0.0, 1.0)
-                        prob_up = prob_up.ewm(alpha=alpha, adjust=False).mean().clip(0.0, 1.0)
-
-                        pu = float(prob_up.iloc[-1])
-                        if np.isfinite(pu):
-                            ctx["markov_prob_up_4h"] = pu
-                            ctx["markov_state_up_4h"] = int(pu > 0.5)
-                            # Some older variants use this name:
-                            ctx.setdefault("markov_state_4h", int(pu > 0.5))
-
+        # Sprint 2.4: online performance features as-of decision_ts_gov
+        try:
+            if getattr(self, "online_state", None) is not None:
+                ctx.update(self.online_state.features_asof(decision_ts_gov))
         except Exception as e:
-            LOG.warning("GOV_CTX: Markov 4h computation failed: %s", e)
+            LOG.warning("GOV_CTX: online performance features failed: %s", e)
 
+        # store per-cycle cache
+        self._gov_ctx_cache_key = decision_ts_gov
         self._gov_ctx_cache = dict(ctx)
-        self._gov_ctx_cache_ts = now
-        return ctx
+        return dict(ctx)
 
+
+
+    async def _last_closed_5m_ts(self, symbol: str) -> Optional[pd.Timestamp]:
+        """
+        Deterministic event timestamp derived from the data stream:
+        last fully-closed 5m bar timestamp from the exchange OHLCV stream
+        (implementation is conservative: relies only on returned candle timestamps).
+        """
+        try:
+            df = await self._fetch_ohlcv_df_paged(str(symbol).upper(), "5m", limit=10)
+            if df is None or df.empty:
+                return None
+            ts = df.index[-1]
+            return pd.to_datetime(ts, utc=True)
+        except Exception:
+            return None
 
 
     # ──────────────────────────────────────────────────────────────────────
@@ -1033,13 +1126,14 @@ class LiveTrader:
 
         return v
 
-
-
     def _augment_meta_with_regime_sets(self, meta_full: dict) -> None:
         """
         Mutates meta_full in-place. Adds:
-          funding_regime_code, oi_regime_code, crowd_side,
-          S1/S2/S3/S4/S6 when prerequisites are present.
+        funding_regime_code, oi_regime_code, crowd_side,
+        S1/S2/S3/S4/S6 when prerequisites are present.
+
+        Also adds:
+        risk_on, risk_on_1 (required for decision.scope == "RISK_ON_1")
 
         This is deterministic and mirrors offline logic as provided by the offline team.
         """
@@ -1080,6 +1174,87 @@ class LiveTrader:
             oic = int(float(meta_full["oi_regime_code"]))
             meta_full["S3_funding_x_oi"] = float((frc + 1) * 3 + (oic + 1))
 
+        # -----------------------------
+        # risk_on / risk_on_1 (scope feature)
+        # Offline logic:
+        #   risk_on = int((regime_up == 1) and (btc_trend_slope >= 0) and (btc_vol_level < btc_vol_hi))
+        # with fallback keys:
+        #   btc_trend_slope: btcusdt_trend_slope else btc_trend_slope
+        #   btc_vol_level:   btcusdt_vol_regime_level else btc_vol_regime_level
+        # Fail-closed if missing/NaN/unparseable.
+        # -----------------------------
+        def _first_present(*keys: str):
+            for k in keys:
+                if k in meta_full:
+                    return meta_full.get(k)
+            return None
+
+        try:
+            btc_vol_hi = float(self.regime_thresholds["btc_vol_hi"])
+        except Exception:
+            btc_vol_hi = np.nan
+
+        try:
+            regime_up = int(float(meta_full.get("regime_up", 0.0) or 0.0))
+        except Exception:
+            regime_up = 0
+
+        tr_raw = _first_present("btcusdt_trend_slope", "btc_trend_slope")
+        vl_raw = _first_present("btcusdt_vol_regime_level", "btc_vol_regime_level")
+
+        try:
+            btc_trend_slope = float(tr_raw)
+        except Exception:
+            btc_trend_slope = np.nan
+
+        try:
+            btc_vol_level = float(vl_raw)
+        except Exception:
+            btc_vol_level = np.nan
+
+        risk_on = 0
+        if (
+            regime_up == 1
+            and np.isfinite(btc_trend_slope)
+            and (btc_trend_slope >= 0.0)
+            and np.isfinite(btc_vol_level)
+            and np.isfinite(btc_vol_hi)
+            and (btc_vol_level < btc_vol_hi)
+        ):
+            risk_on = 1
+
+        # Offline note: risk_on_1 is effectively an alias used for scope gating.
+        meta_full["risk_on"] = float(risk_on)
+
+        # -----------------------------
+        # Sprint 2.3: btc_risk_regime_code (0..3) and S5_btcRisk_x_regimeUp
+        # Offline spec:
+        #   btc_trend_up  = 1 if btc_trend_slope > 0 else 0
+        #   btc_vol_high  = 1 if btc_vol_regime_level >= btc_vol_hi else 0
+        #   btc_risk_regime_code = btc_trend_up*2 + btc_vol_high
+        #   S5 = btc_risk_regime_code*2 + regime_up (ru in {0,1})
+        # Fail-closed: only compute when prerequisites are finite.
+        # -----------------------------
+        try:
+            if np.isfinite(btc_trend_slope) and np.isfinite(btc_vol_level) and np.isfinite(btc_vol_hi):
+                btc_trend_up = 1 if btc_trend_slope > 0.0 else 0
+                btc_vol_high = 1 if btc_vol_level >= btc_vol_hi else 0
+                btc_risk = int(btc_trend_up * 2 + btc_vol_high)
+                meta_full["btc_risk_regime_code"] = float(btc_risk)
+
+                ru = 1 if int(regime_up) == 1 else 0
+                meta_full["S5_btcRisk_x_regimeUp"] = float(btc_risk * 2 + ru)
+            else:
+                meta_full["btc_risk_regime_code"] = np.nan
+                meta_full["S5_btcRisk_x_regimeUp"] = np.nan
+        except Exception:
+            meta_full["btc_risk_regime_code"] = np.nan
+            meta_full["S5_btcRisk_x_regimeUp"] = np.nan
+
+
+
+        meta_full["risk_on_1"] = float(risk_on)
+
         # The remaining features need regime_code_1d + markov_state_4h + vol_prob_low_1d etc.
         # Only compute them when those prereqs exist (to avoid KeyError).
         if "regime_code_1d" in meta_full:
@@ -1112,22 +1287,36 @@ class LiveTrader:
                     cs = int(float(meta_full["crowd_side"]))
                     meta_full["S4_crowd_x_trend1d"] = float((cs + 1) * 2 + int(trc))
 
-        # S6_fresh_x_compress prereqs: days_since_prev_break + consolidation_range_atr + thresholds
+        # S6_fresh_x_compress prereqs: days_since_prev_break, consolidation_range_atr
         if ("days_since_prev_break" in meta_full) and ("consolidation_range_atr" in meta_full):
             try:
-                fresh_q33 = float(self.regime_thresholds["fresh_q33"])
-                fresh_q66 = float(self.regime_thresholds["fresh_q66"])
-                comp_q33 = float(self.regime_thresholds["compression_q33"])
-                comp_q66 = float(self.regime_thresholds["compression_q66"])
+                # Offline semantics: thresholds are stored at top-level in regimes_report.json thresholds dict
+                fresh_q33 = self.regime_thresholds.get("fresh_q33")
+                fresh_q66 = self.regime_thresholds.get("fresh_q66")
+                comp_q33 = self.regime_thresholds.get("compression_q33")
+                comp_q66 = self.regime_thresholds.get("compression_q66")
 
                 fresh = float(meta_full["days_since_prev_break"])
                 comp = float(meta_full["consolidation_range_atr"])
-                fcode = self._tercile_code(fresh, fresh_q33, fresh_q66)
-                ccode = self._tercile_code(comp, comp_q33, comp_q66)
 
-                meta_full["S6_fresh_x_compress"] = float(fcode * 3 + ccode)
+                # Match offline: only compute S6 if both inputs are finite AND thresholds exist
+                if (
+                    np.isfinite(fresh)
+                    and np.isfinite(comp)
+                    and fresh_q33 is not None
+                    and fresh_q66 is not None
+                    and comp_q33 is not None
+                    and comp_q66 is not None
+                ):
+                    fcode = self._tercile_code(fresh, float(fresh_q33), float(fresh_q66))
+                    ccode = self._tercile_code(comp, float(comp_q33), float(comp_q66))
+                    meta_full["S6_fresh_x_compress"] = float(fcode * 3 + ccode)
+                else:
+                    meta_full["S6_fresh_x_compress"] = np.nan
             except Exception:
                 pass
+
+
 
     def _missing_required_features(self, row: dict, required: list[str]) -> list[str]:
         missing = []
@@ -1411,14 +1600,21 @@ class LiveTrader:
             except Exception as e:
                 LOG.warning("Cancel sweep loop error on %s: %s", symbol, e)
     
-    def _listing_age_days(self, symbol: str, dfs: dict[str, pd.DataFrame] | None = None) -> int | None:
+    def _listing_age_days(self, symbol: str, dfs: dict[str, pd.DataFrame] | None = None, asof_ts: pd.Timestamp | None = None) -> int | None:
         """
         Order of preference:
           1) cached listing_dates.json
           2) earliest timestamp in fetched dataframes (prefer '1d' if present)
           3) None if unknown
         """
-        today = datetime.now(timezone.utc).date()
+        # Derive 'today' from decision_ts when available to avoid wall-clock leakage.
+        today = None
+        if asof_ts is not None:
+            ts = pd.to_datetime(asof_ts, utc=True, errors="coerce")
+            if ts is not pd.NaT and not pd.isna(ts):
+                today = ts.date()
+        if today is None:
+            today = datetime.now(timezone.utc).date()
 
         # 1) cache
         d = self._listing_dates_cache.get(symbol)
@@ -1601,7 +1797,7 @@ class LiveTrader:
                 if tf == base_tf:
                     continue
                 try:
-                    dfs[tf] = ta.resample_ohlcv(df_base, tf)  # pandas default label="left", closed="left"
+                    dfs[tf] = resample_ohlcv(df_base, tf)  # pandas default label="left", closed="left"
                 except Exception as e:
                     LOG.warning("SCAN_SKIP symbol=%s stage=resample_fail tf=%s err=%s", symbol, tf, e)
                     return None
@@ -1611,7 +1807,25 @@ class LiveTrader:
                 LOG.warning("Base TF %s not available for %s.", base_tf, symbol)
                 return None
             df5 = dfs[base_tf]
-            decision_ts = df5.index[-1]  # last fully closed 5m bar (after dropping incomplete last bar)
+
+
+            # --- Strict-parity: enforce tz-aware UTC index ---
+            if df5.index.tz is None:
+                # If your fetcher is already UTC but naive, localize; otherwise fix fetcher upstream.
+                df5.index = df5.index.tz_localize("UTC")
+            else:
+                df5.index = df5.index.tz_convert("UTC")
+
+            df5 = df5.sort_index()
+            df5 = df5[~df5.index.duplicated(keep="last")]
+
+            # _fetch_ohlcv_df_paged() already drops the last (possibly incomplete) bar deterministically.
+
+            if df5.empty:
+                return None
+
+            decision_ts = df5.index[-1]
+
 
             # ---------------- Indicators aligned to base index ---
             # EMA on ema_tf (for optional heuristics)
@@ -1654,7 +1868,7 @@ class LiveTrader:
             last = df5_req.iloc[-1]
 
             # ---------------- Listing age ------------------------
-            age_opt = self._listing_age_days(symbol, dfs)
+            age_opt = self._listing_age_days(symbol, dfs, asof_ts=decision_ts)
             listing_age_days = int(age_opt) if age_opt is not None else 9999
 
             # ---------------- Strategy verdict (rule engine) -----
@@ -1668,6 +1882,27 @@ class LiveTrader:
                 "is_symbol_blacklisted": is_blacklisted(symbol),
                 **univ, **eth_ctx,
             }
+
+            # --- Strict Parity: Inject Robust Breakout Level ---
+            don_days = int(self.cfg.get("DON_N_DAYS", 20))
+            don_upper_s = donchian_upper_days_no_lookahead(df5["high"], don_days)
+
+            # decision_ts must exist; if not, fallback to last index
+            if decision_ts in don_upper_s.index:
+                injected_level = float(don_upper_s.loc[decision_ts])
+            else:
+                injected_level = float(don_upper_s.iloc[-1])
+
+            # Always publish the intended Donch window length; publish level only if finite.
+            ctx["don_break_len"] = don_days
+            ctx["donch_break_len"] = don_days  # compat key for some ops
+
+            if np.isfinite(injected_level):
+                ctx["don_break_level"] = float(injected_level)
+                ctx["donch_break_level"] = float(injected_level)
+
+
+
             verdict = self.strategy_engine.evaluate(dfs, ctx)
             should_enter = bool(getattr(verdict, "should_enter", False))
 
@@ -1682,25 +1917,78 @@ class LiveTrader:
                 ret_30d = (df1d['close'].iloc[-1] / df1d['close'].iloc[-cfg.STRUCTURAL_TREND_DAYS] - 1)
 
             tf_minutes = 5  # base timeframe minutes (used for vol_mult window)
-            # Donch breakout info
-            don_len = int(
-                getattr(verdict, "don_break_len",
-                        ((getattr(self.strategy_engine, "_spec", {}) or {}).get("params", {}) or {})
-                        .get("DONCH_PERIOD", self.cfg.get("DON_N_DAYS", 20)))
-            )
 
+            # Donch breakout info (robust to Verdict.don_break_len being None)
+            don_len_raw = getattr(verdict, "don_break_len", None)
+
+            # Prefer what we injected into ctx (strict-parity source of truth), if present
+            if don_len_raw is None:
+                try:
+                    don_len_raw = ctx.get("don_break_len", ctx.get("donch_break_len", None))
+                except Exception:
+                    don_len_raw = None
+
+            # Fallback to YAML param
+            if don_len_raw is None:
+                try:
+                    don_len_raw = (
+                        ((getattr(self.strategy_engine, "_spec", {}) or {}).get("params", {}) or {})
+                        .get("DONCH_PERIOD", None)
+                    )
+                except Exception:
+                    don_len_raw = None
+
+            # Final fallback to cfg / hard default
+            if don_len_raw is None:
+                don_len_raw = self.cfg.get("DON_N_DAYS", 20)
+
+            try:
+                don_len = int(don_len_raw)
+            except Exception:
+                don_len = 20
+
+            don_len = max(2, don_len)
 
             don_level = None
+
+
+            # Strict-parity: prefer the injected Donchian breakout level (computed upstream with
+            # no-lookahead daily construction). We keep it as the canonical value for diagnostics
+            # and for any downstream consumers.
             try:
-                if df1d is not None and len(df1d) >= (don_len + 2):
-                    don_upper = df1d['high'].rolling(don_len).max().shift(1)  # prior N full days
-                    don_level = float(don_upper.iloc[-1])
+                if np.isfinite(injected_level):
+                    don_level = float(injected_level)
             except Exception:
                 pass
-            if getattr(verdict, "don_break_level", None) is not None:
-                don_level = float(verdict.don_break_level)
+
+            # If the StrategyEngine returns its own don_break_level, log any divergence for triage,
+            # but do not override the injected level (injected is strict-parity source of truth).
+            if bool(self.cfg.get("DEBUG_SIGNAL_DIAG", False)):
+                try:
+                    v = getattr(verdict, "don_break_level", None)
+                    if v is not None:
+                        v_f = float(v)
+                        if np.isfinite(v_f) and don_level is not None and abs(v_f - don_level) > 1e-9:
+                            LOG.warning(
+                                "[STRICT-PAR] StrategyEngine don_break_level differs from injected level: "
+                                "engine=%.8f injected=%.8f symbol=%s ts=%s",
+                                v_f, don_level, symbol, str(decision_ts),
+                            )
+                except Exception:
+                    pass
+
+            # Fallback (should be rarely hit): compute from df1d with shift(1)
+            if don_level is None:
+                try:
+                    if df1d is not None and len(df1d) >= (don_len + 2):
+                        don_upper = df1d['high'].rolling(don_len).max().shift(1)  # prior N full days
+                        don_level = float(don_upper.iloc[-1])
+                except Exception:
+                    pass
+
             if don_level is None:
                 don_level = float(last['close'])
+
 
             # volume multiple: current 5m volume / rolling ~30d median
             try:
@@ -1718,12 +2006,15 @@ class LiveTrader:
             eth_above = 1.0 if float((eth_macd or {}).get("macd", 0.0)) > float((eth_macd or {}).get("signal", 0.0)) else 0.0
             regime_up = 1.0 if (eth_hist > 0 and eth_above == 1.0) else 0.0
 
-            # time cyclicals
-            now_utc = datetime.now(timezone.utc)
-            hour_of_day = now_utc.hour
-            day_of_week = now_utc.weekday()
+            # time cyclicals (strict-parity): derive from the decision timestamp, not wall-clock now()
+            ts_utc = decision_ts if decision_ts is not None else df5.index[-1].to_pydatetime()
+            if getattr(ts_utc, "tzinfo", None) is None:
+                ts_utc = ts_utc.replace(tzinfo=timezone.utc)
+            hour_of_day = ts_utc.hour
+            day_of_week = ts_utc.weekday()
             hour_sin = math.sin(2 * math.pi * hour_of_day / 24.0)
             hour_cos = math.cos(2 * math.pi * hour_of_day / 24.0)
+
 
             # derived distances
             atr_pct = (last['atr_1h'] / last['close']) if last['close'] > 0 else 0.0
@@ -1783,7 +2074,7 @@ class LiveTrader:
             turnover_z = float(univ.get("turnover_z", 0.0) or 0.0)
 
             # --- NEW: OI + Funding features (13) ----------
-            oi_feats = await self._build_oi_funding_features(symbol, df5)
+            oi_feats = await self._build_oi_funding_features(symbol, df5, decision_ts)
 
             # Build a superset dict, then FILTER to manifest columns before scoring.
             meta_full = {
@@ -1801,10 +2092,30 @@ class LiveTrader:
                 "dow": float(day_of_week),
                 "vol_mult": float(vol_mult),
 
-                # ETH MACD (4h) components (manifest requires these names)
                 "eth_macd_line_4h": float((eth_macd or {}).get("macd", 0.0) or 0.0),
                 "eth_macd_signal_4h": float((eth_macd or {}).get("signal", 0.0) or 0.0),
                 "eth_macd_hist_4h": float((eth_macd or {}).get("hist", 0.0) or 0.0),
+                "eth_macd_hist_slope_4h": (
+                    float((eth_macd or {}).get("hist_slope_4h"))
+                    if (eth_macd is not None and (eth_macd or {}).get("hist_slope_4h") is not None)
+                    else np.nan
+                ),                "eth_macd_hist_slope_1h": (
+                    float((eth_macd or {}).get("hist_slope_1h"))
+                    if (eth_macd is not None and (eth_macd or {}).get("hist_slope_1h") is not None)
+                    else np.nan
+                ),
+
+                # Explicit literals so diag_manifest_coverage can see these keys
+                "eth_vol_regime_level": (
+                    float((gov_ctx or {}).get("eth_vol_regime_level"))
+                    if isinstance(gov_ctx, dict) and (gov_ctx or {}).get("eth_vol_regime_level") is not None
+                    else np.nan
+                ),
+                "eth_trend_slope": (
+                    float((gov_ctx or {}).get("eth_trend_slope"))
+                    if isinstance(gov_ctx, dict) and (gov_ctx or {}).get("eth_trend_slope") is not None
+                    else np.nan
+                ),
 
                 # regime flags (manifest expects regime_code_1d + regime_up)
                 "regime_code_1d": float(reg_code),
@@ -1833,132 +2144,191 @@ class LiveTrader:
             if isinstance(gov_ctx, dict) and gov_ctx:
                 meta_full.update(gov_ctx)
 
-            # ---------------- Model-required feature slice (order matters) ----------------
-            required = list(getattr(self.winprob, "raw_features", None) or getattr(self.winprob, "required_keys", []) or [])
-            if not required:
-                LOG.error("META_MODEL_NO_FEATURES bundle=%s", self.bundle_id)
-                return None
+            # --- Strict-parity: Entry Quality overlay (overwrites critical fields) ---
+            eq_feats = self.feature_builder.compute_entry_quality_features(df5, decision_ts, meta_dir=bundle.meta_dir)
+            meta_full.update(eq_feats)
 
-            # Validate REQUIRED features against meta_full before slicing
-            missing = self._missing_required_features(meta_full, required)
-            if missing:
-                LOG.error("META_SCHEMA_FAIL symbol=%s missing_or_bad=%s", symbol, missing)
-                if hasattr(self, "_append_meta_error_report"):
-                    self._append_meta_error_report(
-                        symbol=symbol,
-                        stage="meta_schema_fail",
-                        missing=missing,
-                        decision_ts=decision_ts,
-                        meta_keys=sorted(meta_full.keys()),
-                    )
-                return None
+            # --- Strict-parity: regime-set derivations (includes risk_on / risk_on_1 for scope gating) ---
+            try:
+                self._augment_meta_with_regime_sets(meta_full)
+            except Exception as e:
+                LOG.warning("bundle=%s augment_meta_with_regime_sets failed: %s", getattr(self, "bundle_id", "no_bundle"), e)
 
-            num_cols = set(getattr(self.winprob, "numeric_cols", []) or getattr(self.winprob, "raw_num_cols", []) or [])
-            cat_cols = set(getattr(self.winprob, "categorical_cols", []) or getattr(self.winprob, "raw_cat_cols", []) or [])
+            # ---- Sprint 2 / Option A: freeze macro regime inputs from golden truth ----
+            macro = macro_regimes_asof(self.bundle, decision_ts)
+            meta_full.update(macro)
 
-            # Build meta_row with correct typed defaults (exactly required keys)
-            meta_row = {}
-            for k in required:
-                v = meta_full.get(k, None)
-                if v is None:
-                    v = np.nan if k in num_cols else None
-                meta_row[k] = v
-
-            req = required
-            num_cols = set(getattr(self.winprob, "numeric_cols", getattr(self.winprob, "raw_num_cols", [])) or [])
-            cat_cols = set(getattr(self.winprob, "cat_cols", getattr(self.winprob, "raw_cat_cols", [])) or [])
+            # Keep regime_up consistent with regime_code_1d (if regime_up is still used downstream)
+            # (Adjust mapping only if your offline team defines it differently.)
+            try:
+                rc = int(meta_full["regime_code_1d"])
+                meta_full["regime_up"] = 1 if rc in (2, 3) else 0
+            except Exception:
+                pass
+            # -------------------------------------------------------------------------
 
 
-            meta_row = {}
-            for k in required:
-                if k in meta_full:
-                    meta_row[k] = meta_full[k]
-                else:
-                    # default placeholders so keys are present; validator will then report invalid_numeric/invalid_cat
-                    meta_row[k] = (np.nan if k in num_cols else None)
+
+            # ---------------- 10. Strict Slice & Score ----------------
+            required = list(getattr(self.winprob, "raw_features", []) or [])
+
+            # Construct row with EXACTLY required keys (WinProbScorer expects strict input)
+            if required:
+                meta_row = {k: meta_full.get(k, np.nan) for k in required}
+            else:
+                meta_row = {}
+
 
             # --- Golden row injector (parity testing only) ---
             try:
                 if getattr(self, "golden_store", None) is not None:
-                    # Decision timestamp = last completed 5m bar timestamp for this symbol.
-                    # dfs[base_tf] had last bar dropped earlier, so df5.index[-1] is "as-of" ts.
+                    # Decision timestamp = last completed 5m bar timestamp
                     ts = df5.index[-1]
                     golden = self.golden_store.get(symbol, ts)
                     if golden is not None:
                         meta_row = golden
-                        LOG.info(
-                            "bundle=%s Meta golden hit %s ts=%s (row_keys=%d)",
-                            getattr(self, "bundle_id", None) or "no_bundle",
-                            symbol,
-                            pd.to_datetime(ts, utc=True).isoformat(),
-                            len(meta_row),
-                        )
-            except Exception as _e:
-                # Never break scanning because of parity tooling.
+                        LOG.info("bundle=%s Meta golden hit %s ts=%s", 
+                                 self.bundle_id, symbol, ts.isoformat())
+            except Exception:
                 pass
 
-            score_d = self._score_winprob_safe_details(symbol=symbol, meta_row=meta_row)
-            p_raw = score_d.get("p_raw")
-            p_cal = score_d.get("p_cal")
-            schema_ok = bool(score_d.get("schema_ok"))
-            meta_err = score_d.get("err")
+            # Score using the safe wrapper
+            if required:
+                score_d = self._score_winprob_safe_details(symbol, meta_row)
+                p_cal = score_d.get("p_cal")
+                p_raw = score_d.get("p_raw")
+                schema_ok = score_d.get("schema_ok")
+                meta_err = score_d.get("err")
+            else:
+                # No model loaded or no features required
+                p_cal, p_raw = None, None
+                schema_ok = True
+                meta_err = "no_model_features"
 
-            # Strategy OK (pre-meta) already exists as should_enter (from StrategyEngine verdict)
+            # --- Logic Glue: Define thresholds and gating verdict ---
+            # p* source priority: bundle.pstar (artifacts) -> config META_PROB_THRESHOLD -> None (gate disabled)
+            wp = getattr(self, "winprob", None)
+
+            pstar = getattr(wp, "pstar", None) if wp is not None else None
+            if pstar is None:
+                pstar = self.cfg.get("META_PROB_THRESHOLD", None)
+
+            try:
+                pstar = float(pstar) if pstar is not None else None
+                if pstar is not None and ((not np.isfinite(pstar)) or pstar < 0.0 or pstar > 1.0):
+                    pstar = None
+            except Exception:
+                pstar = None
+
+            # Strategy verdict *before* meta veto (observability only)
             strat_ok = bool(should_enter)
 
-            # Meta gate uses calibrated probability and pstar (if configured)
-            pstar = getattr(self.winprob, "pstar", None)
-            if (pstar is None) or (p_cal is None):
+            # ---------------- META: decision (scope + threshold) ----------------
+            meta_required = bool(getattr(cfg, "META_MODEL_ENABLED", True))
+
+            pstar_scope = getattr(wp, "pstar_scope", None) if wp is not None else None
+            scope_ok, scope_info = eval_meta_scope(pstar_scope, meta_row)
+
+            risk_on_1_raw = scope_info.get("risk_on_1_raw", None)
+            risk_on_raw   = scope_info.get("risk_on_raw", None)
+            scope_val     = scope_info.get("scope_val", None)
+            scope_src     = scope_info.get("scope_src", None)
+            missing_cols  = bool(scope_info.get("missing_cols", False))
+
+            def _fmt_raw(x) -> str:
+                if x is None:
+                    return "None"
+                try:
+                    if isinstance(x, (float, np.floating)) and (not np.isfinite(float(x))):
+                        return "nan"
+                except Exception:
+                    pass
+                try:
+                    return str(x)
+                except Exception:
+                    return repr(x)
+
+            meta_ok = False
+            reason = ""
+            err = meta_err  # keep scorer error in the log if present
+
+            # Fail-closed on schema problems (no-trade)
+            if not bool(schema_ok):
                 meta_ok = False
+                reason = "schema_fail"
+                if err is None:
+                    err = "schema_fail"
             else:
-                meta_ok = bool(float(p_cal) >= float(pstar))
+                if pstar is None:
+                    if not meta_required:
+                        meta_ok = True
+                        reason = "meta_disabled"
+                    else:
+                        meta_ok = False
+                        reason = "no_pstar"
+                else:
+                    # pstar present -> enforce scope first, then threshold
+                    if not bool(scope_ok):
+                        meta_ok = False
+                        if missing_cols:
+                            reason = f"scope_error:{(pstar_scope or 'NONE')}"
+                            if err is None:
+                                err = "scope_missing_cols"
+                        else:
+                            reason = f"scope_fail:{(pstar_scope or 'NONE')}"
+                    else:
+                        try:
+                            p_cal_f = float(p_cal) if p_cal is not None else float("nan")
+                        except Exception:
+                            p_cal_f = float("nan")
 
-            # Reason precedence: schema/score failure first, then strategy veto, then meta veto
-            if not schema_ok:
-                reason = "meta_schema_or_score_fail"
-            elif not strat_ok:
-                reason = "rule_veto"
-            elif not meta_ok:
-                reason = "meta_veto"
-            else:
-                reason = "ok"
+                        try:
+                            pstar_f = float(pstar)
+                        except Exception:
+                            pstar_f = float("nan")
 
-            def _is_bad_numeric(v) -> bool:
-                if v is None:
-                    return True
-                if isinstance(v, bool):
-                    return False  # if you treat bools separately; otherwise convert to 0/1 upstream
-                if isinstance(v, (int, float)):
-                    return (isinstance(v, float) and (math.isnan(v) or math.isinf(v)))
-                return False
+                        if np.isfinite(p_cal_f) and np.isfinite(pstar_f):
+                            meta_ok = (p_cal_f >= pstar_f)
+                            reason = "ok" if meta_ok else "below_pstar"
+                        else:
+                            meta_ok = False
+                            reason = "bad_p_cal_or_pstar"
+                            if err is None:
+                                err = "bad_p_cal_or_pstar"
 
-            def meta_report(required_keys, meta_full: dict) -> tuple[list[str], list[tuple[str, object]]]:
-                missing = [k for k in required_keys if k not in meta_full]
-                bad = []
-                for k in required_keys:
-                    if k in meta_full and _is_bad_numeric(meta_full[k]):
-                        bad.append((k, meta_full[k]))
-                return missing, bad
+            # ---------------- META_DECISION log (expanded observability) ----------------
+            bundle = getattr(self, "bundle_id", None) or "no_bundle"
 
-            req = list(self.winprob.required_keys)
-            missing, bad = meta_report(req, meta_full)
-            if missing or bad:
-                LOG.warning("META_SCHEMA_INPUT_PROBLEMS missing=%d bad=%d missing_head=%s bad_head=%s",
-                            len(missing), len(bad), missing[:25], bad[:25])
+            try:
+                p_cal_f_log = float(p_cal) if p_cal is not None else float("nan")
+            except Exception:
+                p_cal_f_log = float("nan")
+            try:
+                pstar_f_log = float(pstar) if pstar is not None else float("nan")
+            except Exception:
+                pstar_f_log = float("nan")
 
             LOG.info(
-                "META_DECISION bundle=%s symbol=%s decision_ts=%s schema_ok=%s p_raw=%s p_cal=%s pstar=%.6f meta_ok=%s strat_ok=%s reason=%s err=%s",
-                self.bundle_id,
+                "META_DECISION bundle=%s symbol=%s decision_ts=%s schema_ok=%s "
+                "p_cal=%s pstar=%s pstar_scope=%s "
+                "risk_on_1=%s risk_on=%s scope_val=%s scope_src=%s scope_ok=%s "
+                "meta_ok=%s strat_ok=%s reason=%s err=%s",
+                bundle,
                 symbol,
-                (decision_ts.isoformat() if decision_ts is not None else "None"),
-                schema_ok,
-                ("None" if p_raw is None else f"{float(p_raw):.6f}"),
-                ("None" if p_cal is None else f"{float(p_cal):.6f}"),
-                (0.0 if pstar is None else float(pstar)),
-                meta_ok,
-                strat_ok,
+                decision_ts.isoformat(),
+                bool(schema_ok),
+                f"{p_cal_f_log:.4f}" if np.isfinite(p_cal_f_log) else "nan",
+                f"{pstar_f_log:.4f}" if np.isfinite(pstar_f_log) else "nan",
+                _fmt_raw(pstar_scope),
+                _fmt_raw(risk_on_1_raw),
+                _fmt_raw(risk_on_raw),
+                _fmt_raw(scope_val),
+                _fmt_raw(scope_src),
+                bool(scope_ok),
+                bool(meta_ok),
+                bool(strat_ok),
                 reason,
-                ("None" if meta_err is None else str(meta_err)),
+                _fmt_raw(err),
             )
 
             # Strict safe-mode: invalid schema => no-trade; meta veto => no-trade
@@ -1988,7 +2358,11 @@ class LiveTrader:
                 g_vol = vol_mult >= vol_needed
                 g_regime = (regime_up == 1.0) or (not regime_block)
                 g_micro = (atr_pct >= float(self.cfg.get("ENTRY_MIN_ATR_PCT", 0.0)))
-                g_meta = (p_cal is not None and p_cal >= pstar)
+                # Mirror the actual meta gate (already computed above)
+                g_meta = bool(meta_ok)
+
+
+
 
 
                 # Try to expose "why" from StrategyEngine when present
@@ -2077,9 +2451,12 @@ class LiveTrader:
                     LOG.debug("— %s vetoed by local entry heuristics.", symbol)
                 return None
 
+
+            
             # -------------- Compose Signal object ----------------
             signal_obj = Signal(
                 symbol=symbol,
+                decision_ts=decision_ts,
                 entry=float(last['close']),
                 atr=float(last['atr_1h']),
                 rsi=float(last['rsi_1h']),
@@ -2136,8 +2513,18 @@ class LiveTrader:
                 "SIGNAL %s @ %.6f | regime=%s | wp=%.2f%%",
                 symbol, float(last['close']), market_regime, signal_obj.win_probability * 100.0
             )
-            return signal_obj
 
+
+            # Attach donch fields for downstream logging/telemetry
+            # (Signal class may not declare them explicitly, so we attach dynamically)
+            setattr(signal_obj, "don_break_level", meta_full.get("don_break_level"))
+            setattr(signal_obj, "don_dist_atr", meta_full.get("don_dist_atr"))
+            setattr(signal_obj, "don_break_len", meta_full.get("don_break_len"))
+
+            setattr(signal_obj, "meta_pstar", pstar)
+
+
+            return signal_obj
 
         except ccxt.BadSymbol:
             LOG.warning("Invalid symbol on exchange: %s", symbol)
@@ -2275,6 +2662,90 @@ class LiveTrader:
                     "hist": float(latest['hist'])}
         except Exception as e:
             LOG.warning("ETH barometer unavailable: %s", e)
+            return None
+
+    async def _get_eth_macd_barometer_asof(self, asof_ts: pd.Timestamp) -> Optional[dict]:
+        """
+        Deterministic ETHUSDT MACD context computed strictly as-of `asof_ts` (decision_ts semantics).
+
+        Returns dict for the latest fully-closed bars as-of asof_ts:
+        - macd, signal, hist (4h)
+        - hist_slope_4h = diff(hist) on 4h bars (latest closed bar minus prior)
+        - hist_slope_1h = diff(hist) on 1h bars (latest closed bar minus prior)
+
+        NOTE: Slopes are computed as first differences on the native bar grid, then read at the
+        last fully closed bar as-of `asof_ts`.
+        """
+        try:
+            asof_ts = pd.to_datetime(asof_ts, utc=True, errors="coerce")
+            if pd.isna(asof_ts):
+                raise ValueError("asof_ts is invalid")
+
+            # ---- 4h MACD ----
+            eth_ohlcv_4h = await self.exchange.fetch_ohlcv("ETHUSDT", "4h", limit=260)
+            if not eth_ohlcv_4h:
+                return None
+
+            df4 = pd.DataFrame(eth_ohlcv_4h, columns=["ts", "open", "high", "low", "close", "volume"])
+            df4["ts"] = pd.to_datetime(df4["ts"], unit="ms", utc=True)
+            df4 = df4.set_index("ts").sort_index()
+            df4 = df4[~df4.index.duplicated(keep="last")]
+            df4 = drop_incomplete_last_bar(df4, "4h", asof_ts)
+            if df4 is None or df4.empty or len(df4) < 40:
+                return None
+
+            macd4 = ta.macd(df4["close"])
+            if macd4 is None or macd4.empty:
+                return None
+
+            last4 = macd4.iloc[-1]
+            hist_slope_4h = float("nan")
+            try:
+                if len(macd4) >= 2:
+                    hist_slope_4h = float(macd4["hist"].diff().iloc[-1])
+            except Exception:
+                hist_slope_4h = float("nan")
+
+            out = {
+                "macd": float(last4["macd"]),
+                "signal": float(last4["signal"]),
+                "hist": float(last4["hist"]),
+                "hist_slope_4h": float(hist_slope_4h),
+            }
+
+            # ---- 1h MACD (slope only) ----
+            try:
+                eth_ohlcv_1h = await self.exchange.fetch_ohlcv("ETHUSDT", "1h", limit=400)
+                if eth_ohlcv_1h:
+                    df1 = pd.DataFrame(eth_ohlcv_1h, columns=["ts", "open", "high", "low", "close", "volume"])
+                    df1["ts"] = pd.to_datetime(df1["ts"], unit="ms", utc=True)
+                    df1 = df1.set_index("ts").sort_index()
+                    df1 = df1[~df1.index.duplicated(keep="last")]
+                    df1 = drop_incomplete_last_bar(df1, "1h", asof_ts)
+                    if df1 is not None and (not df1.empty) and len(df1) >= 40:
+                        macd1 = ta.macd(df1["close"])
+                        if macd1 is not None and (not macd1.empty) and len(macd1) >= 2:
+                            out["hist_slope_1h"] = float(macd1["hist"].diff().iloc[-1])
+                        else:
+                            out["hist_slope_1h"] = float("nan")
+                    else:
+                        out["hist_slope_1h"] = float("nan")
+                else:
+                    out["hist_slope_1h"] = float("nan")
+            except Exception:
+                out["hist_slope_1h"] = float("nan")
+
+            # Fail-closed on non-finite core 4h values (macd/signal/hist).
+            for k in ("macd", "signal", "hist"):
+                v = out.get(k)
+                if v is None or not math.isfinite(float(v)):
+                    return None
+
+            # Slopes may be NaN if insufficient history; allow NaN so schema can fail-closed if required.
+            return out
+
+        except Exception as e:
+            LOG.warning("ETH barometer unavailable (asof): %s", e)
             return None
 
     # ───────────────────── Entry & position lifecycle ─────────────────────
@@ -3123,6 +3594,17 @@ class LiveTrader:
         )
 
         await self.risk.on_trade_close(total_pnl, self.tg)
+
+        # Sprint 2.4: record outcome (ts derived from last closed 5m bar; no wall-clock)
+        try:
+            if getattr(self, "online_state", None) is not None:
+                evt_ts = await self._last_closed_5m_ts(symbol)
+                if evt_ts is not None and not pd.isna(evt_ts):
+                    self.online_state.record_trade_close(ts=evt_ts, pnl=float(total_pnl))
+        except Exception as e:
+            LOG.warning("bundle=%s OnlinePerformanceState record failed for %s: %s", bundle, symbol, e)
+
+
         self.open_positions.pop(pid, None)
         self.last_exit[symbol] = closed_at
         await self.tg.send(f"✅ {symbol} position closed @ {avg_exit:.6g} | PnL ≈ {total_pnl:.2f} USDT")
@@ -3173,6 +3655,17 @@ class LiveTrader:
         )
         await self.db.add_fill(pid, tag, exit_price, size, closed_at)
         await self.risk.on_trade_close(pnl, self.tg)
+
+
+        # Sprint 2.4: record outcome (ts derived from last closed 5m bar; no wall-clock)
+        try:
+            if getattr(self, "online_state", None) is not None:
+                evt_ts = await self._last_closed_5m_ts(symbol)
+                if evt_ts is not None and not pd.isna(evt_ts):
+                    self.online_state.record_trade_close(ts=evt_ts, pnl=float(pnl))
+        except Exception as e:
+            LOG.warning("bundle=%s OnlinePerformanceState record failed for %s: %s", getattr(self, "bundle_id", None) or "no_bundle", symbol, e)
+
         self.last_exit[symbol] = closed_at
         self.open_positions.pop(pid, None)
         await self.tg.send(f"⏰ {symbol} closed by {tag}. PnL ≈ {pnl:.2f} USDT")
@@ -3180,7 +3673,6 @@ class LiveTrader:
 
 
     # ───────────────────── Loops & commands ─────────────────────
-
     async def _main_signal_loop(self):
         LOG.info("Starting main signal scan loop.")
         while True:
@@ -3189,48 +3681,44 @@ class LiveTrader:
                     await asyncio.sleep(5)
                     continue
 
-                current_market_regime = await self.regime_detector.get_current_regime()
-                LOG.info("New scan cycle for %d symbols | regime: %s", len(self.symbols), current_market_regime)
+                # ── Cycle-level deterministic context (no per-symbol lookahead) ──
+                gov_ctx = await self._get_gov_ctx()
+                decision_ts_gov = gov_ctx.get("decision_ts_gov")
+                if decision_ts_gov is None or pd.isna(pd.to_datetime(decision_ts_gov, utc=True, errors="coerce")):
+                    raise RuntimeError("GOV_CTX: missing/invalid decision_ts_gov")
 
-                uc = self._load_universe_cache_if_fresh()
-                if uc is not None:
-                    self._universe_ctx = uc
-                    LOG.info("Universe context loaded from cache (%d symbols).", len(self._universe_ctx))
-                else:
+                decision_ts_gov = pd.to_datetime(decision_ts_gov, utc=True)
+
+                # Daily regime as-of decision_ts_gov
+                current_market_regime = await self.regime_detector.get_current_regime(decision_ts_gov)
+                gov_ctx.update(self.regime_detector.get_latest_meta_features())
+
+                # ETH 4h MACD barometer as-of decision_ts_gov (for scan-time features)
+                eth_macd_data = await self._get_eth_macd_barometer_asof(decision_ts_gov)
+                if eth_macd_data:
                     try:
-                        self._universe_ctx = await self._build_universe_context()
-                        LOG.info("Universe context ready (%d symbols).", len(self._universe_ctx))
-                        self._save_universe_cache(self._universe_ctx)
-                    except Exception as e:
-                        LOG.warning("Universe context failed: %s (continuing with empty).", e)
-                        self._universe_ctx = {}
+                        LOG.info(
+                            "ETH MACD(4h asof %s): macd=%.2f, hist=%.2f",
+                            str(decision_ts_gov),
+                            float(eth_macd_data.get("macd", 0.0) or 0.0),
+                            float(eth_macd_data.get("hist", 0.0) or 0.0),
+                        )
+                    except Exception:
+                        pass
 
-                # ETH MACD Barometer (4h)
-                eth_macd_data = None
+                # Optional: load universe context from cache once (non-fatal)
                 try:
-                    eth_ohlcv = await self.exchange.fetch_ohlcv('ETHUSDT', '4h', limit=100)
-                    if eth_ohlcv:
-                        df_eth = pd.DataFrame(eth_ohlcv, columns=['timestamp','open','high','low','close','volume'])
-                        macd_df = ta.macd(df_eth['close'])
-                        latest_macd = macd_df.iloc[-1]
-                        eth_macd_data = {"macd": latest_macd['macd'], "signal": latest_macd['signal'], "hist": latest_macd['hist']}
-                        LOG.info("ETH MACD(4h): macd=%.2f, hist=%.2f", latest_macd['macd'], latest_macd['hist'])
+                    if not (getattr(self, "_universe_ctx", None) or {}):
+                        cached = self._load_universe_cache_if_fresh()
+                        if cached:
+                            self._universe_ctx = cached
+                            LOG.info("Universe context loaded from cache (%d symbols).", len(cached))
                 except Exception as e:
-                    LOG.warning("ETH MACD barometer failed: %s", e)
-
-                gov_ctx = {}
-                try:
-                    gov_ctx = await self._get_gov_ctx()
-                    gov_ctx.update(self.regime_detector.get_latest_meta_features())
-
-                except Exception as e:
-                    LOG.warning("Gov context build failed: %s", e)
-                    gov_ctx = {}
-
+                    LOG.warning("Universe cache load failed (non-fatal): %s", e)
 
                 equity = await self.db.latest_equity() or 0.0
                 open_positions_count = len(self.open_positions)
-                open_symbols = {p['symbol'] for p in self.open_positions.values()}
+                open_symbols = {p["symbol"] for p in self.open_positions.values()}
 
                 for sym in self.symbols:
                     if self.paused or not self.risk.can_trade():
@@ -3238,7 +3726,7 @@ class LiveTrader:
                     if sym in open_symbols:
                         continue
 
-                    # Cooldown fast-skip
+                    # Cooldown fast-skip (existing behavior kept as-is)
                     cd_h = self.cfg.get("SYMBOL_COOLDOWN_HOURS", cfg.SYMBOL_COOLDOWN_HOURS)
                     last_x = self.last_exit.get(sym)
                     if last_x and datetime.now(timezone.utc) - last_x < timedelta(hours=cd_h):
@@ -3248,7 +3736,7 @@ class LiveTrader:
                         # Pre-flight: skip if exchange already has a position
                         try:
                             positions = await self.exchange.fetch_positions(symbols=[sym])
-                            if positions and positions[0] and float(positions[0].get('info', {}).get('size', 0)) > 0:
+                            if positions and positions[0] and float(positions[0].get("info", {}).get("size", 0)) > 0:
                                 LOG.info("Skipping scan for %s, pre-flight position exists.", sym)
                                 if sym not in open_symbols:
                                     LOG.warning("ORPHAN POSITION DETECTED for %s! Reconcile later.", sym)
@@ -3265,13 +3753,14 @@ class LiveTrader:
                             gov_ctx=gov_ctx,
                         )
 
-
                         if signal:
                             # Optional meta probability gate
                             pstar = self.cfg.get("META_PROB_THRESHOLD", None)
                             if pstar is not None and float(signal.win_probability) < float(pstar):
-                                LOG.info("Signal %s gated by meta p=%.3f < p*=%.3f",
-                                         sym, float(signal.win_probability), float(pstar))
+                                LOG.info(
+                                    "Signal %s gated by meta p=%.3f < p*=%.3f",
+                                    sym, float(signal.win_probability), float(pstar)
+                                )
                                 await asyncio.sleep(0.2)
                                 continue
 
@@ -3298,6 +3787,7 @@ class LiveTrader:
 
             LOG.info("Scan cycle complete. Sleeping…")
             await asyncio.sleep(self.cfg.get("SCAN_INTERVAL_SEC", 60))
+
 
     async def _equity_loop(self):
         while True:
@@ -3997,7 +4487,7 @@ class LiveTrader:
         self._listing_dates_cache = await self._load_listing_dates()
 
         await self._resume()
-        await self.tg.send("DONCH v2.4b started successfully.")
+        await self.tg.send("DONCH v2.1.2 (sprint 2) started successfully.")
 
         try:
             async with asyncio.TaskGroup() as tg:

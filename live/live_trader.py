@@ -11,6 +11,7 @@ live_trader.py – v4.1 (Clean, YAML sizing + meta gate, robust listing-age)
 from __future__ import annotations
 
 import secrets
+import hashlib
 import asyncio
 import dataclasses
 import json
@@ -322,6 +323,7 @@ class RegimeDetector:
 class Signal:
     # Required
     symbol: str
+    decision_ts: pd.Timestamp
     entry: float
     atr: float
     rsi: float
@@ -346,10 +348,16 @@ class Signal:
     win_probability: float = 0.0
 
     def __post_init__(self):
+        dt = pd.to_datetime(self.decision_ts, utc=True, errors="coerce")
+        if dt is pd.NaT:
+            raise ValueError("Signal.decision_ts invalid/NaT")
+        self.decision_ts = dt
+
         self.side = str(self.side).upper()
         if self.side not in ("LONG", "SHORT"):
             self.side = "SHORT"
         LOG.info(f"Successfully created Signal object for {self.symbol} using correct class definition.")
+
 
 ###############################################################################
 # 7 ▸ MAIN TRADER #############################################################
@@ -830,6 +838,9 @@ class LiveTrader:
             raise RuntimeError("GOV_CTX: cannot determine decision_ts_gov (BTC/ETH 5m frames empty)")
 
         decision_ts_gov = pd.to_datetime(decision_ts_gov, utc=True)
+
+        # Cycle-level “data clock” (single source of truth for decision timing this cycle)
+        self._cycle_asof_ts = decision_ts_gov
 
         # Hard as-of cut to prevent any downstream cross-asset lookahead
         if df_btc is not None and not df_btc.empty:
@@ -1345,6 +1356,14 @@ class LiveTrader:
         if not getattr(self, "winprob", None):
             out["err"] = "winprob_not_loaded"
             return out
+
+        # Fail-closed: verify required raw features are present and finite BEFORE scoring
+        required = list(getattr(self.winprob, "raw_features", []) or [])
+        if required:
+            missing = self._missing_required_features(meta_row, required)
+            if missing:
+                out["err"] = "missing_required:" + ",".join(missing[:50])
+                return out
 
         try:
             # winprob_loader.WinProbScorer.score_with_details returns (p_raw, p_cal)
@@ -1865,6 +1884,7 @@ class LiveTrader:
                 return None
 
             last = df5_req.iloc[-1]
+            decision_ts = df5_req.index[-1]
 
             # ---------------- Listing age ------------------------
             age_opt = self._listing_age_days(symbol, dfs, asof_ts=decision_ts)
@@ -2198,6 +2218,15 @@ class LiveTrader:
                 p_raw = score_d.get("p_raw")
                 schema_ok = score_d.get("schema_ok")
                 meta_err = score_d.get("err")
+
+
+                if not schema_ok and meta_err and str(meta_err).startswith("missing_required:"):
+                    LOG.warning("bundle=%s %s meta feature completeness fail (asof=%s): %s",
+                                getattr(self, "bundle_id", None) or "no_bundle",
+                                symbol,
+                                str(decision_ts),
+                                meta_err)
+
             else:
                 # No model loaded or no features required
                 p_cal, p_raw = None, None
@@ -2455,6 +2484,7 @@ class LiveTrader:
             # -------------- Compose Signal object ----------------
             signal_obj = Signal(
                 symbol=symbol,
+                decision_ts=decision_ts,
                 entry=float(last['close']),
                 atr=float(last['atr_1h']),
                 rsi=float(last['rsi_1h']),
@@ -2773,9 +2803,14 @@ class LiveTrader:
             recent_open = await self.db.pool.fetchval(
                 "SELECT MAX(opened_at) FROM positions WHERE symbol=$1", sig.symbol
             )
-            if recent_open and (datetime.now(timezone.utc) - recent_open) < timedelta(hours=dd_hours):
-                LOG.info("De-dup window: last %s open at %s < %sh → skip.", sig.symbol, recent_open, dd_hours)
-                return
+
+            if recent_open:
+                asof_ts = pd.to_datetime(sig.decision_ts, utc=True)
+                ro_ts = pd.to_datetime(recent_open, utc=True, errors="coerce")
+                if ro_ts is not pd.NaT and (asof_ts - ro_ts) < pd.Timedelta(hours=float(dd_hours)):
+                    LOG.warning("Duplicate entry prevented for %s", sig.symbol)
+                    return
+
         except Exception as _e:
             LOG.warning("De-dup check failed for %s: %s (continuing)", sig.symbol, _e)
 
@@ -3009,17 +3044,30 @@ class LiveTrader:
         except Exception:
             return
 
-        # --- Entry: market order with unique CID ---
-        entry_cid = create_unique_cid(f"ENTRY_{sig.symbol}")
+        # --- Entry: market order with deterministic CID (idempotent) ---
+        entry_cid = create_entry_cid(symbol=sig.symbol, decision_ts=sig.decision_ts, side=sig.side, tag="ENTRY")
+
+        # If we already have an order with this CID, do not place again (retry/restart safety).
+        # Proceed to the normal “confirm position appears” logic below.
         try:
-            await self.exchange.create_market_order(
-                sig.symbol, entry_side, intended_size,
-                params={"clientOrderId": entry_cid, "category": "linear"}
-            )
-            LOG.info("Market %s sent for %s (CID=%s)", entry_side.upper(), sig.symbol, entry_cid)
-        except Exception as e:
-            LOG.error("Market %s failed for %s: %s", entry_side.upper(), sig.symbol, e)
-            return
+            existing = await self._fetch_by_cid(entry_cid, sig.symbol, silent=True)
+        except Exception:
+            existing = None
+
+        if existing:
+            LOG.info("Entry order already exists for %s (CID=%s, status=%s). Not re-sending.",
+                    sig.symbol, entry_cid, existing.get("status"))
+        else:
+            try:
+                entry_order = await self.exchange.create_market_order(
+                    sig.symbol, entry_side, intended_size,
+                    params={"clientOrderId": entry_cid, "category": "linear"}
+                )
+                LOG.info("Market %s sent for %s (CID=%s)", entry_side.upper(), sig.symbol, entry_cid)
+            except Exception as e:
+                LOG.error("Market %s failed for %s: %s", entry_side.upper(), sig.symbol, e)
+                return
+
 
         # --- Confirm position appears on exchange ---
         actual_size = 0.0
@@ -3049,13 +3097,25 @@ class LiveTrader:
         # --- Protective levels from actual entry ---
         stop_price = (actual_entry_price - sl_mult * float(sig.atr)) if is_long else (actual_entry_price + sl_mult * float(sig.atr))
 
-        # --- Persist to DB (then add order CIDs) ---
-        now = datetime.now(timezone.utc)
+
+        # --- Persist to DB (timestamps must be data-derived; no wall-clock) ---
+        # Prefer exchange-provided order timestamp if we placed an order; otherwise fall back to signal decision_ts.
+        opened_at_dt = None
+        try:
+            if "entry_order" in locals() and entry_order and entry_order.get("timestamp"):
+                opened_at_dt = datetime.fromtimestamp(int(entry_order["timestamp"]) / 1000.0, tz=timezone.utc)
+        except Exception:
+            opened_at_dt = None
+
+        if opened_at_dt is None:
+            opened_at_dt = pd.to_datetime(sig.decision_ts, utc=True).to_pydatetime()
+
         exit_deadline = None
         if self.cfg.get("TIME_EXIT_HOURS_ENABLED", False):
-            exit_deadline = now + timedelta(hours=int(self.cfg.get("TIME_EXIT_HOURS", 4)))
+            exit_deadline = opened_at_dt + timedelta(hours=int(self.cfg.get("TIME_EXIT_HOURS", 4)))
         elif self.cfg.get("TIME_EXIT_ENABLED", False):
-            exit_deadline = now + timedelta(days=int(self.cfg.get("TIME_EXIT_DAYS", 10)))
+            exit_deadline = opened_at_dt + timedelta(days=int(self.cfg.get("TIME_EXIT_DAYS", 10)))
+
 
         payload = {
             "symbol": sig.symbol,
@@ -3065,7 +3125,7 @@ class LiveTrader:
             "trailing_active": False,
             "atr": float(sig.atr),
             "status": "OPEN",
-            "opened_at": now,
+            "opened_at": opened_at_dt,
             "exit_deadline": exit_deadline,
             "entry_cid": entry_cid,
             "market_regime_at_entry": sig.market_regime,
@@ -3292,11 +3352,24 @@ class LiveTrader:
         open_cids = {o.get("clientOrderId") for o in (orders or [])}
 
         if self.cfg.get("TIME_EXIT_ENABLED", cfg.TIME_EXIT_ENABLED):
-            ddl = pos.get("exit_deadline")
-            if ddl and datetime.now(timezone.utc) >= ddl:
-                LOG.info("bundle=%s Time-exit firing on %s (pid %d)", bundle, symbol, pid)
-                await self._force_close_position(pid, pos, tag="TIME_EXIT")
-                return
+
+
+        ddl = pos.get("exit_deadline")
+        if ddl:
+            # Use data-derived “now” (cycle gov clock if available; else last closed 5m bar for this symbol).
+            asof_ts = getattr(self, "_cycle_asof_ts", None)
+            if asof_ts is None:
+                try:
+                    asof_ts = await self._last_closed_5m_ts(symbol)
+                except Exception:
+                    asof_ts = None
+
+            if asof_ts is not None and not pd.isna(asof_ts):
+                now_dt = pd.to_datetime(asof_ts, utc=True).to_pydatetime()
+                if now_dt >= ddl:
+                    LOG.info("bundle=%s Time-exit firing on %s (pid %d)", bundle, symbol, pid)
+                    await self._force_close_position(pid, pos, tag="TIME_EXIT")
+                    return
 
         trailing_active = bool(pos.get("trailing_active", False))
 
@@ -3525,7 +3598,18 @@ class LiveTrader:
             avg_exit = (exit_notional / exit_qty_sum) if exit_qty_sum > 0 else entry_price
             closed_at = datetime.fromtimestamp(max(ts for ts, *_ in fills) / 1000.0, tz=timezone.utc)
         else:
-            closed_at = datetime.fromtimestamp(order_last_ts / 1000.0, tz=timezone.utc) if order_last_ts else datetime.now(timezone.utc)
+
+        if order_last_ts:
+            closed_at = datetime.fromtimestamp(order_last_ts / 1000.0, tz=timezone.utc)
+        else:
+            # Data-derived fallback: last closed 5m bar timestamp
+            evt_ts = await self._last_closed_5m_ts(symbol)
+            if evt_ts is None or pd.isna(evt_ts):
+                # last-resort fallback: use opened_at (still data-derived from exchange/decision_ts)
+                closed_at = opened_at
+            else:
+                closed_at = pd.to_datetime(evt_ts, utc=True).to_pydatetime()
+
             if exit_price is None:
                 try:
                     tk = await self.exchange.fetch_ticker(symbol)
@@ -3644,8 +3728,15 @@ class LiveTrader:
             exit_price = float((await self.exchange.fetch_ticker(symbol))["last"])
 
         pnl = (entry_price - exit_price) * size if side == "SHORT" else (exit_price - entry_price) * size
-        closed_at = datetime.now(timezone.utc)
-        holding_minutes = (closed_at - pos.get("opened_at", closed_at)).total_seconds()/60.0
+
+        evt_ts = await self._last_closed_5m_ts(symbol)
+        if evt_ts is None or pd.isna(evt_ts):
+            closed_at = pos.get("opened_at", datetime.now(timezone.utc))  # should already be data-derived
+        else:
+            closed_at = pd.to_datetime(evt_ts, utc=True).to_pydatetime()
+
+        holding_minutes = (closed_at - pos.get("opened_at", closed_at)).total_seconds() / 60.0
+
 
         await self.db.update_position(
             pid, status="CLOSED", closed_at=closed_at, pnl=pnl,
@@ -3664,7 +3755,7 @@ class LiveTrader:
         except Exception as e:
             LOG.warning("bundle=%s OnlinePerformanceState record failed for %s: %s", getattr(self, "bundle_id", None) or "no_bundle", symbol, e)
 
-        self.last_exit[symbol] = closed_at
+        self.last_exit[symbol] = pd.to_datetime(closed_at, utc=True)
         self.open_positions.pop(pid, None)
         await self.tg.send(f"⏰ {symbol} closed by {tag}. PnL ≈ {pnl:.2f} USDT")
 
@@ -3686,6 +3777,9 @@ class LiveTrader:
                     raise RuntimeError("GOV_CTX: missing/invalid decision_ts_gov")
 
                 decision_ts_gov = pd.to_datetime(decision_ts_gov, utc=True)
+
+                # Cycle-level “data clock” (single source of truth for decision timing this cycle)
+                self._cycle_asof_ts = decision_ts_gov
 
                 # Daily regime as-of decision_ts_gov
                 current_market_regime = await self.regime_detector.get_current_regime(decision_ts_gov)
@@ -3726,9 +3820,17 @@ class LiveTrader:
 
                     # Cooldown fast-skip (existing behavior kept as-is)
                     cd_h = self.cfg.get("SYMBOL_COOLDOWN_HOURS", cfg.SYMBOL_COOLDOWN_HOURS)
+
+                    asof_ts = getattr(self, "_cycle_asof_ts", None)
+                    if asof_ts is None:
+                        asof_ts = decision_ts_gov
+                    asof_ts = pd.to_datetime(asof_ts, utc=True)
+
                     last_x = self.last_exit.get(sym)
-                    if last_x and datetime.now(timezone.utc) - last_x < timedelta(hours=cd_h):
-                        continue
+                    if last_x is not None:
+                        last_ts = pd.to_datetime(last_x, utc=True, errors="coerce")
+                        if last_ts is not pd.NaT and (asof_ts - last_ts) < pd.Timedelta(hours=float(cd_h)):
+                            continue
 
                     async with self.symbol_locks[sym]:
                         # Pre-flight: skip if exchange already has a position
@@ -4597,15 +4699,24 @@ class LiveTrader:
 # Helpers (module-level)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def create_unique_cid(tag: str) -> str:
-    """Unique client order ID for entries."""
-    timestamp_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    random_suffix = secrets.token_hex(2)
-    return f"bot_{tag}_{timestamp_ms}_{random_suffix}"[:36]
+def create_entry_cid(symbol: str, decision_ts: pd.Timestamp, side: str, tag: str = "ENTRY") -> str:
+    """
+    Deterministic client order ID for entry orders.
+
+    Stable across retries/restarts for the same (symbol, decision_ts, side, tag).
+    Keeps length <= 36 characters for Bybit/CCXT clientOrderId constraints.
+    """
+    ts = pd.to_datetime(decision_ts, utc=True).strftime("%Y%m%d%H%M")  # minute bucket
+    sym8 = str(symbol).replace("/", "").upper()[:8]
+    side1 = "L" if str(side).upper().startswith("L") else "S"
+    base = f"{tag}|{symbol}|{side}|{ts}"
+    h = hashlib.sha1(base.encode("utf-8")).hexdigest()[:8]
+    return f"bot_{tag}{sym8}{side1}{ts}{h}"[:36]
 
 def create_stable_cid(pid: int, tag: str) -> str:
     """Stable client order ID for SL/TP."""
     return f"bot_{pid}_{tag}"[:36]
+
 
 
 # ──────────────────────────────────────────────────────────────────────────────
