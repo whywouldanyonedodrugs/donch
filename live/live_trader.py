@@ -62,7 +62,8 @@ from .strategy_engine import StrategyEngine
 from .feature_builder import FeatureBuilder
 from .parity_utils import resample_ohlcv, donchian_upper_days_no_lookahead, eval_meta_scope
 
-from .oi_funding import fetch_series_5m, compute_oi_funding_features
+from .oi_funding import fetch_series_5m, compute_oi_funding_features, StaleDerivativesDataError
+
 
 import logging
 logging.getLogger("watchdog").setLevel(logging.WARNING)
