@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Any
 
 import numpy as np
 import pandas as pd
@@ -22,6 +22,29 @@ WIN_7D = 7 * WIN_1D
 
 class StaleDerivativesDataError(RuntimeError):
     pass
+
+def _coerce_thresholds(thresholds: Any) -> RegimeThresholds:
+    """
+    LiveTrader historically passes a plain dict loaded from regimes_report.json.
+    The OI/Funding feature code expects a RegimeThresholds object.
+    Coerce dict -> RegimeThresholds (ignoring any extra keys).
+    """
+    if isinstance(thresholds, RegimeThresholds):
+        return thresholds
+
+    if isinstance(thresholds, dict):
+        t = thresholds
+        # These keys are required by add_oi_funding_features below.
+        return RegimeThresholds(
+            funding_neutral_eps=float(t["funding_neutral_eps"]),
+            oi_source=str(t["oi_source"]),
+            oi_q33=float(t["oi_q33"]),
+            oi_q66=float(t["oi_q66"]),
+            btc_vol_hi=float(t["btc_vol_hi"]),
+        )
+
+    raise TypeError(f"thresholds must be RegimeThresholds or dict, got {type(thresholds)!r}")
+
 
 
 def _ensure_dt_index(df: pd.DataFrame) -> pd.DataFrame:
@@ -86,6 +109,8 @@ def add_oi_funding_features(
       - funding_regime_code, oi_regime_code, S3_funding_x_oi
     """
     df = _ensure_dt_index(df5)
+    thresholds = _coerce_thresholds(thresholds)
+
     if df.empty:
         raise ValueError("df5 is empty")
 
