@@ -3597,17 +3597,15 @@ class LiveTrader:
             avg_exit = (exit_notional / exit_qty_sum) if exit_qty_sum > 0 else entry_price
             closed_at = datetime.fromtimestamp(max(ts for ts, *_ in fills) / 1000.0, tz=timezone.utc)
         else:
-
-        if order_last_ts:
-            closed_at = datetime.fromtimestamp(order_last_ts / 1000.0, tz=timezone.utc)
-        else:
-            # Data-derived fallback: last closed 5m bar timestamp
-            evt_ts = await self._last_closed_5m_ts(symbol)
-            if evt_ts is None or pd.isna(evt_ts):
-                # last-resort fallback: use opened_at (still data-derived from exchange/decision_ts)
-                closed_at = opened_at
-            else:
+            # Sprint 3.0: Deterministic close time fallback (last closed 5m bar)
+            try:
+                evt_ts = await self._last_closed_5m_ts(symbol)
                 closed_at = pd.to_datetime(evt_ts, utc=True).to_pydatetime()
+            except Exception:
+                closed_at = opened_at  # deterministic, no wall-clock
+
+            if order_last_ts:
+                closed_at = datetime.fromtimestamp(order_last_ts / 1000.0, tz=timezone.utc)
 
             if exit_price is None:
                 try:
