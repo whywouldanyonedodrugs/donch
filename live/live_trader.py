@@ -523,7 +523,7 @@ class LiveTrader:
                 state_path = str(self.cfg.get("ONLINE_STATE_PATH", "results/online_state.jsonl"))
                 max_records = int(self.cfg.get("ONLINE_STATE_MAX_RECORDS", 2000))
 
-                cold_raw = self.cfg.get("ONLINE_STATE_COLDSTART_WINRATE", float("nan"))
+                cold_raw = self.cfg.get("ONLINE_STATE_COLDSTART_WINRATE", 0.25)
                 try:
                     cold_f = float(cold_raw)
                 except Exception:

@@ -5,9 +5,8 @@ import numpy as np
 import pandas as pd
 from typing import Dict, Optional
 
-from common.indicators import ta
-from common.indicators.vwap_stack import vwap_stack_features
-from common.indicators.congestion import congestion_range_atr_15m
+from . import indicators as ta
+from .indicators import vwap_stack_features
 
 
 def _resample_ohlcv(df5: pd.DataFrame, rule: str) -> pd.DataFrame:
@@ -31,6 +30,45 @@ def _last_ts_asof(df: pd.DataFrame, decision_ts: pd.Timestamp) -> Optional[pd.Ti
         return None
     return sub.index[-1]
 
+def _prebreak_congestion_atr_15m(
+    df5: pd.DataFrame,
+    decision_ts: pd.Timestamp,
+    atr_len: int,
+    lookback_bars_15m: int,
+) -> Optional[float]:
+    """
+    Deterministic, as-of decision_ts:
+    - Resample 5m -> 15m with label='right', closed='right'
+    - Take last closed 15m bar <= decision_ts
+    - Compute (max(high)-min(low)) over last N 15m bars
+    - Divide by ATR(15m, atr_len) at that as-of 15m timestamp
+    """
+    if df5 is None or df5.empty:
+        return None
+
+    df15 = _resample_ohlcv(df5, "15min")
+    ts15 = _last_ts_asof(df15, decision_ts)
+    if ts15 is None:
+        return None
+
+    win = df15.loc[:ts15].tail(int(lookback_bars_15m))
+    if win.empty:
+        return None
+
+    rng = float(win["high"].max() - win["low"].min())
+    if not np.isfinite(rng):
+        return None
+
+    try:
+        atr15 = ta.atr(df15[["open", "high", "low", "close"]], int(atr_len))
+        a = float(atr15.loc[ts15])
+    except Exception:
+        return None
+
+    if (not np.isfinite(a)) or a == 0.0:
+        return None
+
+    return float(rng / a)
 
 class FeatureBuilder:
     """
@@ -140,7 +178,7 @@ class FeatureBuilder:
         try:
             # Existing deterministic helper based on 15m congestion range vs ATR
             cong_len = int(self.cfg.get("PREBREAK_CONGESTION_N15", 12))
-            cong = congestion_range_atr_15m(df5, decision_ts=decision_ts, atr_len=atr_len, lookback_bars_15m=cong_len)
+            cong = _prebreak_congestion_atr_15m(df5, decision_ts=decision_ts, atr_len=atr_len, lookback_bars_15m=cong_len)
             out["congestion_range_atr"] = float(cong) if cong is not None else float("nan")
         except Exception:
             out["congestion_range_atr"] = float("nan")
@@ -150,7 +188,10 @@ class FeatureBuilder:
 
         # -------- VWAP stack features (already used for other features/DB columns)
         try:
-            vwap = vwap_stack_features(df5, decision_ts=decision_ts)
+            vwap_lb = int(self.cfg.get("VWAP_LOOKBACK_BARS", 12))
+            vwap_band = float(self.cfg.get("VWAP_BAND_PCT", 0.004))
+            df5_cut = df5.loc[:decision_ts]
+            vwap = vwap_stack_features(df5_cut, lookback_bars=vwap_lb, band_pct=vwap_band)
             for k, v in vwap.items():
                 out[k] = float(v) if v is not None else float("nan")
         except Exception:
