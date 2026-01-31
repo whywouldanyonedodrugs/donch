@@ -4008,16 +4008,31 @@ class LiveTrader:
         Single source of truth for zero-size finalization to avoid divergent code paths.
         """
         bundle = getattr(self, "bundle_id", None) or "no_bundle"
-        now = datetime.now(timezone.utc)
+
+        # Data-time debounce (no wall-clock leakage)
+        asof_ts = getattr(self, "_cycle_asof_ts", None)
+        if asof_ts is None:
+            try:
+                asof_ts = await self._last_closed_5m_ts(symbol)
+            except Exception:
+                asof_ts = None
+
+        now = None
+        if asof_ts is not None and not pd.isna(asof_ts):
+            now = pd.to_datetime(asof_ts, utc=True).to_pydatetime()
+        else:
+            # last resort: use opened_at (should be data-derived); if missing, skip debounce
+            now = pos.get("opened_at")
 
         # Debounce finalize attempts
         if not hasattr(self, "_zero_finalize_backoff"):
             self._zero_finalize_backoff = {}
         last_try = self._zero_finalize_backoff.get(pid)
-        if last_try and (now - last_try).total_seconds() < float(self.cfg.get("FINALIZE_BACKOFF_SEC", 120)):
+        if now is not None and last_try and (now - last_try).total_seconds() < float(self.cfg.get("FINALIZE_BACKOFF_SEC", 120)):
             LOG.info("bundle=%s Position size is 0 for %s; finalize debounced.", bundle, symbol)
             return
-        self._zero_finalize_backoff[pid] = now
+        if now is not None:
+            self._zero_finalize_backoff[pid] = now
 
         # Infer exit reason by checking our known clientOrderIds
         exit_kind = "MANUAL_CLOSE"
