@@ -566,12 +566,13 @@ class LiveTrader:
             )
             return feats
 
-        except (StaleDerivativesDataError, KeyError, ValueError, NotImplementedError) as e:
-            self.logger.warning(f"OI/Funding features unavailable for {symbol} at {decision_ts}: {e}")
+        except (StaleDerivativesDataError, KeyError, ValueError, TypeError, NotImplementedError) as e:
+            LOG.warning("OI/Funding features error for %s at %s: %s", symbol, decision_ts, e)
             return {}
         except Exception as e:
-            self.logger.warning(f"OI/Funding features error for {symbol} at {decision_ts}: {e}")
+            LOG.exception("OI/Funding features unexpected error for %s at %s", symbol, decision_ts)
             return {}
+
 
 
     async def _fetch_ohlcv_df_paged(self, symbol: str, tf: str, limit: int) -> Optional[pd.DataFrame]:

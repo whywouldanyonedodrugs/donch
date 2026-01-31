@@ -162,6 +162,10 @@ class ExchangeProxy:
         Returns a list of dicts with keys: {"timestamp": <ms>, "openInterest": <float>}.
         Window is [end_ts - lookback_days, end_ts]. If end_ts is None, uses exchange time.
         """
+
+        if lookback_days is None:
+            raise ValueError("lookback_days must not be None")
+
         ex = self._exchange
 
         # Only Bybit v5 supports 5m open interest in the way we need.
@@ -256,9 +260,14 @@ class ExchangeProxy:
         - lookback_days=...
         - lookback_oi_days=..., lookback_fr_days=...
         """
+        # Normalize lookback overrides
         if lookback_days is not None:
             lookback_oi_days = int(lookback_days)
             lookback_fr_days = int(lookback_days)
+
+        lookback_oi_days = int(lookback_oi_days)
+        lookback_fr_days = int(lookback_fr_days)
+
 
         # Normalize end_ts
         if end_ts is not None:
@@ -268,8 +277,12 @@ class ExchangeProxy:
                 end_ts = end_ts.tz_localize("UTC")
 
         # Fetch raw history
-        oi_rows = await self.fetch_open_interest_history_5m(symbol, lookback_days=lookback_days, end_ts=end_ts)
-        fr_rows = await self.fetch_funding_rate_history(symbol, lookback_days=lookback_days, end_ts=end_ts)
+        oi_rows = await self.fetch_open_interest_history_5m(
+            symbol, lookback_days=lookback_oi_days, end_ts=end_ts
+        )
+        fr_rows = await self.fetch_funding_rate_history(
+            symbol, lookback_days=lookback_fr_days, end_ts=end_ts
+        )
 
         # Build OI dataframe
         oi_df = pd.DataFrame(oi_rows or [])
