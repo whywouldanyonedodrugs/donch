@@ -20,33 +20,44 @@ def _tf_to_timedelta(tf: str) -> pd.Timedelta:
         return pd.Timedelta(days=int(tf[:-1]))
     raise ValueError(f"Unsupported timeframe: {tf}")
 
-def drop_incomplete_last_bar(df: pd.DataFrame, asof_ts: pd.Timestamp) -> pd.DataFrame:
+def drop_incomplete_last_bar(df, tf, asof_ts=None):
     """
-    Drop the last row if its timestamp is strictly AFTER asof_ts.
-    This enforces 'past-only' semantics for as-of feature snapshots.
-    Assumes the DataFrame index represents BAR CLOSE timestamps.
+    Drop any bar that is not fully closed as-of `asof_ts`.
+
+    Backward-compatible:
+    - If called as (df, tf), we conservatively drop the last row.
+    - If called as (df, tf, asof_ts), we keep bars with index <= asof_ts.
+
+    Assumption consistent with the rest of live pipeline:
+    - DataFrames are indexed by BAR CLOSE TIME (right-labeled). This matches the
+      live OHLCV fetcher docstring that returns "indexed at BAR CLOSE TIME (shifted)"
+      and drops incomplete last bar upstream.
     """
-    if df is None or len(df) == 0:
+    import pandas as pd
+
+    if df is None or getattr(df, "empty", True):
         return df
 
-    out = df
-    if not isinstance(out.index, pd.DatetimeIndex):
-        out = out.copy()
-        out.index = pd.to_datetime(out.index, utc=True)
+    # If no asof provided, be conservative (drop last bar)
+    if asof_ts is None:
+        return df.iloc[:-1]
 
-    out = out.sort_index()
-
-    ts = pd.Timestamp(asof_ts)
-    if ts.tzinfo is None:
-        ts = ts.tz_localize("UTC")
+    # Normalize asof_ts to tz-aware UTC
+    if isinstance(asof_ts, pd.Timestamp):
+        ts = asof_ts
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        else:
+            ts = ts.tz_convert("UTC")
     else:
-        ts = ts.tz_convert("UTC")
+        ts = pd.Timestamp(asof_ts, tz="UTC")
 
-    if out.index[-1] > ts:
-        return out.iloc[:-1].copy()
-
-    return out
-
+    # Keep only bars that are closed at/before ts
+    try:
+        return df.loc[df.index <= ts]
+    except Exception:
+        # If index is not comparable, fail closed
+        return df.iloc[:-1]
 
 def _ensure_utc_ts(ts: pd.Timestamp) -> pd.Timestamp:
     ts = pd.to_datetime(ts, utc=True)

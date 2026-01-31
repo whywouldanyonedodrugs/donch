@@ -278,10 +278,14 @@ class ExchangeProxy:
 
         # Fetch raw history
         oi_rows = await self.fetch_open_interest_history_5m(
-            symbol, lookback_days=lookback_oi_days, end_ts=end_ts
+            symbol,
+            lookback_days=lookback_oi_days,
+            end_ts=end_ts,
         )
         fr_rows = await self.fetch_funding_rate_history(
-            symbol, lookback_days=lookback_fr_days, end_ts=end_ts
+            symbol,
+            lookback_days=lookback_fr_days,
+            end_ts=end_ts,
         )
 
         # Build OI dataframe
@@ -335,74 +339,59 @@ class ExchangeProxy:
 
         return oi_df, fr_df
 
-
-
-    async def fetch_funding_rate_history(self, symbol: str, *, lookback_days: int = 7) -> list[dict]:
+    async def fetch_funding_rate_history(
+        self,
+        symbol: str,
+        *,
+        lookback_days: int = 7,
+        end_ts=None,
+    ):
         """
-        Return [{"timestamp": ms, "fundingRate": float}, ...], newest last.
-        """
-        ex = self._exchange
+        Fetch funding rate history.
 
-        # Try CCXT unified first
-        if getattr(ex, "has", {}).get("fetchFundingRateHistory"):
-            rows = await ex.fetchFundingRateHistory(symbol)
-            if not rows:
-                return []
-            out = []
-            if isinstance(rows[0], dict):
-                for r in rows:
-                    ts = int(r.get("timestamp") or r.get("time") or 0)
-                    fr = r.get("fundingRate") or r.get("rate")
-                    try: fr = float(fr)
-                    except Exception: fr = None
-                    if ts and fr is not None:
-                        out.append({"timestamp": ts, "fundingRate": fr})
+        Strict-parity note:
+        - If end_ts is provided, we anchor the query window to end_ts (not wall-clock),
+        so features are "as-of decision_ts" and deterministic.
+        - If end_ts is None, we fall back to exchange wall-clock milliseconds (legacy behavior).
+        """
+        import pandas as pd
+
+        if lookback_days is None:
+            raise ValueError("lookback_days must not be None")
+
+        # Resolve end_ms
+        if end_ts is None:
+            end_ms = self.ex.milliseconds()
+        else:
+            if isinstance(end_ts, pd.Timestamp):
+                ts = end_ts
+                if ts.tzinfo is None:
+                    ts = ts.tz_localize("UTC")
+                else:
+                    ts = ts.tz_convert("UTC")
+                end_ms = int(ts.timestamp() * 1000)
             else:
-                for ts, rate, *_ in rows:
-                    out.append({"timestamp": int(ts), "fundingRate": float(rate)})
-            out.sort(key=lambda x: x["timestamp"])
-            return out
+                # allow passing ms int
+                end_ms = int(end_ts)
 
-        # Fallback: Bybit V5 public endpoint
-        if ex.id == "bybit" and hasattr(ex, "publicGetV5MarketHistoryFundRate"):
-            now_ms = ex.milliseconds()
-            start_ms = now_ms - lookback_days * 24 * 60 * 60 * 1000
-            cursor = None
-            result: list[dict] = []
-            while True:
+        start_ms = end_ms - int(lookback_days) * 24 * 60 * 60 * 1000
 
+        # Preferred CCXT unified call
+        if self.ex.has.get("fetchFundingRateHistory"):
+            # Some CCXT implementations accept since + limit; keep it simple:
+            # pass `since=start_ms`, then slice to <= end_ts in the caller if needed.
+            return await self.ex.fetch_funding_rate_history(symbol, since=start_ms)
 
-                params = {
-                    "category": "linear",
-                    "symbol": symbol,
-                    "endTime": end_ms,
-                    "limit": 200,
-                }
+        # Bybit fallback: use params (startTime/endTime)
+        if getattr(self.ex, "id", "") == "bybit":
+            return await self.ex.public_get_v5_market_funding_history({
+                "symbol": symbol.replace("/", ""),
+                "startTime": start_ms,
+                "endTime": end_ms,
+                "limit": 200,
+            })
 
-
-
-
-                if cursor:
-                    params["cursor"] = cursor
-                resp = await ex.publicGetV5MarketHistoryFundRate(params)
-                lst = (((resp or {}).get("result") or {}).get("list")) or []
-                for row in lst:
-                    ts = int(row.get("fundingRateTimestamp") or row.get("timestamp") or 0)
-                    fr = row.get("fundingRate")
-                    try: fr = float(fr)
-                    except Exception: fr = None
-                    if ts and fr is not None:
-                        result.append({"timestamp": ts, "fundingRate": fr})
-                cursor = (((resp or {}).get("result") or {}).get("nextPageCursor")) or ""
-                if not cursor:
-                    break
-                await asyncio.sleep(0.1)
-            result.sort(key=lambda x: x["timestamp"])
-            return result
-
-        return []
-
-
+        raise NotImplementedError("Funding rate history not supported on this exchange adapter")
 
     async def close(self):
         """Gracefully close the underlying exchange connection."""
