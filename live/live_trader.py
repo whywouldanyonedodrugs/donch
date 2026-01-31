@@ -830,15 +830,16 @@ class LiveTrader:
 
         Owns Markov 4h (ETH by default) to match canonical offline semantics.
         """
-        # Fetch 5m OHLCV for BTC/ETH
-        df_btc, df_eth = await asyncio.gather(
-            days = int(self.cfg.get("GOV_CTX_DAYS_5M", 60))
-            min_bars = days * 288 + 500
-            self._fetch_ohlcv_df_paged("BTCUSDT", "5m", limit=min_bars),
-            self._fetch_ohlcv_df_paged("ETHUSDT", "5m", limit=min_bars),
+        # At the top of _get_gov_ctx, before fetching BTC/ETH:
 
-            return_exceptions=False,
+        min_days = int(self.cfg.get("GOV_CTX_DAYS_5M", 60))
+        min_bars = int(min_days * 24 * 12) + 2 * 288  # +2d cushion
+
+        df_btc, df_eth = await asyncio.gather(
+            self._get_ohlcv("BTCUSDT", "5m", min_bars=min_bars),
+            self._get_ohlcv("ETHUSDT", "5m", min_bars=min_bars),
         )
+
 
         # Determine decision_ts_gov (min last-closed ts across BTC/ETH) to avoid cross-asset lookahead
         decision_ts_gov = None
