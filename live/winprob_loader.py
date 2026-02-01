@@ -243,6 +243,28 @@ def _safe_float01(x: Any) -> Optional[float]:
     return v
 
 
+def _threshold_from_scope_entry(entry: Any) -> Any:
+    """
+    thresholds_by_scope[scope] can be:
+      - float
+      - {"threshold": 0.xx, ...}
+      - {"best": {..., "threshold": 0.xx}, "top5": [...]}  (your current export)
+    """
+    if isinstance(entry, dict):
+        if "threshold" in entry:
+            return entry.get("threshold")
+        best = entry.get("best")
+        if isinstance(best, dict) and ("threshold" in best):
+            return best.get("threshold")
+        top5 = entry.get("top5")
+        if isinstance(top5, list) and top5:
+            t0 = top5[0]
+            if isinstance(t0, dict) and ("threshold" in t0):
+                return t0.get("threshold")
+        return None
+    return entry
+
+
 def _extract_pstar_from_thresholds(
     thresholds_obj: Any,
     *,
@@ -290,7 +312,9 @@ def _extract_pstar_from_thresholds(
         if isinstance(v, str) and v.strip() in scope_set:
             chosen_scope = v.strip()
             entry = tbs.get(chosen_scope)
-            thr = entry.get("threshold") if isinstance(entry, dict) else entry
+
+            thr = _threshold_from_scope_entry(entry)
+
             p = _safe_float01(thr)
             if p is not None:
                 return (p, chosen_scope, f"artifact:thresholds.json:{k}")
@@ -333,7 +357,9 @@ def _extract_pstar_from_thresholds(
     # If we got a scope from deployment config, use the scope's threshold from thresholds.json
     if deploy_scope is not None:
         entry = tbs.get(deploy_scope)
-        thr = entry.get("threshold") if isinstance(entry, dict) else entry
+
+        thr = _threshold_from_scope_entry(entry)
+
         p = _safe_float01(thr)
         if p is not None:
             return (p, deploy_scope, "artifact:deployment_config.json->thresholds.json:scope")
@@ -343,7 +369,9 @@ def _extract_pstar_from_thresholds(
         matches: list[str] = []
         for sc in scopes:
             entry = tbs.get(sc)
-            thr = entry.get("threshold") if isinstance(entry, dict) else entry
+
+            thr = _threshold_from_scope_entry(entry)
+
             p = _safe_float01(thr)
             if p is None:
                 continue

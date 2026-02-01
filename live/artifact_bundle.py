@@ -342,11 +342,91 @@ def load_bundle(meta_dir: str | Path, strict: bool = True, required_extra_files:
 
     # Load thresholds/p* if present
     thresholds = _read_json(thresholds_path) if thresholds_path is not None else None
-    pstar = None
-    pstar_scope = None
+
+    def _safe_float01(x: Any) -> Optional[float]:
+        try:
+            v = float(x)
+        except Exception:
+            return None
+        if not np.isfinite(v):
+            return None
+        if v < 0.0 or v > 1.0:
+            return None
+        return v
+
+    def _thr_from_scope_entry(entry: Any) -> Optional[float]:
+        """
+        thresholds_by_scope[scope] can be:
+          - float
+          - {"threshold": 0.xx, ...}
+          - {"best": {..., "threshold": 0.xx}, "top5": [...]}   (your current export)
+        """
+        if isinstance(entry, (float, int)):
+            return _safe_float01(entry)
+
+        if isinstance(entry, dict):
+            if "threshold" in entry:
+                return _safe_float01(entry.get("threshold"))
+
+            best = entry.get("best")
+            if isinstance(best, dict) and ("threshold" in best):
+                return _safe_float01(best.get("threshold"))
+
+            top5 = entry.get("top5")
+            if isinstance(top5, list) and top5:
+                t0 = top5[0]
+                if isinstance(t0, dict) and ("threshold" in t0):
+                    return _safe_float01(t0.get("threshold"))
+
+        return None
+
+    pstar: Optional[float] = None
+    pstar_scope: Optional[str] = None
+
+    # 1) Direct legacy keys (if present)
     if isinstance(thresholds, dict):
-        pstar = thresholds.get("pstar") or thresholds.get("p*") or thresholds.get("p_star")
-        pstar_scope = thresholds.get("scope")
+        pstar = _safe_float01(thresholds.get("pstar") or thresholds.get("p*") or thresholds.get("p_star"))
+        sc = thresholds.get("scope") or thresholds.get("selected_scope") or thresholds.get("pstar_scope")
+        pstar_scope = str(sc).strip() if isinstance(sc, str) and sc.strip() else None
+
+    # 2) thresholds_by_scope structure (your current export)
+    if (pstar is None) and isinstance(thresholds, dict):
+        tbs = thresholds.get("thresholds_by_scope")
+        if isinstance(tbs, dict) and tbs:
+            # Prefer thresholds.json selected_scope if valid
+            sc = thresholds.get("selected_scope") or thresholds.get("scope")
+            if isinstance(sc, str) and sc.strip() and sc.strip() in tbs:
+                p = _thr_from_scope_entry(tbs.get(sc.strip()))
+                if p is not None:
+                    pstar = p
+                    pstar_scope = sc.strip()
+
+    # 3) deployment_config.json decision (tie-breaker / fallback)
+    if pstar is None:
+        dep_path = meta_dir_p / "deployment_config.json"
+        dep = _read_json(dep_path) if dep_path.exists() else None
+        if isinstance(dep, dict):
+            dec = dep.get("decision")
+            if isinstance(dec, dict):
+                sc = dec.get("scope")
+                th = dec.get("threshold")
+                if isinstance(sc, str) and sc.strip():
+                    pstar_scope = sc.strip()
+
+                # If thresholds_by_scope exists, prefer its per-scope "best.threshold"
+                if isinstance(thresholds, dict):
+                    tbs = thresholds.get("thresholds_by_scope")
+                    if isinstance(tbs, dict) and pstar_scope and (pstar_scope in tbs):
+                        p = _thr_from_scope_entry(tbs.get(pstar_scope))
+                        if p is not None:
+                            pstar = p
+
+                # else fall back to deployment decision threshold itself
+                if pstar is None:
+                    pstar = _safe_float01(th)
+
+    # Fail-closed if still None (caller will enforce no-trade)
+
 
     deployment_config = _read_json(deployment_config_path) if deployment_config_path is not None else None
 
