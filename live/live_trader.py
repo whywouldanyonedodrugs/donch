@@ -466,6 +466,32 @@ class LiveTrader:
             # -----------------------------------------------
 
 
+            # --- Meta sizing curve (offline parity) ---
+            self._meta_curve_x = None
+            self._meta_curve_y = None
+            try:
+                from pathlib import Path
+                curve_path = None
+
+                # Prefer artifact bundle path if present
+                if getattr(self, "meta_bundle", None) is not None:
+                    curve_path = getattr(self.meta_bundle, "sizing_curve_path", None)
+
+                # Fallback to meta_dir/sizing_curve.csv
+                if not curve_path:
+                    curve_path = str(Path(self.meta_dir) / "sizing_curve.csv")
+
+                curve_p = Path(str(curve_path))
+                if curve_p.exists():
+                    self._load_meta_sizing_curve(curve_p)
+                else:
+                    LOG.warning("bundle=%s sizing curve not found at %s (will use _winprob_multiplier fallback)",
+                                self.bundle_id, str(curve_p))
+            except Exception as e:
+                LOG.warning("bundle=%s sizing curve load failed: %s (fallback to _winprob_multiplier)",
+                            self.bundle_id, e)
+
+
             try:
                 self._load_meta_sizing_curve()
             except Exception as e:
@@ -531,70 +557,124 @@ class LiveTrader:
                 self.online_state = None
 
     def _load_meta_sizing_curve(self) -> None:
-        self._meta_sizing_curve = None
-        self._meta_sizing_mode = None
+        """
+        Offline-parity sizing curve loader.
 
-        if not bool(self.cfg.get("META_SIZING_ENABLED", False)):
-            return
+        Supports two formats:
+        (A) bin format (your file): columns include bin_low, bin_high, risk_multiplier
+            -> size_mult chosen by p_cal falling into [bin_low, bin_high)
+        (B) point format: columns include p/prob + mult/risk_multiplier
+            -> interpolated via np.interp
 
-        p = self.cfg.get("META_SIZING_CURVE_PATH", None)
-        if not p:
-            p = str(Path(self.meta_dir) / "sizing_curve.csv")
+        Stores:
+        self._meta_bins: list[(lo, hi, mult)] sorted by lo
+        self._meta_curve_x / _meta_curve_y: optional arrays for point/interp
+        """
+        import numpy as np
+        import pandas as pd
+        from pathlib import Path
 
-        path = Path(p)
-        if not path.exists():
-            LOG.error("META sizing enabled but sizing curve not found: %s", path)
-            self._meta_sizing_mode = "missing"
-            return
+        self._meta_bins = None
+        self._meta_curve_x = None
+        self._meta_curve_y = None
 
-        df = pd.read_csv(path)
+        curve_path = Path(str(getattr(self, "meta_dir", "results/meta_export"))) / "sizing_curve.csv"
+        if not curve_path.exists():
+            raise FileNotFoundError(f"sizing_curve.csv not found at {curve_path}")
+
+        df = pd.read_csv(curve_path)
         if df is None or df.empty:
-            LOG.error("META sizing curve is empty: %s", path)
-            self._meta_sizing_mode = "empty"
+            raise ValueError(f"sizing_curve.csv empty: {curve_path}")
+
+        cols_l = [str(c).strip().lower() for c in df.columns]
+
+        def _col(name: str):
+            return df.columns[cols_l.index(name)] if name in cols_l else None
+
+        # multiplier column (prefer risk_multiplier)
+        mcol = None
+        for cand in ("risk_multiplier", "mult", "multiplier", "size_mult", "size_multiplier", "risk_mult"):
+            if cand in cols_l:
+                mcol = _col(cand)
+                break
+        if mcol is None:
+            # fallback: second column
+            if len(df.columns) >= 2:
+                mcol = df.columns[1]
+            else:
+                raise ValueError(f"sizing_curve.csv has no multiplier col: cols={list(df.columns)}")
+
+        # --- Format A: BINNED curve (bin_low/bin_high) ---
+        lowcol = None
+        highcol = None
+        for cand in ("bin_low", "p_low", "prob_low"):
+            if cand in cols_l:
+                lowcol = _col(cand)
+                break
+        for cand in ("bin_high", "p_high", "prob_high"):
+            if cand in cols_l:
+                highcol = _col(cand)
+                break
+
+        if lowcol is not None and highcol is not None:
+            lows = df[lowcol].astype(float).to_numpy()
+            highs = df[highcol].astype(float).to_numpy()
+            mults = df[mcol].astype(float).to_numpy()
+
+            order = np.argsort(lows)
+            bins = []
+            for i in order:
+                lo = float(lows[i])
+                hi = float(highs[i])
+                mu = float(mults[i])
+                if not (np.isfinite(lo) and np.isfinite(hi) and np.isfinite(mu)):
+                    continue
+                # keep sane bounds
+                lo = max(0.0, min(1.0, lo))
+                hi = max(0.0, min(1.0, hi))
+                if hi <= lo:
+                    continue
+                bins.append((lo, hi, mu))
+
+            if len(bins) < 1:
+                raise ValueError(f"sizing_curve.csv bin format found but no valid bins: {curve_path}")
+
+            self._meta_bins = bins
+            try:
+                bundle = getattr(self, "bundle_id", None) or "no_bundle"
+                LOG.info("bundle=%s Loaded sizing curve (bins) %s n_bins=%d mult_col=%s",
+                        bundle, str(curve_path), len(bins), str(mcol))
+            except Exception:
+                pass
             return
 
-        # Normalize column names
-        cols = {c.lower().strip(): c for c in df.columns}
-
-        # Multiplier column (handle a few common names)
-        mult_key = None
-        for k in ("risk_multiplier", "size_multiplier", "size_mult", "multiplier", "risk_mult"):
-            if k in cols:
-                mult_key = cols[k]
+        # --- Format B: POINT curve (p/probability + multiplier) ---
+        pcol = None
+        for cand in ("p_cal", "p", "prob", "probability", "win_probability", "mean_score"):
+            if cand in cols_l:
+                pcol = _col(cand)
                 break
-        if mult_key is None:
-            raise ValueError(f"sizing_curve.csv missing multiplier column; got cols={list(df.columns)}")
-
-        # Probability columns: either (p_lo,p_hi) bins OR a single p/prob for interpolation
-        if ("p_lo" in cols) and ("p_hi" in cols):
-            plo = cols["p_lo"]
-            phi = cols["p_hi"]
-            df = df[[plo, phi, mult_key]].copy()
-            df[plo] = pd.to_numeric(df[plo], errors="coerce")
-            df[phi] = pd.to_numeric(df[phi], errors="coerce")
-            df[mult_key] = pd.to_numeric(df[mult_key], errors="coerce")
-            df = df.dropna()
-            df = df.sort_values([plo, phi])
-            self._meta_sizing_mode = "bins"
-            self._meta_sizing_curve = (df, plo, phi, mult_key)
-            LOG.info("Loaded META sizing curve (bins) from %s rows=%d", path, len(df))
-            return
-
-        pcol_key = None
-        for k in ("p", "prob", "p_cal", "probability"):
-            if k in cols:
-                pcol_key = cols[k]
-                break
-        if pcol_key is None:
+        if pcol is None:
             raise ValueError(f"sizing_curve.csv missing p/prob columns; got cols={list(df.columns)}")
 
-        df = df[[pcol_key, mult_key]].copy()
-        df[pcol_key] = pd.to_numeric(df[pcol_key], errors="coerce")
-        df[mult_key] = pd.to_numeric(df[mult_key], errors="coerce")
-        df = df.dropna().sort_values(pcol_key)
-        self._meta_sizing_mode = "interp"
-        self._meta_sizing_curve = (df, pcol_key, mult_key)
-        LOG.info("Loaded META sizing curve (interp) from %s rows=%d", path, len(df))
+        xs = df[pcol].astype(float).to_numpy()
+        ys = df[mcol].astype(float).to_numpy()
+        if len(xs) < 2:
+            raise ValueError(f"sizing_curve.csv too short for interpolation: {curve_path}")
+
+        order = np.argsort(xs)
+        xs = xs[order]
+        ys = ys[order]
+        self._meta_curve_x = xs
+        self._meta_curve_y = ys
+
+        try:
+            bundle = getattr(self, "bundle_id", None) or "no_bundle"
+            LOG.info("bundle=%s Loaded sizing curve (interp) %s n=%d p_col=%s mult_col=%s",
+                    bundle, str(curve_path), len(xs), str(pcol), str(mcol))
+        except Exception:
+            pass
+
 
     def _meta_size_mult_from_p(self, p_cal: float) -> float:
         if not bool(self.cfg.get("META_SIZING_ENABLED", False)):
@@ -664,7 +744,95 @@ class LiveTrader:
 
         return 1 if (regime_up == 1.0 and btc_trend_up == 1 and btc_vol_high == 0) else 0
 
+    def _load_meta_sizing_curve(self, path):
+        """
+        Load sizing_curve.csv (probability -> size multiplier).
+        Stores sorted x/y arrays for interpolation.
+        """
+        import pandas as pd
+        import numpy as np
 
+        df = pd.read_csv(path)
+        if df is None or df.empty or len(df.columns) < 2:
+            raise ValueError(f"bad sizing_curve.csv: {path}")
+
+        cols_l = [str(c).strip().lower() for c in df.columns]
+
+        # probability column
+        pcol = None
+        for cand in ("p_cal", "p", "prob", "probability", "win_probability"):
+            if cand in cols_l:
+                pcol = df.columns[cols_l.index(cand)]
+                break
+        if pcol is None:
+            pcol = df.columns[0]
+
+        # multiplier column
+        mcol = None
+        for cand in ("mult", "size_mult", "multiplier", "risk_mult", "risk_multiplier", "size_multiplier"):
+            if cand in cols_l:
+                mcol = df.columns[cols_l.index(cand)]
+                break
+        if mcol is None:
+            mcol = df.columns[1]
+
+        xs = df[pcol].astype(float).to_numpy()
+        ys = df[mcol].astype(float).to_numpy()
+
+        if len(xs) < 2:
+            raise ValueError(f"sizing_curve too short: {path}")
+
+        order = np.argsort(xs)
+        xs = xs[order]
+        ys = ys[order]
+
+        self._meta_curve_x = xs
+        self._meta_curve_y = ys
+
+        try:
+            bundle = getattr(self, "bundle_id", None) or "no_bundle"
+            LOG.info("bundle=%s Loaded sizing curve %s (pcol=%s mcol=%s n=%d)",
+                    bundle, str(path), str(pcol), str(mcol), len(xs))
+        except Exception:
+            pass
+
+
+    def _meta_size_mult(self, p_cal: float) -> float:
+        import numpy as np
+
+        try:
+            p = float(p_cal)
+        except Exception:
+            return 0.0
+        if not np.isfinite(p):
+            return 0.0
+
+        # Prefer bin-lookup (offline parity)
+        bins = getattr(self, "_meta_bins", None)
+        if bins:
+            # clamp to edges
+            if p <= bins[0][0]:
+                return float(bins[0][2])
+            if p >= bins[-1][1]:
+                return float(bins[-1][2])
+
+            for lo, hi, mu in bins:
+                # [lo, hi) like typical binning
+                if p >= lo and p < hi:
+                    return float(mu)
+
+            # edge case: p==1.0 and last bin is [..,1.0]
+            return float(bins[-1][2])
+
+        # Fallback: interpolation curve
+        xs = getattr(self, "_meta_curve_x", None)
+        ys = getattr(self, "_meta_curve_y", None)
+        if xs is not None and ys is not None and len(xs) >= 2:
+            p = min(max(p, float(xs[0])), float(xs[-1]))
+            return float(np.interp(p, xs, ys))
+
+        # Final fallback: old mapping
+        return float(self._winprob_multiplier(p))
 
 
     async def _build_oi_funding_features(
@@ -3025,9 +3193,28 @@ class LiveTrader:
             getattr(sig, "vwap_stack_expansion_pct", None),
         )
 
-        # 3) Calibrated win-prob multiplier (0..1 → mult range)
-        wp = float(getattr(sig, "win_probability", 0.0) or 0.0)
-        wp_mult = self._winprob_multiplier(wp)
+        # 3) Meta sizing multiplier (offline parity: sizing_curve.csv on p_cal)
+        p_cal = float(getattr(sig, "win_probability", 0.0) or 0.0)
+
+        meta_mult = 1.0
+        if bool(self.cfg.get("META_SIZING_ENABLED", True)):
+            meta_mult = float(self._meta_size_mult(p_cal))
+
+        # Offline parity: risk-off does NOT block entry; it caps sizing to probe
+        # If risk_on is missing, treat as risk_off (fail-closed -> probe sizing).
+        try:
+            risk_on_f = float(getattr(sig, "risk_on", 0.0) or 0.0)
+        except Exception:
+            risk_on_f = 0.0
+
+        if bool(self.cfg.get("META_RISK_OFF_PROBE_ENABLED", True)) and risk_on_f != 1.0:
+            try:
+                probe = float(self.cfg.get("RISK_OFF_PROBE_MULT", 0.01))
+            except Exception:
+                probe = 0.01
+            if np.isfinite(probe) and probe > 0.0:
+                meta_mult = min(meta_mult, probe)
+
 
         # 4) YAML scalers (generic, linear maps feature→mult). Local helper.
         def _apply_yaml_scalers(sig_obj: Signal) -> float:
@@ -3080,15 +3267,17 @@ class LiveTrader:
         yaml_mult = _apply_yaml_scalers(sig)
 
         # Combine & clamp final risk
-        risk_usd = base_risk_usd * eth_mult * vw_mult * wp_mult * yaml_mult
+        risk_usd = base_risk_usd * eth_mult * vw_mult * meta_mult * yaml_mult
+
         if self.cfg.get("RISK_USD_MIN") is not None:
             risk_usd = max(float(self.cfg["RISK_USD_MIN"]), risk_usd)
         if self.cfg.get("RISK_USD_MAX") is not None:
             risk_usd = min(float(self.cfg["RISK_USD_MAX"]), risk_usd)
         sig.risk_usd = float(risk_usd)
 
-        LOG.info("Sizing(%s) base=%.2f · eth×=%.2f · vwap×=%.2f · wp=%.2f (wp×=%.2f) · yaml×=%.2f → risk=%.2f",
-                 side_label, base_risk_usd, eth_mult, vw_mult, wp, wp_mult, yaml_mult, risk_usd)
+        LOG.info("Sizing(%s) base=%.2f · eth×=%.2f · vwap×=%.2f · p_cal=%.4f (meta×=%.4f, risk_on=%.0f) · yaml×=%.2f → risk=%.2f",
+                side_label, base_risk_usd, eth_mult, vw_mult, p_cal, meta_mult, risk_on_f, yaml_mult, risk_usd)
+
 
         # --- Compute size from live price / ATR distance ---
         try:
