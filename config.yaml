@@ -87,3 +87,6 @@ META_REQUIRED: true                # (optional) fail-closed on feature mismatch
 META_SCHEMA_DIAG_SYMBOLS: "BTCUSDT,ETHUSDT"
 
 REGIMES_REPORT_PATH: "/root/apps/donch/results/meta_export/regimes_report.json"
+
+GOV_CTX_DAYS_5M: 90
+VOL_CAP_BARS: 15000
