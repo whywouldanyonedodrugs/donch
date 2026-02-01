@@ -832,13 +832,13 @@ class LiveTrader:
         """
         # At the top of _get_gov_ctx, before fetching BTC/ETH:
 
-        min_days = int(self.cfg.get("GOV_CTX_DAYS_5M", 60))
-        min_bars = int(min_days * 24 * 12) + 2 * 288  # +2d cushion
+        # Fetch 5m OHLCV for BTC/ETH
+        days = int(self.cfg.get("GOV_CTX_DAYS_5M", 60))
+        min_bars = days * 288 + 500
 
-        df_btc, df_eth = await asyncio.gather(
-            self._get_ohlcv("BTCUSDT", "5m", min_bars=min_bars),
-            self._get_ohlcv("ETHUSDT", "5m", min_bars=min_bars),
-        )
+        task_btc = asyncio.create_task(self._get_ohlcv("BTCUSDT", "5m", min_bars=min_bars))
+        task_eth = asyncio.create_task(self._get_ohlcv("ETHUSDT", "5m", min_bars=min_bars))
+        df_btc, df_eth = await asyncio.gather(task_btc, task_eth)
 
 
         # Determine decision_ts_gov (min last-closed ts across BTC/ETH) to avoid cross-asset lookahead
