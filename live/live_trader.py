@@ -571,7 +571,7 @@ class LiveTrader:
             return feats
 
         except (StaleDerivativesDataError, KeyError, ValueError, NotImplementedError) as e:
-            self.logger.warning(f"OI/Funding features unavailable for {symbol} at {decision_ts}: {e}")
+            self.log.warning(f"OI/Funding features unavailable for {symbol} at {decision_ts}: {e}")
             return {}
         except Exception as e:
 
@@ -579,21 +579,27 @@ class LiveTrader:
 
             return {}
 
-
     async def _fetch_ohlcv_df_paged(self, symbol: str, tf: str, limit: int) -> Optional[pd.DataFrame]:
         """
         Fetch `limit` candles via pagination (CCXT usually caps per-call limit).
-        Returns DataFrame indexed at BAR CLOSE TIME (shifted), and drops the last incomplete bar.
+        Returns DataFrame indexed at BAR OPEN TIME (UTC), sorted ascending, and drops the last incomplete bar.
         """
         try:
-            page_limit = int(self.cfg.get("OHLCV_PAGE_LIMIT", 1000))
+            page_limit_cfg = int(self.cfg.get("OHLCV_PAGE_LIMIT", 1000))
+
+            # Bybit v5 commonly caps low timeframes to 200 candles per call.
+            # If the exchange allows more, CCXT will still cap; this avoids requesting unreachable sizes.
+            if tf in ("1m", "3m", "5m", "15m", "30m"):
+                page_limit = min(page_limit_cfg, 200)
+            else:
+                page_limit = page_limit_cfg
+
             tf_ms = int(_tf_to_timedelta(tf).total_seconds() * 1000)
 
             need = int(limit) + 2  # +2 for safety; we drop last bar later
             rows: list[list] = []
 
-            # Start far enough back to cover `need` candles.
-            # Bybit returns the most recent candles when since=None; so we must anchor since in the past.
+            # Anchor since in the past; DO NOT start with since=None (that only returns the latest capped batch).
             try:
                 now_ms = int(self.exchange.milliseconds())
             except Exception:
@@ -604,12 +610,17 @@ class LiveTrader:
             start_ms = now_ms - int((need + page_limit) * tf_ms)
             since = start_ms
 
+            # Pagination loop (forward in time)
             while len(rows) < need:
-                batch = await self.exchange.fetch_ohlcv(symbol, tf, since=since, limit=min(page_limit, need - len(rows)))
+                req_limit = min(page_limit, need - len(rows))
+                prev_since = since
+
+                batch = await self.exchange.fetch_ohlcv(symbol, tf, since=since, limit=req_limit)
                 if not batch:
                     break
 
-                # de-overlap
+                # Ensure ascending timestamps and de-overlap
+                batch = sorted(batch, key=lambda r: r[0])
                 if rows:
                     last_ts = rows[-1][0]
                     batch = [r for r in batch if r[0] > last_ts]
@@ -617,27 +628,35 @@ class LiveTrader:
                         break
 
                 rows.extend(batch)
+
+                # Advance "since" to just after the last returned candle open time
                 since = rows[-1][0] + tf_ms
 
+                # Safety: if we failed to advance, stop to avoid an infinite loop
+                if since <= prev_since:
+                    break
 
             if len(rows) < 2:
                 return None
 
             df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
             df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-
             df = df.set_index("timestamp").sort_index()
 
+            # Drop last possibly-incomplete bar
             if len(df) > 1:
-                df = df.iloc[:-1]  # drop last possibly-incomplete bar
+                df = df.iloc[:-1]
 
+            # Keep only last `limit` rows
             if len(df) > limit:
                 df = df.iloc[-limit:]
 
             return df
+
         except Exception as e:
             LOG.debug("OHLCV paged fetch failed %s %s: %s", symbol, tf, e)
             return None
+
 
     def _init_ohlcv_cache(self) -> None:
         self._ohlcv_cache: dict[tuple[str, str], pd.DataFrame] = {}
