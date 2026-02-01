@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
 import joblib
-
+import numpy as np
 
 class BundleError(RuntimeError):
     pass
