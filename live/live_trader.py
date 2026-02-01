@@ -582,17 +582,12 @@ class LiveTrader:
     async def _fetch_ohlcv_df_paged(self, symbol: str, tf: str, limit: int) -> Optional[pd.DataFrame]:
         """
         Fetch `limit` candles via pagination (CCXT usually caps per-call limit).
-
-        IMPORTANT:
-        - Bybit/CCXT timestamps are bar OPEN times in ms.
-        - We drop the last row as "possibly incomplete".
-        - We must fetch forward until we reach the last closed bar; otherwise we end up systematically stale.
+        Returns DataFrame indexed at BAR OPEN TIME (UTC), sorted ascending, and drops the last incomplete bar.
         """
         try:
-            import math
             page_limit_cfg = int(self.cfg.get("OHLCV_PAGE_LIMIT", 1000))
 
-            # Bybit v5 commonly caps low timeframes to ~200 candles per call.
+            # Bybit v5 commonly caps low timeframes to 200 candles per call.
             if tf in ("1m", "3m", "5m", "15m", "30m"):
                 page_limit = min(page_limit_cfg, 200)
             else:
@@ -600,42 +595,31 @@ class LiveTrader:
 
             tf_ms = int(_tf_to_timedelta(tf).total_seconds() * 1000)
 
-            # We want at least `limit` fully-closed bars. Keep a tiny safety pad, but do NOT create a full-page lag.
-            need = int(limit) + 2
+            need = int(limit) + 2  # +2 for safety; we drop last bar later
+            target = need + page_limit  # IMPORTANT: fetch the extra buffer so we reach "now"
+            rows: list[list] = []
 
-            # Use exchange clock if available
+            # Anchor since in the past; DO NOT start with since=None (that only returns the latest capped batch).
             try:
                 now_ms = int(self.exchange.milliseconds())
             except Exception:
                 import time
                 now_ms = int(time.time() * 1000)
 
-            # Align to the current bar open boundary to define "last closed bar open"
-            now_aligned_ms = (now_ms // tf_ms) * tf_ms
-            last_closed_open_ms = now_aligned_ms - tf_ms  # bar that most recently closed has this OPEN time
-
-            # Anchor approximately `need` bars in the past (not `need + page_limit`)
-            start_ms = now_aligned_ms - int(need * tf_ms)
+            start_ms = now_ms - int(target * tf_ms)
             since = start_ms
 
-            rows: list[list] = []
-            pages = 0
-            max_pages = int(math.ceil((need / max(page_limit, 1)))) + 25  # small safety margin
-
-            # Fetch forward until:
-            # 1) we have enough rows, AND
-            # 2) we've reached the last closed bar (or can't fetch further)
-            while pages < max_pages and (len(rows) < need or (rows and rows[-1][0] < last_closed_open_ms)):
-                pages += 1
-                req_limit = min(page_limit, max(1, need - len(rows)))
-
+            # Pagination loop (forward in time)
+            while len(rows) < target:
+                req_limit = min(page_limit, target - len(rows))
                 prev_since = since
+
                 batch = await self.exchange.fetch_ohlcv(symbol, tf, since=since, limit=req_limit)
                 if not batch:
                     break
 
+                # Ensure ascending timestamps and de-overlap
                 batch = sorted(batch, key=lambda r: r[0])
-
                 if rows:
                     last_ts = rows[-1][0]
                     batch = [r for r in batch if r[0] > last_ts]
@@ -643,9 +627,11 @@ class LiveTrader:
                         break
 
                 rows.extend(batch)
+
+                # Advance "since" to just after the last returned candle open time
                 since = rows[-1][0] + tf_ms
 
-                # Safety: prevent infinite loops if the exchange doesn't advance
+                # Safety: if we failed to advance, stop to avoid an infinite loop
                 if since <= prev_since:
                     break
 
@@ -660,22 +646,9 @@ class LiveTrader:
             if len(df) > 1:
                 df = df.iloc[:-1]
 
-            # Keep only last `limit` rows
+            # Keep only last `limit` rows (the most recent window)
             if len(df) > limit:
                 df = df.iloc[-limit:]
-
-            # Optional: warn if still stale by a large margin
-            try:
-                if len(df) > 0:
-                    last = df.index[-1]
-                    # last is bar OPEN time; last closed time is last + tf
-                    last_close = last + pd.Timedelta(tf)
-                    now_utc = pd.Timestamp.now(tz="UTC")
-                    if (now_utc - last_close) > pd.Timedelta(minutes=30):
-                        LOG.warning("OHLCV_STALE %s %s last_close=%s now=%s lag=%s",
-                                    symbol, tf, last_close, now_utc, now_utc - last_close)
-            except Exception:
-                pass
 
             return df
 
