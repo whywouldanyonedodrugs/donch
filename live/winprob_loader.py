@@ -615,22 +615,15 @@ class WinProbScorer:
 
 
     def _diag(self, vec_hash: str) -> None:
-        if not self._diag_once:
-            # Compute diagnostics locally (avoid NameError; deterministic)
-            raw_feats = len(
-                (getattr(self, "required_keys", None) or getattr(self, "raw_features", None) or [])  # type: ignore[arg-type]
-            )
+        if not getattr(self, "_diag_once", False):
+            raw_feats = len(getattr(self, "raw_features", []) or [])
             model_cols = len(getattr(self, "model_features", []) or [])
             pstar = getattr(self, "pstar", None)
-            pstar_s = (
-                f"{float(pstar):.6f}"
-                if isinstance(pstar, (int, float, np.floating))
-                else "None"
-            )
+            pstar_s = "None" if pstar is None else f"{float(pstar):.6f}"
 
             LOG.info(
                 "WinProb ready (bundle=%s, raw_feats=%d, model_cols=%d, p*=%s)",
-                self.bundle_id,
+                getattr(self, "bundle_id", "no_bundle"),
                 raw_feats,
                 model_cols,
                 pstar_s,
@@ -638,20 +631,20 @@ class WinProbScorer:
 
             self._diag_once = True
 
-
-        if self._last_hash is None:
+        if getattr(self, "_last_hash", None) is None:
             self._last_hash = vec_hash
             return
 
         if vec_hash == self._last_hash:
-            self._same_vec_count += 1
+            self._same_vec_count = getattr(self, "_same_vec_count", 0) + 1
             if self._same_vec_count in (5, 25, 100):
                 LOG.warning(
                     "[WINPROB DIAG] %d consecutive identical feature vectors (hash=%s, bundle=%s)",
                     self._same_vec_count,
                     vec_hash,
-                    self.bundle_id,
+                    getattr(self, "bundle_id", "no_bundle"),
                 )
         else:
             self._last_hash = vec_hash
             self._same_vec_count = 0
+
