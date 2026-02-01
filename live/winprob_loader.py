@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -215,6 +216,146 @@ def _parse_manifest(manifest_obj: Any) -> List[FeatureSpec]:
 
     return specs
 
+def _iter_json(obj: Any, path: str = ""):
+    """
+    Yield (path, key, value) for all dict entries in a nested JSON-like object.
+    """
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            p = f"{path}.{k}" if path else str(k)
+            yield (p, k, v)
+            yield from _iter_json(v, p)
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            p = f"{path}[{i}]"
+            yield from _iter_json(v, p)
+
+
+def _safe_float01(x: Any) -> Optional[float]:
+    try:
+        v = float(x)
+    except Exception:
+        return None
+    if not np.isfinite(v):
+        return None
+    if v < 0.0 or v > 1.0:
+        return None
+    return v
+
+
+def _extract_pstar_from_thresholds(
+    thresholds_obj: Any,
+    *,
+    meta_dir: Path,
+) -> Tuple[Optional[float], Optional[str], Optional[str]]:
+    """
+    Derive (pstar, pstar_scope, src) from exported artifacts.
+
+    Supported:
+      - legacy direct keys in thresholds.json: pstar / p* / p_star (+ optional scope)
+      - structured thresholds.json:
+          {
+            "thresholds_by_scope": {
+              "<SCOPE>": {"threshold": 0.xx, ...} | 0.xx,
+              ...
+            },
+            ...
+          }
+        plus deployment_config.json to select the active scope/threshold deterministically.
+
+    Fail-closed if ambiguous or missing.
+    """
+    if not isinstance(thresholds_obj, dict):
+        return (None, None, None)
+
+    # 1) Legacy direct keys
+    direct = thresholds_obj.get("pstar") or thresholds_obj.get("p*") or thresholds_obj.get("p_star")
+    p_direct = _safe_float01(direct)
+    if p_direct is not None:
+        sc = thresholds_obj.get("scope") or thresholds_obj.get("pstar_scope") or thresholds_obj.get("selected_scope")
+        sc = str(sc).strip() if isinstance(sc, str) and sc.strip() else None
+        return (p_direct, sc, "artifact:thresholds.json:direct")
+
+    # 2) Structured thresholds_by_scope
+    tbs = thresholds_obj.get("thresholds_by_scope")
+    if not isinstance(tbs, dict) or not tbs:
+        return (None, None, None)
+
+    scopes = [str(k) for k in tbs.keys() if isinstance(k, str) and k.strip()]
+    scope_set = set(scopes)
+
+    # 2a) Try explicit scope hints inside thresholds.json itself
+    for k in ("scope", "selected_scope", "active_scope", "default_scope", "best_scope", "chosen_scope"):
+        v = thresholds_obj.get(k)
+        if isinstance(v, str) and v.strip() in scope_set:
+            chosen_scope = v.strip()
+            entry = tbs.get(chosen_scope)
+            thr = entry.get("threshold") if isinstance(entry, dict) else entry
+            p = _safe_float01(thr)
+            if p is not None:
+                return (p, chosen_scope, f"artifact:thresholds.json:{k}")
+
+    # 2b) Use deployment_config.json to choose scope/threshold
+    deploy_path = meta_dir / "deployment_config.json"
+    deploy_obj = None
+    if deploy_path.exists():
+        try:
+            deploy_obj = json.loads(deploy_path.read_text())
+        except Exception:
+            deploy_obj = None
+
+    deploy_scope: Optional[str] = None
+    deploy_thr: Optional[float] = None
+
+    if isinstance(deploy_obj, dict):
+        # Find any scope-like string that matches thresholds_by_scope keys
+        scope_candidates: list[Tuple[str, str]] = []
+        thr_candidates: list[Tuple[str, float]] = []
+
+        for pth, key, val in _iter_json(deploy_obj):
+            if isinstance(key, str):
+                kl = key.lower()
+                if "scope" in kl and isinstance(val, str) and val.strip() in scope_set:
+                    scope_candidates.append((pth, val.strip()))
+                if key == "threshold":
+                    vv = _safe_float01(val)
+                    if vv is not None:
+                        thr_candidates.append((pth, vv))
+
+        # Prefer the first matching scope candidate (deterministic traversal order)
+        if scope_candidates:
+            deploy_scope = scope_candidates[0][1]
+
+        # Prefer the first threshold candidate
+        if thr_candidates:
+            deploy_thr = thr_candidates[0][1]
+
+    # If we got a scope from deployment config, use the scope's threshold from thresholds.json
+    if deploy_scope is not None:
+        entry = tbs.get(deploy_scope)
+        thr = entry.get("threshold") if isinstance(entry, dict) else entry
+        p = _safe_float01(thr)
+        if p is not None:
+            return (p, deploy_scope, "artifact:deployment_config.json->thresholds.json:scope")
+
+    # Otherwise, if we only got a deploy threshold, match it uniquely to a scope
+    if deploy_thr is not None:
+        matches: list[str] = []
+        for sc in scopes:
+            entry = tbs.get(sc)
+            thr = entry.get("threshold") if isinstance(entry, dict) else entry
+            p = _safe_float01(thr)
+            if p is None:
+                continue
+            if abs(p - deploy_thr) <= 1e-12:
+                matches.append(sc)
+
+        if len(matches) == 1:
+            return (deploy_thr, matches[0], "artifact:deployment_config.json:threshold->thresholds.json:unique_match")
+
+    # Ambiguous / missing => fail-closed
+    return (None, None, None)
+
 
 class WinProbScorer:
     """
@@ -240,9 +381,25 @@ class WinProbScorer:
         self.model = bundle.model
         self.model_kind = bundle.model_kind
         self.calibrator = bundle.calibrator
-        self.pstar = bundle.pstar
-        self.pstar_scope = getattr(bundle, "pstar_scope", None)        
+
+        # p* / scope thresholding (strict-parity):
+        # Prefer bundle-provided pstar, else derive from thresholds.json + deployment_config.json.
+        self.pstar = getattr(bundle, "pstar", None)
+        self.pstar_scope = getattr(bundle, "pstar_scope", None)
+        self.pstar_src: Optional[str] = None
+
+        if self.pstar is None or (isinstance(self.pstar, (float, int)) and (not np.isfinite(float(self.pstar)))):
+            thr_obj = getattr(bundle, "thresholds", None)
+            meta_dir = Path(getattr(bundle, "meta_dir", artifact_dir if artifact_dir is not None else "."))
+            p, sc, src = _extract_pstar_from_thresholds(thr_obj, meta_dir=meta_dir)
+            self.pstar = p
+            self.pstar_scope = sc
+            self.pstar_src = src
+        else:
+            self.pstar_src = "artifact:thresholds.json:direct_or_bundle"
+
         self.strict_schema = bool(strict_schema)
+
 
         # Parse manifest → raw feature specs
         self._raw_specs = _parse_manifest(bundle.feature_manifest)
@@ -432,12 +589,13 @@ class WinProbScorer:
     def _diag(self, vec_hash: str) -> None:
         if not self._diag_once:
             LOG.info(
-                "WinProb ready bundle=%s model_kind=%s raw_feats=%d p*=%s",
+                "WinProb ready (bundle=%s, raw_feats=%d, model_cols=%d, p*=%s)",
                 self.bundle_id,
-                self.model_kind,
-                len(self.raw_features),
-                (f"{self.pstar:.4f}" if isinstance(self.pstar, (float, int)) else "None"),
+                raw_feats,
+                model_cols,
+                pstar_s,
             )
+
             self._diag_once = True
 
         if self._last_hash is None:
