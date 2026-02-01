@@ -574,7 +574,9 @@ class LiveTrader:
             self.logger.warning(f"OI/Funding features unavailable for {symbol} at {decision_ts}: {e}")
             return {}
         except Exception as e:
-            self.logger.warning(f"OI/Funding features error for {symbol} at {decision_ts}: {e}")
+
+            LOG.warning("OI/Funding features error for %s at %s: %s", symbol, decision_ts, e)
+
             return {}
 
 

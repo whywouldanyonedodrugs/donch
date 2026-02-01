@@ -79,13 +79,15 @@ def _bucket_3way(x: pd.Series, q33: float, q66: float) -> pd.Series:
 
 
 def _funding_regime_code(funding_rate: pd.Series, eps: float) -> pd.Series:
-    out = pd.Series(np.nan, index=funding_rate.index, dtype="float64")
-    ok = funding_rate.notna()
-    fr = funding_rate[ok]
+    # Ensure numeric; keep index intact
+    fr = pd.to_numeric(funding_rate, errors="coerce")
+
+    out = pd.Series(np.nan, index=fr.index, dtype="float64")
     out.loc[fr <= -eps] = -1.0
     out.loc[(fr > -eps) & (fr < eps)] = 0.0
     out.loc[fr >= eps] = 1.0
     return out
+
 
 
 def add_oi_funding_features(
