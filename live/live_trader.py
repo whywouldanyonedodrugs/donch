@@ -2216,19 +2216,41 @@ class LiveTrader:
                 meta_err = "no_model_features"
 
             # --- Logic Glue: Define thresholds and gating verdict ---
-            # p* source priority: bundle.pstar (artifacts) -> config META_PROB_THRESHOLD -> None (gate disabled)
+            # OFFLINE-PARITY: entry gating on meta probability is applied ONLY when
+            # cfg META_PROB_THRESHOLD is not None. The exported artifact p* is informational unless enabled.
             wp = getattr(self, "winprob", None)
 
-            pstar = getattr(wp, "pstar", None) if wp is not None else None
-            if pstar is None:
-                pstar = self.cfg.get("META_PROB_THRESHOLD", None)
+            cfg_thr = self.cfg.get("META_PROB_THRESHOLD", None)
+            pstar = None
+            pstar_src = "disabled_cfg_none"
+
+            if cfg_thr is None:
+                pstar = None
+            else:
+                # Allow explicit "artifact" to use exported p*
+                if isinstance(cfg_thr, str) and cfg_thr.strip().lower() in ("artifact", "bundle", "pstar", "thresholds"):
+                    pstar = getattr(wp, "pstar", None) if wp is not None else None
+                    pstar_src = "cfg:artifact"
+                else:
+                    try:
+                        pstar = float(cfg_thr)
+                        pstar_src = "cfg:number"
+                    except Exception:
+                        pstar = None
+                        pstar_src = "cfg:bad_value"
 
             try:
                 pstar = float(pstar) if pstar is not None else None
                 if pstar is not None and ((not np.isfinite(pstar)) or pstar < 0.0 or pstar > 1.0):
                     pstar = None
+                    pstar_src = "cfg:out_of_range"
             except Exception:
                 pstar = None
+                pstar_src = "cfg:parse_error"
+
+            # Optional: scope gating (deployment policy), OFF by default for offline-run parity.
+            scope_gate_enabled = bool(self.cfg.get("META_SCOPE_GATE_ENABLED", False))
+
 
             # Strategy verdict *before* meta veto (observability only)
             strat_ok = bool(should_enter)
@@ -2270,15 +2292,17 @@ class LiveTrader:
                     err = "schema_fail"
             else:
                 if pstar is None:
+                    # OFFLINE-PARITY: no probability gate => allow entries; meta still used for sizing.
                     if not meta_required:
                         meta_ok = True
                         reason = "meta_disabled"
                     else:
-                        meta_ok = False
-                        reason = "no_pstar"
+                        meta_ok = True
+                        reason = "no_prob_gate"
+
                 else:
-                    # pstar present -> enforce scope first, then threshold
-                    if not bool(scope_ok):
+                    # pstar present -> optionally enforce scope, then threshold
+                    if scope_gate_enabled and (not bool(scope_ok)):
                         meta_ok = False
                         if missing_cols:
                             reason = f"scope_error:{(pstar_scope or 'NONE')}"
@@ -2286,6 +2310,8 @@ class LiveTrader:
                                 err = "scope_missing_cols"
                         else:
                             reason = f"scope_fail:{(pstar_scope or 'NONE')}"
+                    else:
+
                     else:
                         try:
                             p_cal_f = float(p_cal) if p_cal is not None else float("nan")
