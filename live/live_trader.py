@@ -465,6 +465,16 @@ class LiveTrader:
             )
             # -----------------------------------------------
 
+
+            try:
+                self._load_meta_sizing_curve()
+            except Exception as e:
+                LOG.exception("Failed to load META sizing curve: %s", e)
+                self._meta_sizing_curve = None
+                self._meta_sizing_mode = "error"
+
+
+
             # Optional: golden row injector for parity testing (disabled by default).
             self.golden_store = None
             try:
@@ -519,6 +529,142 @@ class LiveTrader:
             except Exception as e:
                 LOG.warning("bundle=%s OnlinePerformanceState init failed (disabling): %s", getattr(self, "bundle_id", None) or "no_bundle", e)
                 self.online_state = None
+
+    def _load_meta_sizing_curve(self) -> None:
+        self._meta_sizing_curve = None
+        self._meta_sizing_mode = None
+
+        if not bool(self.cfg.get("META_SIZING_ENABLED", False)):
+            return
+
+        p = self.cfg.get("META_SIZING_CURVE_PATH", None)
+        if not p:
+            p = str(Path(self.meta_dir) / "sizing_curve.csv")
+
+        path = Path(p)
+        if not path.exists():
+            LOG.error("META sizing enabled but sizing curve not found: %s", path)
+            self._meta_sizing_mode = "missing"
+            return
+
+        df = pd.read_csv(path)
+        if df is None or df.empty:
+            LOG.error("META sizing curve is empty: %s", path)
+            self._meta_sizing_mode = "empty"
+            return
+
+        # Normalize column names
+        cols = {c.lower().strip(): c for c in df.columns}
+
+        # Multiplier column (handle a few common names)
+        mult_key = None
+        for k in ("risk_multiplier", "size_multiplier", "size_mult", "multiplier", "risk_mult"):
+            if k in cols:
+                mult_key = cols[k]
+                break
+        if mult_key is None:
+            raise ValueError(f"sizing_curve.csv missing multiplier column; got cols={list(df.columns)}")
+
+        # Probability columns: either (p_lo,p_hi) bins OR a single p/prob for interpolation
+        if ("p_lo" in cols) and ("p_hi" in cols):
+            plo = cols["p_lo"]
+            phi = cols["p_hi"]
+            df = df[[plo, phi, mult_key]].copy()
+            df[plo] = pd.to_numeric(df[plo], errors="coerce")
+            df[phi] = pd.to_numeric(df[phi], errors="coerce")
+            df[mult_key] = pd.to_numeric(df[mult_key], errors="coerce")
+            df = df.dropna()
+            df = df.sort_values([plo, phi])
+            self._meta_sizing_mode = "bins"
+            self._meta_sizing_curve = (df, plo, phi, mult_key)
+            LOG.info("Loaded META sizing curve (bins) from %s rows=%d", path, len(df))
+            return
+
+        pcol_key = None
+        for k in ("p", "prob", "p_cal", "probability"):
+            if k in cols:
+                pcol_key = cols[k]
+                break
+        if pcol_key is None:
+            raise ValueError(f"sizing_curve.csv missing p/prob columns; got cols={list(df.columns)}")
+
+        df = df[[pcol_key, mult_key]].copy()
+        df[pcol_key] = pd.to_numeric(df[pcol_key], errors="coerce")
+        df[mult_key] = pd.to_numeric(df[mult_key], errors="coerce")
+        df = df.dropna().sort_values(pcol_key)
+        self._meta_sizing_mode = "interp"
+        self._meta_sizing_curve = (df, pcol_key, mult_key)
+        LOG.info("Loaded META sizing curve (interp) from %s rows=%d", path, len(df))
+
+    def _meta_size_mult_from_p(self, p_cal: float) -> float:
+        if not bool(self.cfg.get("META_SIZING_ENABLED", False)):
+            return 1.0
+
+        if p_cal is None:
+            return 1.0
+        try:
+            p = float(p_cal)
+        except Exception:
+            return 1.0
+        if not np.isfinite(p):
+            return 1.0
+
+        curve = getattr(self, "_meta_sizing_curve", None)
+        mode = getattr(self, "_meta_sizing_mode", None)
+
+        if curve is None:
+            # Fail-closed behavior: cap to probe if enabled, otherwise do nothing
+            if bool(self.cfg.get("META_SIZING_FAIL_CLOSED", True)):
+                return float(self.cfg.get("RISK_OFF_PROBE_MULT", 0.01))
+            return 1.0
+
+        if mode == "bins":
+            df, plo, phi, mcol = curve
+            hit = df[(df[plo] <= p) & (p < df[phi])]
+            if hit.empty:
+                # clamp to nearest
+                if p < float(df[plo].iloc[0]):
+                    return float(df[mcol].iloc[0])
+                return float(df[mcol].iloc[-1])
+            return float(hit[mcol].iloc[0])
+
+        if mode == "interp":
+            df, pcol, mcol = curve
+            xs = df[pcol].to_numpy(dtype=float)
+            ys = df[mcol].to_numpy(dtype=float)
+            if xs.size < 2:
+                return float(ys[0]) if ys.size == 1 else 1.0
+            return float(np.interp(p, xs, ys))
+
+        return 1.0
+
+    def _offline_risk_on(self, meta_row: dict) -> int:
+        # Prefer already-built feature if present
+        v = meta_row.get("risk_on", None)
+        try:
+            if v is not None and np.isfinite(float(v)):
+                return 1 if float(v) == 1.0 else 0
+        except Exception:
+            pass
+
+        # Compute from offline definition
+        try:
+            regime_up = float(meta_row.get("regime_up", np.nan))
+            btc_trend_slope = float(meta_row.get("btc_trend_slope", np.nan))
+            btc_vol_regime_level = float(meta_row.get("btc_vol_regime_level", np.nan))
+            btc_vol_hi = float(self.regime_thresholds.get("btc_vol_hi"))
+        except Exception:
+            return 0
+
+        if not (np.isfinite(regime_up) and np.isfinite(btc_trend_slope) and np.isfinite(btc_vol_regime_level) and np.isfinite(btc_vol_hi)):
+            return 0
+
+        btc_trend_up = 1 if btc_trend_slope > 0 else 0
+        btc_vol_high = 1 if btc_vol_regime_level >= btc_vol_hi else 0
+
+        return 1 if (regime_up == 1.0 and btc_trend_up == 1 and btc_vol_high == 0) else 0
+
+
 
 
     async def _build_oi_funding_features(
