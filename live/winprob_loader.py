@@ -616,6 +616,18 @@ class WinProbScorer:
 
     def _diag(self, vec_hash: str) -> None:
         if not self._diag_once:
+            # Compute diagnostics locally (avoid NameError; deterministic)
+            raw_feats = len(
+                (getattr(self, "required_keys", None) or getattr(self, "raw_features", None) or [])  # type: ignore[arg-type]
+            )
+            model_cols = len(getattr(self, "model_features", []) or [])
+            pstar = getattr(self, "pstar", None)
+            pstar_s = (
+                f"{float(pstar):.6f}"
+                if isinstance(pstar, (int, float, np.floating))
+                else "None"
+            )
+
             LOG.info(
                 "WinProb ready (bundle=%s, raw_feats=%d, model_cols=%d, p*=%s)",
                 self.bundle_id,
@@ -625,6 +637,7 @@ class WinProbScorer:
             )
 
             self._diag_once = True
+
 
         if self._last_hash is None:
             self._last_hash = vec_hash
