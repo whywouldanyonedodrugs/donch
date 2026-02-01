@@ -746,82 +746,35 @@ class LiveTrader:
         except Exception:
             return float(np.nan)
 
-    async def _compute_cross_asset_daily_ctx(self, asset: str, asof_ts: pd.Timestamp, df5: Optional[pd.DataFrame] = None) -> dict:
+    async def _compute_cross_asset_daily_ctx(
+        self, asset: str, asof_ts: pd.Timestamp, df5: Optional[pd.DataFrame] = None
+    ) -> dict:
         """
-        Offline-parity cross-asset DAILY context (scout.py logic):
-        - vol_regime_level: (ATR20/close) / expanding_median(min_periods=50), then shift(1)
-        - trend_slope: diff( MA20 - MA50 ), then shift(1)
-
-        IMPORTANT:
-        - Do NOT drop today's (forming) 1D candle, because shift(1) makes today's value depend only on yesterday.
-        - As-of mapping uses last index <= decision_ts (intraday).
+        Cross-asset daily context (BTC/ETH) using the offline-parity implementation.
+        Produces:
+        {prefix}_vol_regime_level, {prefix}_trend_slope
+        and manifest-friendly aliases:
+        btc_vol_regime_level / eth_vol_regime_level
+        btc_trend_slope / eth_trend_slope
         """
         out: dict = {}
-        asset = str(asset).upper()
-        prefix = asset.lower()  # "btcusdt" / "ethusdt"
-
-        asof_ts = pd.to_datetime(asof_ts, utc=True, errors="coerce")
-        if pd.isna(asof_ts):
-            return out
         try:
-            # Offline parity: build DAILY bars from the 5m stream using pandas resample defaults
-            # (label=left, closed=left). Fall back to exchange-provided 1d candles only if df5 is unavailable.
-            if df5 is not None and isinstance(df5, pd.DataFrame) and not df5.empty:
-                _df5 = df5.copy()
-                if _df5.index.tz is None:
-                    _df5.index = _df5.index.tz_localize("UTC")
-                else:
-                    _df5.index = _df5.index.tz_convert("UTC")
-                _df5 = _df5.sort_index()
-                _df5 = _df5[~_df5.index.duplicated(keep="last")]
+            from .macro_offline_parity import compute_cross_asset_daily_context
 
-                needed_5m = ("open", "high", "low", "close", "volume")
-                if any(c not in _df5.columns for c in needed_5m):
-                    raise ValueError("df5 missing required OHLCV columns")
+            asof_ts = pd.to_datetime(asof_ts, utc=True)
 
-                daily = _df5[list(needed_5m)].resample("1D").agg({
-                    "open": "first",
-                    "high": "max",
-                    "low": "min",
-                    "close": "last",
-                    "volume": "sum",
-                })
-                df = daily.dropna(subset=["open", "high", "low", "close"])
-                if df.empty:
-                    return out
+            if df5 is None:
+                days = int(self.cfg.get("GOV_CTX_DAYS_5M", 60))
+                min_bars = days * 288 + 500
+                df5 = await self._get_ohlcv(asset, "5m", min_bars=min_bars)
 
-            else:
-                ohlcv_d = await self.exchange.fetch_ohlcv(asset, timeframe="1d", limit=650)
-                if not ohlcv_d:
-                    return out
-
-                df = pd.DataFrame(ohlcv_d, columns=["ts", "open", "high", "low", "close", "volume"])
-                df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-                df = df.set_index("ts").sort_index()
-                df = df[~df.index.duplicated(keep="last")]
-
-            needed = ("open", "high", "low", "close")
-            if any(c not in df.columns for c in needed):
+            if df5 is None or df5.empty:
                 return out
 
-            # Compute daily ATR% and vol_regime_level (shift(1) is the no-lookahead guard)
-            # IMPORTANT: call ATR with positional period to avoid keyword incompatibilities across ta/indicator impls.
-            atr1d = ta.atr(df[["open", "high", "low", "close"]], 20)
-            close = df["close"].astype(float).replace(0.0, np.nan)
-            atr_pct = (atr1d.astype(float) / close)
+            prefix = asset.lower()  # e.g. BTCUSDT -> btcusdt
+            out.update(compute_cross_asset_daily_context(df5, asof_ts, prefix=prefix))
 
-            base = atr_pct.expanding(min_periods=50).median().replace(0.0, np.nan)
-            vol_regime_level = (atr_pct / (base + 1e-12)).shift(1)
-
-            # Trend slope (shift(1) is the no-lookahead guard)
-            ma20 = close.rolling(20, min_periods=20).mean()
-            ma50 = close.rolling(50, min_periods=50).mean()
-            trend_slope = (ma20 - ma50).diff().shift(1)
-
-            out[f"{prefix}_vol_regime_level"] = self._asof_series_value(vol_regime_level, asof_ts)
-            out[f"{prefix}_trend_slope"] = self._asof_series_value(trend_slope, asof_ts)
-
-            # Manifest-friendly aliases (offline uses prefixed series, scorer may require short btc_/eth_ keys)
+            # Manifest-friendly aliases (short btc_/eth_ keys)
             short = None
             up = asset.upper()
             if up.startswith("BTC"):
@@ -830,15 +783,17 @@ class LiveTrader:
                 short = "eth"
 
             if short is not None:
-                out[f"{short}_vol_regime_level"] = out[f"{prefix}_vol_regime_level"]
-                out[f"{short}_trend_slope"] = out[f"{prefix}_trend_slope"]
+                if f"{prefix}_vol_regime_level" in out:
+                    out[f"{short}_vol_regime_level"] = out[f"{prefix}_vol_regime_level"]
+                if f"{prefix}_trend_slope" in out:
+                    out[f"{short}_trend_slope"] = out[f"{prefix}_trend_slope"]
 
             return out
-
 
         except Exception as e:
             LOG.warning("Cross-asset daily ctx failed for %s: %s", asset, e)
             return out
+
 
     async def _get_gov_ctx(self) -> dict:
         """
