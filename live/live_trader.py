@@ -2310,7 +2310,6 @@ class LiveTrader:
                                 err = "scope_missing_cols"
                         else:
                             reason = f"scope_fail:{(pstar_scope or 'NONE')}"
-                    else:
 
                     else:
                         try:
