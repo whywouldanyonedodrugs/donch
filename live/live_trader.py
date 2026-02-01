@@ -361,6 +361,7 @@ class LiveTrader:
         self.settings = settings
         self.meta_schema = None  # always defined; assigned after bundle/winprob load if available
         self._cycle_data_ts: Optional[pd.Timestamp] = None  # Sprint 3.0: Data clock source of truth
+        self._init_ohlcv_cache()
 
         # Merge python config defaults (config.py) with YAML overrides into self.cfg
         self.cfg: Dict[str, Any] = {}

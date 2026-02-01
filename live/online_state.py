@@ -7,7 +7,7 @@ from typing import Optional, List, Dict, Any
 
 import numpy as np
 import pandas as pd
-
+import math
 
 @dataclass(frozen=True)
 class TradeOutcome:
@@ -29,13 +29,18 @@ class OnlinePerformanceState:
       {"ts":"2026-01-30T12:35:00Z","win":1,"pnl":12.34}
     """
 
-    def __init__(self, path: str, max_records: int = 2000, cold_start_winrate: float = float(np.nan)):
+    def __init__(self, path: str, max_records: int = 2000, cold_start_winrate: float = 0.25):
         self.path = Path(path)
         self.max_records = int(max_records)
+
         self.cold_start_winrate = float(cold_start_winrate)
+        if not math.isfinite(self.cold_start_winrate):
+            self.cold_start_winrate = 0.25
+
         self._records: List[TradeOutcome] = []
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._load()
+    
 
     def _load(self) -> None:
         self._records = []
