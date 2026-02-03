@@ -175,6 +175,8 @@ class Settings(BaseSettings):
 
 CONFIG_PATH = Path("config.yaml")
 SYMBOLS_PATH = Path("symbols.txt")
+INVALID_SYMBOLS_PATH = Path("results/runtime/invalid_symbols.txt")
+
 
 def load_yaml(p: Path) -> Dict[str, Any]:
     if not p.exists():
@@ -393,6 +395,16 @@ class LiveTrader:
 
 
         self.symbols = self._load_symbols()
+
+        self._invalid_symbols: set[str] = self._load_invalid_symbols()
+        if self._invalid_symbols:
+            before = len(self.symbols)
+            self.symbols = [s for s in self.symbols if s not in self._invalid_symbols]
+            after = len(self.symbols)
+            LOG.warning("Filtered %d invalid symbols from universe (kept=%d). File=%s",
+                        before - after, after, str(INVALID_SYMBOLS_PATH))
+
+
         self._universe_ctx: dict[str, dict] = {}
         self._universe_ctx_ts: datetime = datetime.min.replace(tzinfo=timezone.utc)
         self.open_positions: Dict[int, Dict[str, Any]] = {}
@@ -1952,9 +1964,39 @@ class LiveTrader:
     def _reload_symbols(self):
         try:
             self.symbols = self._load_symbols()
+
+            self._invalid_symbols: set[str] = self._load_invalid_symbols()
+            if self._invalid_symbols:
+                before = len(self.symbols)
+                self.symbols = [s for s in self.symbols if s not in self._invalid_symbols]
+                after = len(self.symbols)
+                LOG.warning("Filtered %d invalid symbols from universe (kept=%d). File=%s",
+                            before - after, after, str(INVALID_SYMBOLS_PATH))
+
             LOG.info("Symbols reloaded – %d symbols", len(self.symbols))
         except Exception as e:
             LOG.error("Failed to reload symbols: %s", e)
+
+    @staticmethod
+    def _load_invalid_symbols() -> set[str]:
+        try:
+            if INVALID_SYMBOLS_PATH.exists():
+                raw = INVALID_SYMBOLS_PATH.read_text(encoding="utf-8")
+                return {ln.strip() for ln in raw.splitlines() if ln.strip() and not ln.strip().startswith("#")}
+        except Exception:
+            pass
+        return set()
+
+    def _persist_invalid_symbols(self) -> None:
+        try:
+            INVALID_SYMBOLS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            txt = "\n".join(sorted(self._invalid_symbols)) + ("\n" if self._invalid_symbols else "")
+            INVALID_SYMBOLS_PATH.write_text(txt, encoding="utf-8")
+        except Exception:
+            LOG.exception("Failed to persist invalid symbols list to %s", str(INVALID_SYMBOLS_PATH))
+
+
+
 
     def _normalize_cfg_key(self, key: str) -> str:
         """Alias old → new config keys so /set works with either."""
@@ -4160,13 +4202,31 @@ class LiveTrader:
                             LOG.error("Pre-flight position check failed for %s: %s", sym, e)
                             continue
 
-                        # Build signal
-                        signal = await self._scan_symbol_for_signal(
-                            symbol=sym,
-                            market_regime=current_market_regime,
-                            eth_macd=eth_macd_data,
-                            gov_ctx=gov_ctx,
-                        )
+                        try:
+                            signal = await self._scan_symbol_for_signal(
+                                symbol=sym,
+                                market_regime=current_market_regime,
+                                eth_macd=eth_macd_data,
+                                gov_ctx=gov_ctx,
+                            )
+                        except Exception as e:
+                            msg = str(e)
+                            if "does not have market symbol" in msg:
+                                if sym not in self._invalid_symbols:
+                                    self._invalid_symbols.add(sym)
+                                    self._persist_invalid_symbols()
+                                    LOG.error("Quarantined invalid market symbol %s (wrote %s). Error=%s",
+                                            sym, str(INVALID_SYMBOLS_PATH), msg)
+                                    # optional: notify telegram
+                                    if getattr(self, "tg", None):
+                                        try:
+                                            await self.tg.send(f"⚠️ Removed from live universe (invalid market symbol): {sym}\n{msg}")
+                                        except Exception:
+                                            pass
+                                continue
+                            raise
+
+
 
                         if signal:
                             # Old-school filters (belt & suspenders)
