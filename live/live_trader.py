@@ -470,7 +470,7 @@ class LiveTrader:
             self._meta_curve_x = None
             self._meta_curve_y = None
             try:
-                from pathlib import Path
+
                 curve_path = None
 
                 # Prefer artifact bundle path if present
