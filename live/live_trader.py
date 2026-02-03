@@ -483,7 +483,9 @@ class LiveTrader:
 
                 curve_p = Path(str(curve_path))
                 if curve_p.exists():
-                    self._load_meta_sizing_curve(curve_p)
+                    from pathlib import Path
+                    self._load_meta_sizing_curve(Path(self.meta_dir) / "sizing_curve.csv")
+
                 else:
                     LOG.warning("bundle=%s sizing curve not found at %s (will use _winprob_multiplier fallback)",
                                 self.bundle_id, str(curve_p))
@@ -493,7 +495,9 @@ class LiveTrader:
 
 
             try:
-                self._load_meta_sizing_curve()
+                from pathlib import Path
+                self._load_meta_sizing_curve(Path(self.meta_dir) / "sizing_curve.csv")
+
             except Exception as e:
                 LOG.exception("Failed to load META sizing curve: %s", e)
                 self._meta_sizing_curve = None
@@ -744,7 +748,7 @@ class LiveTrader:
 
         return 1 if (regime_up == 1.0 and btc_trend_up == 1 and btc_vol_high == 0) else 0
 
-    def _load_meta_sizing_curve(self, path):
+    def _load_meta_sizing_curve(self, path=None):
         """
         Load sizing_curve.csv (probability -> size multiplier).
         Stores sorted x/y arrays for interpolation.
