@@ -670,7 +670,7 @@ class LiveTrader:
 
         try:
             bundle = getattr(self, "bundle_id", None) or "no_bundle"
-            LOG.info("bundle=%s Loaded sizing curve (interp) %s n=%d p_col=%s mult_col=%s",
+            LOG.info("bundle=%s Loaded sizing curve (interp.) %s n=%d p_col=%s mult_col=%s",
                     bundle, str(curve_path), len(xs), str(pcol), str(mcol))
         except Exception:
             pass
