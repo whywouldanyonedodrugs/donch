@@ -2784,6 +2784,23 @@ class LiveTrader:
                 is_ema_crossed_down=bool(is_ema_crossed_down),
                 side=side,
             )
+
+            # Attach META sizing inputs to signal for later sizing (offline parity)
+            try:
+                signal_obj.win_probability = float(p_cal)
+            except Exception:
+                signal_obj.win_probability = 0.0
+
+            try:
+                signal_obj.risk_on = 1 if float(risk_on_raw or 0.0) == 1.0 else 0
+            except Exception:
+                signal_obj.risk_on = 0
+
+            try:
+                signal_obj.risk_on_1 = 1 if float(risk_on_1_raw or 0.0) == 1.0 else 0
+            except Exception:
+                signal_obj.risk_on_1 = 0
+
             signal_obj.vwap_stack_frac = vwap_frac
             signal_obj.vwap_stack_expansion_pct = vwap_exp
             signal_obj.vwap_stack_slope_pph = vwap_slope
@@ -3168,7 +3185,31 @@ class LiveTrader:
         )
 
         # 3) Meta sizing multiplier (offline parity: sizing_curve.csv on p_cal)
-        p_cal = float(getattr(sig, "win_probability", 0.0) or 0.0)
+        p_cal = float(getattr(sig, "win_probability", float("nan")))
+        meta_mult = 1.0
+
+        if bool(self.cfg.get("META_SIZING_ENABLED", True)) and np.isfinite(p_cal):
+            meta_mult = float(self._meta_size_mult(p_cal))
+
+        # Offline parity: risk-off does NOT block entry; it caps sizing to probe
+        # If risk_on is missing, treat as risk_off (fail-closed -> probe sizing).
+        try:
+            risk_on_f = float(getattr(sig, "risk_on", 0.0) or 0.0)
+        except Exception:
+            risk_on_f = 0.0
+
+        if bool(self.cfg.get("META_RISK_OFF_PROBE_ENABLED", True)) and risk_on_f != 1.0:
+            try:
+                probe = float(self.cfg.get("RISK_OFF_PROBE_MULT", 0.01))
+            except Exception:
+                probe = 0.01
+            if np.isfinite(probe) and probe > 0.0:
+                meta_mult = min(meta_mult, probe)
+
+        # Guardrail
+        if (not np.isfinite(meta_mult)) or meta_mult <= 0.0:
+            meta_mult = 1.0
+
 
         meta_mult = 1.0
         if bool(self.cfg.get("META_SIZING_ENABLED", True)):
@@ -3189,6 +3230,8 @@ class LiveTrader:
             if np.isfinite(probe) and probe > 0.0:
                 meta_mult = min(meta_mult, probe)
 
+        LOG.info("SIZING_META symbol=%s p_cal=%s meta_mult=%.4f risk_on=%s",
+                sig.symbol, str(p_cal), float(meta_mult), str(getattr(sig, "risk_on", None)))
 
         # 4) YAML scalers (generic, linear maps feature→mult). Local helper.
         def _apply_yaml_scalers(sig_obj: Signal) -> float:
