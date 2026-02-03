@@ -483,7 +483,6 @@ class LiveTrader:
 
                 curve_p = Path(str(curve_path))
                 if curve_p.exists():
-                    from pathlib import Path
                     self._load_meta_sizing_curve(Path(self.meta_dir) / "sizing_curve.csv")
 
                 else:
@@ -493,16 +492,35 @@ class LiveTrader:
                 LOG.warning("bundle=%s sizing curve load failed: %s (fallback to _winprob_multiplier)",
                             self.bundle_id, e)
 
-
+            # --- Meta sizing curve (offline parity) ---
+            # Always non-fatal: if anything goes wrong, log and continue with meta sizing disabled.
             try:
-                from pathlib import Path
-                self._load_meta_sizing_curve(Path(self.meta_dir) / "sizing_curve.csv")
+                curve_path = None
+                # If bundle exposes a sizing curve path, prefer it.
+                if getattr(self, "meta_bundle", None) is not None:
+                    curve_path = getattr(self.meta_bundle, "sizing_curve_path", None)
+
+                # Fallback: META_EXPORT_DIR/sizing_curve.csv
+                if not curve_path:
+                    curve_path = Path(self.meta_dir) / "sizing_curve.csv"
+                else:
+                    curve_path = Path(str(curve_path))
+
+                if curve_path.exists():
+                    self._load_meta_sizing_curve(curve_path)
+                else:
+                    LOG.warning(
+                        "bundle=%s META sizing curve not found at %s (meta sizing disabled)",
+                        self.bundle_id,
+                        str(curve_path),
+                    )
+                    self._meta_sizing_curve = None
+                    self._meta_sizing_mode = "none"
 
             except Exception as e:
-                LOG.exception("Failed to load META sizing curve: %s", e)
+                LOG.exception("bundle=%s Failed to load META sizing curve (meta sizing disabled): %s", self.bundle_id, e)
                 self._meta_sizing_curve = None
                 self._meta_sizing_mode = "error"
-
 
 
             # Optional: golden row injector for parity testing (disabled by default).
