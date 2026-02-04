@@ -868,7 +868,7 @@ class LiveTrader:
         try:
             page_limit_cfg = int(self.cfg.get("OHLCV_PAGE_LIMIT", 1000))
 
-            # Bybit v5 commonly caps low timeframes to 200 candles per call.
+            # Bybit v5 commonly caps low timeframes to ~200 candles per call.
             if tf in ("1m", "3m", "5m", "15m", "30m"):
                 page_limit = min(page_limit_cfg, 200)
             else:
@@ -877,14 +877,20 @@ class LiveTrader:
             tf_ms = int(_tf_to_timedelta(tf).total_seconds() * 1000)
 
             need = int(limit) + 2  # +2 for safety; we drop last bar later
-            target = need + page_limit  # IMPORTANT: fetch the extra buffer so we reach "now"
+            target = need + page_limit  # fetch extra buffer so we reach "now"
             rows: list[list] = []
 
-            # Anchor since in the past; DO NOT start with since=None (that only returns the latest capped batch).
+            # Timeouts/progress (diagnostics only; does not affect parity math)
+            fetch_timeout_s = float(self.cfg.get("OHLCV_FETCH_TIMEOUT_S", 25.0))
+            progress_log_s = float(self.cfg.get("OHLCV_PROGRESS_LOG_S", 60.0))
+            t_start = time.perf_counter()
+            t_last_log = t_start
+            pages = 0
+
+            # Anchor since in the past; DO NOT start with since=None (would only return latest capped batch).
             try:
                 now_ms = int(self.exchange.milliseconds())
             except Exception:
-                import time
                 now_ms = int(time.time() * 1000)
 
             start_ms = now_ms - int(target * tf_ms)
@@ -894,8 +900,21 @@ class LiveTrader:
             while len(rows) < target:
                 req_limit = min(page_limit, target - len(rows))
                 prev_since = since
+                pages += 1
 
-                batch = await self.exchange.fetch_ohlcv(symbol, tf, since=since, limit=req_limit)
+                try:
+                    batch = await asyncio.wait_for(
+                        self.exchange.fetch_ohlcv(symbol, tf, since=since, limit=req_limit),
+                        timeout=fetch_timeout_s,
+                    )
+                except asyncio.TimeoutError:
+                    LOG.warning(
+                        "OHLCV_TIMEOUT symbol=%s tf=%s since_ms=%s limit=%d waited=%.1fs got=%d/%d pages=%d",
+                        symbol, tf, str(since), int(req_limit), float(fetch_timeout_s),
+                        int(len(rows)), int(target), int(pages),
+                    )
+                    break
+
                 if not batch:
                     break
 
@@ -915,6 +934,15 @@ class LiveTrader:
                 # Safety: if we failed to advance, stop to avoid an infinite loop
                 if since <= prev_since:
                     break
+
+                # Periodic progress log (so “Checking X…” doesn’t look like a hang)
+                now = time.perf_counter()
+                if (now - t_last_log) >= progress_log_s:
+                    LOG.info(
+                        "OHLCV_PROGRESS symbol=%s tf=%s got=%d/%d pages=%d elapsed=%.1fs",
+                        symbol, tf, int(len(rows)), int(target), int(pages), float(now - t_start),
+                    )
+                    t_last_log = now
 
             if len(rows) < 2:
                 return None
@@ -937,9 +965,11 @@ class LiveTrader:
             LOG.debug("OHLCV paged fetch failed %s %s: %s", symbol, tf, e)
             return None
 
+
     def _init_ohlcv_cache(self) -> None:
         self._ohlcv_cache: dict[tuple[str, str], pd.DataFrame] = {}
         self._ohlcv_cache_ts: dict[tuple[str, str], float] = {}
+
 
 
     def _init_ohlcv_disk_cache(self) -> None:
