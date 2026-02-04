@@ -27,6 +27,7 @@ import math
 import time
 import faulthandler
 import signal
+import inspect
 
 
 import aiohttp
@@ -444,6 +445,7 @@ class LiveTrader:
         self._wd_symbol: Optional[str] = None
         self._wd_stage: str = "init"
         self._wd_since: float = time.time()
+        self._wd_task: Optional[asyncio.Task] = None
 
         # Meta / win-prob scorer (strict-parity artifact bundle)
         meta_dir = (self.cfg.get("META_EXPORT_DIR")
@@ -1096,7 +1098,7 @@ class LiveTrader:
                     load_timeout_s = float(self.cfg.get("OHLCV_DISK_LOAD_TIMEOUT_S", 10.0))
                     try:
                         df_disk = await asyncio.wait_for(
-                            asyncio.to_thread(self._ohlcv_store.load, symbol, tf=tf, limit=load_bars),
+                            asyncio.to_thread(self._ohlcv_store.load, symbol, tf=tf, limit_bars=load_bars),
                             timeout=load_timeout_s,
                         )
                     except asyncio.TimeoutError:
@@ -2270,6 +2272,12 @@ class LiveTrader:
     ) -> Optional[Signal]:
         LOG.info("Checking %s...", symbol)
 
+        self._wd_symbol = symbol
+        self._wd_stage = "scan"
+        self._wd_since = time.time()
+        self._wd_task = asyncio.current_task()
+
+
         reg_label = str(market_regime).upper().strip()
         reg_code = REGIME_CODE_MAP.get(reg_label)
 
@@ -2318,23 +2326,38 @@ class LiveTrader:
             slow_s = float(self.cfg.get("SLOW_OHLCV_WARN_S", 8.0))
 
             t0_fetch = time.perf_counter()
+
+            # Semaphore acquisition (instrument + bounded)
+            acq_timeout_s = float(self.cfg.get("API_SEM_ACQUIRE_TIMEOUT_S", 30.0))
             t0_sem = time.perf_counter()
-            await self.api_semaphore.acquire()
+            try:
+                await asyncio.wait_for(self.api_semaphore.acquire(), timeout=acq_timeout_s)
+            except asyncio.TimeoutError:
+                sem_wait = time.perf_counter() - t0_sem
+                LOG.error(
+                    "API_SEM_ACQUIRE_TIMEOUT symbol=%s waited=%.2fs timeout_s=%.1f",
+                    symbol, float(sem_wait), float(acq_timeout_s),
+                )
+                LOG.warning("SCAN_SKIP symbol=%s stage=api_sem_timeout tf=%s", symbol, base_tf)
+                return None
+
             sem_wait = time.perf_counter() - t0_sem
             if sem_wait >= 1.0:
                 LOG.warning("API_SEM_WAIT symbol=%s waited=%.2fs", symbol, float(sem_wait))
+
             try:
                 df_base = await self._get_ohlcv(symbol, base_tf, min_bars=base_limit)
             finally:
                 self.api_semaphore.release()
 
             dt_fetch = time.perf_counter() - t0_fetch
-            if dt_fetch >= slow_s:
-                LOG.warning("SLOW_OHLCV symbol=%s tf=%s bars=%d took=%.2fs", symbol, base_tf, int(base_limit), dt_fetch)
-
             slow_s = float(self.cfg.get("SLOW_OHLCV_WARN_S", 8.0))
             if dt_fetch >= slow_s:
-                LOG.warning("SLOW_OHLCV symbol=%s tf=%s bars=%d took=%.2fs", symbol, base_tf, int(base_limit), dt_fetch)
+                LOG.warning(
+                    "SLOW_OHLCV symbol=%s tf=%s bars=%d took=%.2fs",
+                    symbol, base_tf, int(base_limit), float(dt_fetch),
+                )
+
 
 
             if df_base is None or df_base.empty or len(df_base) < 3:
@@ -4484,7 +4507,7 @@ class LiveTrader:
                             self._wd_stage = "scan"
                             self._wd_since = time.time()
 
-                            scan_timeout_s = float(self.cfg.get("SCAN_SYMBOL_TIMEOUT_S", 180.0))
+                            scan_timeout_s = float(self.cfg.get("SCAN_SYMBOL_TIMEOUT_S", 60.0))
                             try:
                                 signal = await asyncio.wait_for(
                                     self._scan_symbol_for_signal(
@@ -4496,8 +4519,9 @@ class LiveTrader:
                                     timeout=scan_timeout_s,
                                 )
                             except asyncio.TimeoutError:
-                                LOG.error("SCAN_TIMEOUT symbol=%s timeout=%.1fs (skipping symbol)", sym, scan_timeout_s)
+                                LOG.warning("SCAN_TIMEOUT symbol=%s timeout_s=%.1f (skipping)", sym, scan_timeout_s)
                                 continue
+
                             finally:
                                 # keep wd_symbol as-is; stage is updated by next iteration
                                 pass
@@ -4696,7 +4720,11 @@ class LiveTrader:
             period = parts[1].lower()
             if period in ['6h', 'daily', 'weekly', 'monthly']:
                 await self.tg.send(f"Generating on-demand '{period}' report…")
-                summary_text = await self._generate_summary_report(period)
+                res = self._generate_summary_report(period)
+                summary_text = await res if inspect.isawaitable(res) else res
+
+
+
                 await self.tg.send(summary_text)
             else:
                 await self.tg.send("Unknown period. Use: 6h, daily, weekly, monthly.")
@@ -5248,6 +5276,22 @@ class LiveTrader:
             if sym:
                 age = (time.time() - float(since)) if since else 0.0
                 LOG.warning("WATCHDOG symbol=%s stage=%s age=%.1fs", sym, stage, age)
+                t = getattr(self, "_wd_task", None)
+                if t is not None:
+                    try:
+                        import traceback
+                        frames = t.get_stack(limit=50)
+                        if frames:
+                            # Show the deepest frame available for the task.
+                            txt = "".join(traceback.format_stack(frames[-1]))
+                            LOG.warning("WATCHDOG_TASK_STACK symbol=%s stage=%s\n%s", sym, stage, txt)
+                        else:
+                            LOG.warning("WATCHDOG_TASK_STACK symbol=%s stage=%s (no frames)", sym, stage)
+                    except Exception as e:
+                        LOG.warning("WATCHDOG_TASK_STACK_FAIL symbol=%s err=%s", sym, e)
+
+
+
 
 
     async def _reporting_loop(self):
@@ -5271,7 +5315,8 @@ class LiveTrader:
 
                 if should_send and not is_already_sent:
                     LOG.info("Sending scheduled '%s' report.", period)
-                    summary_text = await self._generate_summary_report(period)
+                    res = self._generate_summary_report(period)
+                    summary_text = await res if inspect.isawaitable(res) else res
                     await self.tg.send(summary_text)
                     if period in ['daily', 'weekly']:
                         last_report_sent[period] = now.date()
