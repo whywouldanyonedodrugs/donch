@@ -25,6 +25,9 @@ from typing import Any, Dict, List, Optional
 import subprocess
 import math
 import time
+import faulthandler
+import signal
+
 
 import aiohttp
 import asyncpg
@@ -437,6 +440,10 @@ class LiveTrader:
         self.tasks: List[asyncio.Task] = []
         self.api_semaphore = asyncio.Semaphore(10)
         self.symbol_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        # Watchdog state (diagnostics only)
+        self._wd_symbol: Optional[str] = None
+        self._wd_stage: str = "init"
+        self._wd_since: float = time.time()
 
         # Meta / win-prob scorer (strict-parity artifact bundle)
         meta_dir = (self.cfg.get("META_EXPORT_DIR")
@@ -4466,12 +4473,29 @@ class LiveTrader:
                             LOG.error("Pre-flight position check failed for %s: %s", sym, e)
                             continue
                         try:
-                            signal = await self._scan_symbol_for_signal(
-                                symbol=sym,
-                                market_regime=current_market_regime,
-                                eth_macd=eth_macd_data,
-                                gov_ctx=gov_ctx,
-                            )
+                            self._wd_symbol = sym
+                            self._wd_stage = "scan"
+                            self._wd_since = time.time()
+
+                            scan_timeout_s = float(self.cfg.get("SCAN_SYMBOL_TIMEOUT_S", 180.0))
+                            try:
+                                signal = await asyncio.wait_for(
+                                    self._scan_symbol_for_signal(
+                                        symbol=sym,
+                                        market_regime=current_market_regime,
+                                        eth_macd=eth_macd_data,
+                                        gov_ctx=gov_ctx,
+                                    ),
+                                    timeout=scan_timeout_s,
+                                )
+                            except asyncio.TimeoutError:
+                                LOG.error("SCAN_TIMEOUT symbol=%s timeout=%.1fs (skipping symbol)", sym, scan_timeout_s)
+                                continue
+                            finally:
+                                # keep wd_symbol as-is; stage is updated by next iteration
+                                pass
+
+
                         except Exception as e:
                             if self._maybe_quarantine_symbol(symbol, e, where="scan_exception"):
                                 return None
@@ -5207,6 +5231,18 @@ class LiveTrader:
         # 4) Default
         return "short"
 
+    async def _watchdog_loop(self):
+        every = float(self.cfg.get("WATCHDOG_LOG_SEC", 60.0))
+        while True:
+            await asyncio.sleep(every)
+            sym = getattr(self, "_wd_symbol", None)
+            stage = getattr(self, "_wd_stage", "unknown")
+            since = getattr(self, "_wd_since", None)
+            if sym:
+                age = (time.time() - float(since)) if since else 0.0
+                LOG.warning("WATCHDOG symbol=%s stage=%s age=%.1fs", sym, stage, age)
+
+
     async def _reporting_loop(self):
         LOG.info("Reporting loop started.")
         last_report_sent = {}
@@ -5238,6 +5274,15 @@ class LiveTrader:
     # ───────────────────── Run ─────────────────────
 
     async def run(self):
+
+        # Allow operator to dump Python stacks to journald: sudo kill -USR1 <pid>
+        try:
+            faulthandler.register(signal.SIGUSR1, all_threads=True)
+            LOG.info("Faulthandler SIGUSR1 registered (kill -USR1 <pid> dumps stacks).")
+        except Exception as e:
+            LOG.warning("Faulthandler SIGUSR1 register failed: %s", e)
+
+
         await self.db.init()
         await self.db.migrate_schema()
 
@@ -5268,6 +5313,8 @@ class LiveTrader:
                 tg.create_task(self._telegram_loop())
                 tg.create_task(self._equity_loop())
                 tg.create_task(self._reporting_loop())
+                tg.create_task(self._watchdog_loop())
+                
         except* (asyncio.CancelledError, KeyboardInterrupt):
             LOG.info("Shutdown signal received.")
         finally:
