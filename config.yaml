@@ -102,3 +102,11 @@ META_SIZING_ENABLED: true
 RISK_OFF_PROBE_MULT: 0.01
 META_SIZING_CURVE_PATH: null          # if null: use <meta_dir>/sizing_curve.csv
 META_SIZING_FAIL_CLOSED: true         # if curve missing/invalid: do not upsize; cap to probe
+
+# OHLCV caching
+OHLCV_DISK_CACHE_ENABLED: true
+OHLCV_DISK_CACHE_SQLITE: "results/runtime/ohlcv_cache.sqlite"
+OHLCV_DISK_CACHE_TFS: ["5m"]
+OHLCV_DISK_FLUSH_BARS: 12
+OHLCV_DISK_KEEP_BARS: 20000
+OHLCV_DISK_LOAD_BARS: 15000

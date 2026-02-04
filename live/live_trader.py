@@ -44,6 +44,7 @@ from .shared_utils import is_blacklisted
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 from .exchange_proxy import ExchangeProxy
+from .ohlcv_store import OHLCVSqliteStore
 from .database import DB
 from .telegram import TelegramBot
 from .winprob_loader import WinProbScorer
@@ -378,6 +379,9 @@ class LiveTrader:
         self.cfg.update(cfg_dict)
         for k, v in self.cfg.items():  # keep config.py attributes in sync too
             setattr(cfg, k, v)
+
+        # OHLCV disk cache (SQLite), optional but recommended to avoid cold-start full-history refetch.
+        self._init_ohlcv_disk_cache()
 
         self.feature_builder = FeatureBuilder(self.cfg)
 
@@ -937,29 +941,133 @@ class LiveTrader:
     def _init_ohlcv_cache(self) -> None:
         self._ohlcv_cache: dict[tuple[str, str], pd.DataFrame] = {}
 
-    async def _get_ohlcv(self, symbol: str, tf: str, min_bars: int) -> Optional[pd.DataFrame]:
+    def _init_ohlcv_disk_cache(self) -> None:
+        # Defaults: disabled unless explicitly enabled in cfg/YAML.
+        self._ohlcv_store = None
+        self._ohlcv_disk_last_flush: dict[tuple[str, str], pd.Timestamp] = {}
+        self._ohlcv_disk_tfs: set[str] = set()
+
+        enabled = bool(self.cfg.get("OHLCV_DISK_CACHE_ENABLED", False))
+        if not enabled:
+            return
+
+        path = Path(self.cfg.get("OHLCV_DISK_CACHE_SQLITE", "results/runtime/ohlcv_cache.sqlite"))
+        self._ohlcv_store = OHLCVSqliteStore(path)
+
+        tfs = self.cfg.get("OHLCV_DISK_CACHE_TFS", ["5m"])
+        if isinstance(tfs, str):
+            tfs = [tfs]
+        self._ohlcv_disk_tfs = {str(x).strip() for x in (tfs or []) if str(x).strip()}
+
+        self._ohlcv_disk_flush_bars = int(self.cfg.get("OHLCV_DISK_FLUSH_BARS", 12))  # 12x5m=1h default
+        self._ohlcv_disk_keep_bars = int(self.cfg.get("OHLCV_DISK_KEEP_BARS", 20000))
+
+        LOG.info(
+            "OHLCV disk cache enabled: sqlite=%s tfs=%s flush_bars=%d keep_bars=%d",
+            str(path), sorted(self._ohlcv_disk_tfs), int(self._ohlcv_disk_flush_bars), int(self._ohlcv_disk_keep_bars),
+        )
+
+    async def _maybe_flush_ohlcv_to_disk(self, symbol: str, tf: str, df: pd.DataFrame, *, force: bool) -> None:
+        store = getattr(self, "_ohlcv_store", None)
+        if store is None:
+            return
+        if tf not in getattr(self, "_ohlcv_disk_tfs", set()):
+            return
+        if df is None or df.empty:
+            return
+
         key = (symbol, tf)
-        df = self._ohlcv_cache.get(key)
+        last_ts = df.index[-1]
 
-        if df is None or len(df) < min_bars:
-            df = await self._fetch_ohlcv_df_paged(symbol, tf, min_bars)
-            if df is None:
-                return None
-            self._ohlcv_cache[key] = df
+        prev = self._ohlcv_disk_last_flush.get(key)
+        if (not force) and (prev is not None):
+            try:
+                new_slice = df.loc[df.index > prev]
+            except Exception:
+                new_slice = df
+            if len(new_slice) < int(getattr(self, "_ohlcv_disk_flush_bars", 12)):
+                return
+            df_flush = new_slice
+        else:
+            df_flush = df
+
+        try:
+            await asyncio.to_thread(
+                store.upsert_df,
+                symbol,
+                tf,
+                df_flush,
+                keep_last=int(getattr(self, "_ohlcv_disk_keep_bars", 20000)),
+            )
+            self._ohlcv_disk_last_flush[key] = last_ts
+        except Exception as e:
+            LOG.warning("OHLCV_DISK_FLUSH_FAIL symbol=%s tf=%s err=%s", symbol, tf, e)
+
+    async def _get_ohlcv(self, symbol: str, tf: str, min_bars: int) -> pd.DataFrame:
+        """
+        Returns OHLCV indexed at candle OPEN time (UTC), with the last incomplete bar removed.
+        Uses in-memory cache; optionally uses disk-backed SQLite cache to survive restarts.
+
+        IMPORTANT invariants (parity-critical):
+          - No feature uses wall-clock; decision_ts is derived from last fully closed 5m bar.
+          - We never keep the last incomplete bar (drop happens in fetcher).
+          - Merge/dedup is by timestamp, keep="last".
+        """
+        key = (symbol, tf)
+        async with self.symbol_locks[symbol]:
+            df = self._ohlcv_cache.get(key)
+
+            # Disk warm-start: if memory is empty/short, try SQLite cache first.
+            if (df is None or len(df) < int(min_bars)) and getattr(self, "_ohlcv_store", None) is not None:
+                try:
+                    # Load at least min_bars, but allow config to request a larger warm-start window.
+                    load_bars = int(self.cfg.get("OHLCV_DISK_LOAD_BARS", min_bars))
+                    load_bars = max(load_bars, int(min_bars))
+                    df_disk = await asyncio.to_thread(self._ohlcv_store.load, symbol, tf, limit_bars=load_bars)
+                    if df_disk is not None and not df_disk.empty:
+                        df = df_disk
+                        self._ohlcv_cache[key] = df
+                        self._ohlcv_cache_ts[key] = time.time()
+                        LOG.info("OHLCV_DISK_HIT symbol=%s tf=%s bars=%d", symbol, tf, int(len(df)))
+                except Exception as e:
+                    LOG.warning("OHLCV_DISK_LOAD_FAIL symbol=%s tf=%s err=%s", symbol, tf, e)
+
+            # Hard miss: full fetch (expensive). Persist to disk so next restart is fast.
+            if df is None or len(df) < min_bars:
+                t0 = time.perf_counter()
+                df = await self._fetch_ohlcv_df_paged(symbol, tf, min_bars)
+                dt = time.perf_counter() - t0
+                if dt > 5.0:
+                    LOG.warning("SLOW_OHLCV symbol=%s tf=%s bars=%d took=%.2fs", symbol, tf, min_bars, dt)
+                self._ohlcv_cache[key] = df
+                self._ohlcv_cache_ts[key] = time.time()
+
+                # Force flush the full window once (rate-limited later).
+                await self._maybe_flush_ohlcv_to_disk(symbol, tf, df, force=True)
+                return df
+
+            # Incremental refresh (tail fetch) — merge/dedup and keep last min_bars.
+            tail = int(self.cfg.get("OHLCV_TAIL_FETCH", 400))
+            t0 = time.perf_counter()
+            df_new = await self._fetch_ohlcv_df_paged(symbol, tf, tail)
+            dt = time.perf_counter() - t0
+            if dt > 5.0:
+                LOG.warning("SLOW_OHLCV_TAIL symbol=%s tf=%s bars=%d took=%.2fs", symbol, tf, tail, dt)
+
+            if df_new is not None and not df_new.empty:
+                merged = pd.concat([df, df_new], axis=0).sort_index()
+                merged = merged[~merged.index.duplicated(keep="last")]
+
+                if len(merged) > min_bars:
+                    merged = merged.iloc[-min_bars:]
+
+                df = merged
+                self._ohlcv_cache[key] = df
+                self._ohlcv_cache_ts[key] = time.time()
+
+                await self._maybe_flush_ohlcv_to_disk(symbol, tf, df, force=False)
+
             return df
-
-        # incremental refresh: fetch a small tail and merge
-        tail = int(self.cfg.get("OHLCV_TAIL_FETCH", 400))
-        df_new = await self._fetch_ohlcv_df_paged(symbol, tf, min(tail, min_bars))
-        if df_new is None:
-            return df
-
-        df = pd.concat([df, df_new], axis=0)
-        df = df[~df.index.duplicated(keep="last")].sort_index()
-        if len(df) > min_bars:
-            df = df.iloc[-min_bars:]
-        self._ohlcv_cache[key] = df
-        return df
 
 
     async def _fetch_ohlcv_df_simple(self, symbol: str, tf: str, limit: int) -> Optional[pd.DataFrame]:
@@ -1995,6 +2103,43 @@ class LiveTrader:
         except Exception:
             LOG.exception("Failed to persist invalid symbols list to %s", str(INVALID_SYMBOLS_PATH))
 
+    def _maybe_quarantine_symbol(self, symbol: str, err: BaseException, *, where: str) -> bool:
+        """
+        Quarantine symbols that are not tradable/unsupported by this bot/exchange account.
+
+        IMPORTANT:
+        - Only quarantine on specific, repeatable “unsupported instrument” signatures observed in logs.
+        - Do NOT quarantine on transient/network errors.
+        """
+        try:
+            msg = str(err) or repr(err)
+        except Exception:
+            msg = repr(err)
+
+        msg_l = msg.lower()
+
+        reason = None
+        # Existing known signature (already handled in scan exception path)
+        if "does not have market symbol" in msg_l:
+            reason = "unknown_market_symbol"
+        # New known signature from logs:
+        # bybit {"retCode":181001,"retMsg":"category only support linear or option",...}
+        elif "category only support linear or option" in msg_l:
+            reason = "unsupported_category_181001"
+        elif ("retcode" in msg_l) and ("181001" in msg_l):
+            reason = "unsupported_category_181001"
+
+        if reason is None:
+            return False
+
+        if symbol not in self._invalid_symbols:
+            self._invalid_symbols.add(symbol)
+            self._persist_invalid_symbols()
+            LOG.warning(
+                "Quarantined invalid symbol=%s where=%s reason=%s -> %s | err=%s",
+                symbol, where, reason, str(INVALID_SYMBOLS_PATH), msg,
+            )
+        return True
 
 
 
@@ -3649,18 +3794,41 @@ class LiveTrader:
             final_tp_mult  = float(self.cfg.get("FINAL_TP_ATR_MULT", self.cfg.get("TP_ATR_MULT", 8.0)))
             tp_final_price = actual_entry_price + (final_tp_mult * float(sig.atr) * (+1 if is_long else -1))
 
+            # --- Short OPENED telegram (essential info only) ---
+            import math  # only needed if math isn't already imported in this file
+
+            risk_on = int(getattr(sig, "risk_on", 0) or 0)
+            risk_on_1 = int(getattr(sig, "risk_on_1", 0) or 0)
+
+            # SL / TP formatting (fail-safe)
+            try:
+                sl_s = f"{float(stop_price):.6f}"
+            except Exception:
+                sl_s = "NA"
+
+            try:
+                tp_s = f"{float(tp_final_price):.6f}"
+            except Exception:
+                tp_s = "NA"
+
+            # Basic sizing: base risk + total multiplier (fail-safe)
+            try:
+                base_r = float(base_risk_usd)
+            except Exception:
+                base_r = float("nan")
+
+            try:
+                total_r = float(risk_usd)
+            except Exception:
+                total_r = float("nan")
+
+            mult = (total_r / base_r) if (base_r and base_r > 0 and math.isfinite(base_r) and math.isfinite(total_r)) else float("nan")
+            mult_s = f"x{mult:.2f}" if math.isfinite(mult) else "xNA"
+
             msg = (
                 f"🔔 OPENED {side_label} {sig.symbol} — {ts} UTC\n"
-                f"Price: {actual_entry_price:.6f} | ATR1h: {sig.atr:.6f} ({sig.atr_pct:.2f}%) | RSI1h: {sig.rsi:.1f} | ADX1h: {sig.adx:.1f}\n"
-                f"Donch({don_len_s}d): level={don_level_s}  dist_atr={don_dist_s}\n"
-                f"Volume mult: x{vol_mult:.2f} | RS: {rs_pct:.1f}% | Regime: {sig.market_regime}\n"
-                f"ETH(4h) MACD hist: {eth_hist_s}  MACD>signal: {bool(eth_above)}  → regime_up={reg_up}\n"
-                f"VWAP stack: frac={vwap_frac_s}  exp={vwap_exp_s}  slope_pph={vwap_slope_s}\n"
-                f"Entry Rule: {pullback} + {entry_rule}\n"
-                f"GATES: RS≥{rs_min:.0f} {_ok(g_rs)} | Liquidity {_ok(g_liq)} | RegimeUp/OK {_ok(g_reg)} | "
-                f"Vol x{vol_needed:.1f} {_ok(g_vol)} | MicroATR≥{min_atr_pct:.4f} {_ok(g_micro)} | META p={wp:.3f}≥{meta_thresh:.2f} {_ok(g_meta)}\n"
-                f"Sizing: base ${base_risk_usd:.2f} · ETH×{eth_mult:.2f} · VWAP×{vw_mult:.2f} · WP×{wp_mult:.2f} · YAML×{yaml_mult:.2f} ⇒ risk ${risk_usd:.2f}\n"
-                f"Protection: SL {sl_mult:.2f}×ATR → {stop_price:.6f} | Final TP {final_tp_mult:.2f}×ATR → {tp_final_price:.6f}"
+                f"Px {actual_entry_price:.6f} | SL {sl_s} | TP {tp_s}\n"
+                f"Risk ${total_r:.2f} (base ${base_r:.2f} {mult_s}) | Regime {sig.market_regime} | risk_on={risk_on} risk_on_1={risk_on_1}"
             )
             await self.tg.send(msg)
 
@@ -4176,6 +4344,10 @@ class LiveTrader:
                 open_symbols = {p["symbol"] for p in self.open_positions.values()}
 
                 for sym in self.symbols:
+                    # If a symbol is quarantined mid-process, we must skip it immediately,
+                    # not only after a reload.
+                    if sym in self._invalid_symbols:
+                        continue
                     if self.paused or not self.risk.can_trade():
                         break
                     if sym in open_symbols:
@@ -4199,9 +4371,11 @@ class LiveTrader:
                                     LOG.warning("ORPHAN POSITION DETECTED for %s! Reconcile later.", sym)
                                 continue
                         except Exception as e:
+                            # Some “pre-flight” failures are permanent unsupported-instrument cases.
+                            if self._maybe_quarantine_symbol(sym, e, where="preflight_positions"):
+                                continue
                             LOG.error("Pre-flight position check failed for %s: %s", sym, e)
                             continue
-
                         try:
                             signal = await self._scan_symbol_for_signal(
                                 symbol=sym,
@@ -4210,21 +4384,8 @@ class LiveTrader:
                                 gov_ctx=gov_ctx,
                             )
                         except Exception as e:
-                            msg = str(e)
-                            if "does not have market symbol" in msg:
-                                if sym not in self._invalid_symbols:
-                                    self._invalid_symbols.add(sym)
-                                    self._persist_invalid_symbols()
-                                    LOG.error("Quarantined invalid market symbol %s (wrote %s). Error=%s",
-                                            sym, str(INVALID_SYMBOLS_PATH), msg)
-                                    # optional: notify telegram
-                                    if getattr(self, "tg", None):
-                                        try:
-                                            await self.tg.send(f"⚠️ Removed from live universe (invalid market symbol): {sym}\n{msg}")
-                                        except Exception:
-                                            pass
-                                continue
-                            raise
+                            if self._maybe_quarantine_symbol(symbol, e, where="scan_exception"):
+                                return None
 
 
 
@@ -4621,64 +4782,121 @@ class LiveTrader:
 
         LOG.info("<-- Resume complete.")
 
-    async def _generate_summary_report(self, period: str) -> str:
+    def _generate_summary_report(self, period: str = "6h") -> str:
         now = datetime.now(timezone.utc)
-        period_map = {
-            '6h': timedelta(hours=6),
-            'daily': timedelta(days=1),
-            'weekly': timedelta(weeks=1),
-            'monthly': timedelta(days=30)
-        }
-        if period not in period_map:
-            return f"Error: Unknown report period '{period}'."
+        if period == "6h":
+            start = now - timedelta(hours=6)
+        elif period == "24h":
+            start = now - timedelta(days=1)
+        elif period == "7d":
+            start = now - timedelta(days=7)
+        else:
+            start = now - timedelta(hours=6)
 
-        start_time = now - period_map[period]
-        LOG.info("Generating %s summary report since %s", period, start_time.isoformat())
-
-        try:
-            query = """
-                SELECT pnl FROM positions
-                WHERE status = 'CLOSED' AND closed_at >= $1
+        def _metrics(pnls: list[float]) -> tuple[int, float, int, int, float, float]:
             """
-            records = await self.db.pool.fetch(query, start_time)
-            if not records:
-                return f"📊 *{period.capitalize()} Report*\n\nNo trades were closed in the last {period}."
+            Returns: (n, total_pnl, win_count, loss_count, win_rate_pct, profit_factor, expectancy)
+            """
+            n = len(pnls)
+            if n == 0:
+                return 0, 0.0, 0, 0, 0.0, 0.0, 0.0
 
-            total_trades = len(records)
-            pnl_values = [float(r['pnl']) for r in records if r['pnl'] is not None]
-            wins = [p for p in pnl_values if p > 0]
-            losses = [p for p in pnl_values if p < 0]
-
+            wins = [p for p in pnls if p > 0]
+            losses = [p for p in pnls if p <= 0]
             win_count = len(wins)
             loss_count = len(losses)
-            win_rate = (win_count / total_trades) * 100 if total_trades > 0 else 0
-            total_pnl = sum(pnl_values)
-            gross_profit = sum(wins)
-            gross_loss = abs(sum(losses))
-            profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
-            avg_win = sum(wins) / win_count if win_count > 0 else 0
-            avg_loss = sum(losses) / loss_count if loss_count > 0 else 0
-            expectancy = (avg_win * (win_rate / 100)) - (abs(avg_loss) * (1 - (win_rate / 100)))
 
-            report_lines = [
-                f"📊 *{period.capitalize()} Performance Summary*",
-                f"```{'-'*25}",
-                f" Period: Last {period}",
-                f" Total Closed Trades: {total_trades}",
-                f" Total PnL: {total_pnl:+.2f} USDT",
-                f"",
-                f" Win Rate: {win_rate:.2f}% ({win_count} W / {loss_count} L)",
-                f" Profit Factor: {profit_factor:.2f}",
-                f" Expectancy/Trade: {expectancy:+.2f} USDT",
-                f"",
-                f" Avg Win:  {avg_win:+.2f} USDT",
-                f" Avg Loss: {avg_loss:+.2f} USDT",
-                f"```{'-'*25}",
-            ]
-            return "\n".join(report_lines)
-        except Exception as e:
-            LOG.error("Failed to generate summary report: %s", e)
-            return f"Error: Could not generate {period} report. Check logs."
+            total_pnl = float(sum(pnls))
+            win_rate = (win_count / n) * 100.0
+
+            gross_profit = float(sum(wins))
+            gross_loss = float(abs(sum(losses)))
+            profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else float("inf")
+
+            expectancy = total_pnl / n
+            return n, total_pnl, win_count, loss_count, win_rate, profit_factor, expectancy
+
+        pnl_period: list[float] = []
+        pnl_recent: list[float] = []
+        last_regime: str | None = None
+
+        try:
+            conn = psycopg2.connect(self.db_dsn)
+            cur = conn.cursor()
+
+            # Period PnL (for main report)
+            cur.execute(
+                """
+                SELECT pnl
+                FROM positions
+                WHERE closed_at IS NOT NULL
+                AND closed_at >= %s
+                ORDER BY closed_at DESC
+                """,
+                (start,),
+            )
+            pnl_period = [float(r[0]) for r in cur.fetchall() if r and r[0] is not None]
+
+            # Recent PnL (for winrate20/winrate50)
+            cur.execute(
+                """
+                SELECT pnl
+                FROM positions
+                WHERE closed_at IS NOT NULL
+                ORDER BY closed_at DESC
+                LIMIT %s
+                """,
+                (50,),
+            )
+            pnl_recent = [float(r[0]) for r in cur.fetchall() if r and r[0] is not None]
+
+            # Optional: include last known market_regime if the column exists
+            try:
+                cur.execute(
+                    """
+                    SELECT market_regime
+                    FROM positions
+                    WHERE closed_at IS NOT NULL
+                    ORDER BY closed_at DESC
+                    LIMIT 1
+                    """
+                )
+                row = cur.fetchone()
+                if row and row[0] is not None:
+                    last_regime = str(row[0])
+            except Exception:
+                last_regime = None
+
+            cur.close()
+            conn.close()
+        except Exception:
+            LOG.exception("Failed to fetch PnL for report")
+            try:
+                cur.close()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return ""
+
+        if not pnl_period:
+            # still show recent winrates if available
+            wr20 = _metrics(pnl_recent[:20])[4] if pnl_recent else 0.0
+            wr50 = _metrics(pnl_recent[:50])[4] if pnl_recent else 0.0
+            return f"📊 {period}: no closed trades | win20={wr20:.1f}% win50={wr50:.1f}%"
+
+        n, total_pnl, w, l, wr, pf, exp = _metrics(pnl_period)
+        wr20 = _metrics(pnl_recent[:20])[4] if pnl_recent else 0.0
+        wr50 = _metrics(pnl_recent[:50])[4] if pnl_recent else 0.0
+
+        pf_s = f"{pf:.2f}" if (pf != float("inf")) else "inf"
+        base = f"📊 {period}: closed={n} pnl={total_pnl:+.2f} win={wr:.1f}% ({w}/{l}) pf={pf_s} exp={exp:+.2f} | win20={wr20:.1f}% win50={wr50:.1f}%"
+        if last_regime:
+            base += f" | last_regime={last_regime}"
+        return base
+
 
     async def _deep_analysis_text(self, period: str = "30d") -> str:
         """
@@ -4952,7 +5170,7 @@ class LiveTrader:
         self._listing_dates_cache = await self._load_listing_dates()
 
         await self._resume()
-        await self.tg.send("DONCH v4.2 (Sprint 3.0) started successfully.")
+        await self.tg.send("DONCH 2 (2.2.1b) started successfully.")
 
         try:
             async with asyncio.TaskGroup() as tg:
