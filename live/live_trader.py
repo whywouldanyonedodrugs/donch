@@ -447,6 +447,9 @@ class LiveTrader:
         self.tasks: List[asyncio.Task] = []
         self.api_semaphore = asyncio.Semaphore(10)
         self.symbol_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+        self._ohlcv_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+
         # Watchdog state (diagnostics only)
         self._wd_symbol: Optional[str] = None
         self._wd_stage: str = "init"
@@ -1091,7 +1094,9 @@ class LiveTrader:
           - Merge/dedup is by timestamp, keep="last".
         """
         key = (symbol, tf)
-        async with self.symbol_locks[symbol]:
+
+        async with self._ohlcv_locks[symbol]:
+
             df = self._ohlcv_cache.get(key)
 
             # Disk warm-start: if memory is empty/short, try SQLite cache first.
@@ -4532,6 +4537,11 @@ class LiveTrader:
                                     ),
                                     timeout=scan_timeout_s,
                                 )
+
+
+
+
+                                
                             except asyncio.TimeoutError:
                                 LOG.warning("SCAN_TIMEOUT symbol=%s timeout_s=%.1f (skipping)", sym, scan_timeout_s)
                                 continue
@@ -4944,126 +4954,76 @@ class LiveTrader:
 
         LOG.info("<-- Resume complete.")
 
-    def _generate_summary_report(self, period: str = "6h") -> str:
-
-        if psycopg2 is None:
-            LOG.error("Reporting PnL unavailable: psycopg2 not installed/importable.")
-            # Return report without DB PnL section (or return an empty PnL dict)
-            return "PnL unavailable (psycopg2 missing)."
-
+    async def _generate_summary_report(self, period: str) -> str:
         now = datetime.now(timezone.utc)
-        if period == "6h":
-            start = now - timedelta(hours=6)
-        elif period == "24h":
-            start = now - timedelta(days=1)
-        elif period == "7d":
-            start = now - timedelta(days=7)
-        else:
-            start = now - timedelta(hours=6)
 
-        def _metrics(pnls: list[float]) -> tuple[int, float, int, int, float, float]:
-            """
-            Returns: (n, total_pnl, win_count, loss_count, win_rate_pct, profit_factor, expectancy)
-            """
-            n = len(pnls)
-            if n == 0:
-                return 0, 0.0, 0, 0, 0.0, 0.0, 0.0
-
-            wins = [p for p in pnls if p > 0]
-            losses = [p for p in pnls if p <= 0]
-            win_count = len(wins)
-            loss_count = len(losses)
-
-            total_pnl = float(sum(pnls))
-            win_rate = (win_count / n) * 100.0
-
-            gross_profit = float(sum(wins))
-            gross_loss = float(abs(sum(losses)))
-            profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else float("inf")
-
-            expectancy = total_pnl / n
-            return n, total_pnl, win_count, loss_count, win_rate, profit_factor, expectancy
-
-        pnl_period: list[float] = []
-        pnl_recent: list[float] = []
-        last_regime: str | None = None
-
+        # Parse period like "6h", "24h", "7d"
+        start = None
         try:
-            conn = psycopg2.connect(self.db_dsn)
-            cur = conn.cursor()
+            if isinstance(period, str) and period.endswith("h"):
+                start = now - timedelta(hours=int(period[:-1]))
+            elif isinstance(period, str) and period.endswith("d"):
+                start = now - timedelta(days=int(period[:-1]))
+        except Exception:
+            start = None
+        if start is None:
+            start = now - timedelta(hours=6)
 
-            # Period PnL (for main report)
-            cur.execute(
-                """
-                SELECT pnl
-                FROM positions
-                WHERE closed_at IS NOT NULL
-                AND closed_at >= %s
-                ORDER BY closed_at DESC
-                """,
-                (start,),
-            )
-            pnl_period = [float(r[0]) for r in cur.fetchall() if r and r[0] is not None]
+        period_pnls: list[float] = []
+        recent_pnls: list[float] = []
+        last_regime = "n/a"
 
-            # Recent PnL (for winrate20/winrate50)
-            cur.execute(
-                """
-                SELECT pnl
-                FROM positions
-                WHERE closed_at IS NOT NULL
-                ORDER BY closed_at DESC
-                LIMIT %s
-                """,
-                (50,),
-            )
-            pnl_recent = [float(r[0]) for r in cur.fetchall() if r and r[0] is not None]
-
-            # Optional: include last known market_regime if the column exists
-            try:
-                cur.execute(
-                    """
-                    SELECT market_regime
-                    FROM positions
-                    WHERE closed_at IS NOT NULL
-                    ORDER BY closed_at DESC
-                    LIMIT 1
-                    """
+        # Fetch from Postgres via asyncpg pool
+        try:
+            async with self.db.pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT pnl FROM positions WHERE closed_at IS NOT NULL AND closed_at >= $1 ORDER BY closed_at DESC",
+                    start,
                 )
-                row = cur.fetchone()
-                if row and row[0] is not None:
-                    last_regime = str(row[0])
-            except Exception:
-                last_regime = None
+                period_pnls = [float(r["pnl"]) for r in rows if r["pnl"] is not None]
 
-            cur.close()
-            conn.close()
+                rows2 = await conn.fetch(
+                    "SELECT pnl FROM positions WHERE closed_at IS NOT NULL ORDER BY closed_at DESC LIMIT 50"
+                )
+                recent_pnls = [float(r["pnl"]) for r in rows2 if r["pnl"] is not None]
+
+                try:
+                    lr = await conn.fetchval(
+                        "SELECT market_regime FROM positions WHERE closed_at IS NOT NULL ORDER BY closed_at DESC LIMIT 1"
+                    )
+                    if lr is not None:
+                        last_regime = str(lr)
+                except Exception:
+                    # Column may not exist in some deployments; do not fail the report.
+                    last_regime = "n/a"
+
         except Exception:
             LOG.exception("Failed to fetch PnL for report")
-            try:
-                cur.close()
-            except Exception:
-                pass
-            try:
-                conn.close()
-            except Exception:
-                pass
-            return ""
 
-        if not pnl_period:
-            # still show recent winrates if available
-            wr20 = _metrics(pnl_recent[:20])[4] if pnl_recent else 0.0
-            wr50 = _metrics(pnl_recent[:50])[4] if pnl_recent else 0.0
-            return f"📊 {period}: no closed trades | win20={wr20:.1f}% win50={wr50:.1f}%"
+        total_pnl = float(sum(period_pnls))
+        n_trades = int(len(period_pnls))
+        n_wins = int(sum(1 for x in period_pnls if x > 0))
+        n_losses = int(sum(1 for x in period_pnls if x < 0))
+        win_rate = (100.0 * n_wins / n_trades) if n_trades > 0 else 0.0
 
-        n, total_pnl, w, l, wr, pf, exp = _metrics(pnl_period)
-        wr20 = _metrics(pnl_recent[:20])[4] if pnl_recent else 0.0
-        wr50 = _metrics(pnl_recent[:50])[4] if pnl_recent else 0.0
+        sum_wins = float(sum(x for x in period_pnls if x > 0))
+        sum_losses_abs = float(-sum(x for x in period_pnls if x < 0))
+        pf = (sum_wins / sum_losses_abs) if sum_losses_abs > 0 else (float("inf") if sum_wins > 0 else 0.0)
 
-        pf_s = f"{pf:.2f}" if (pf != float("inf")) else "inf"
-        base = f"📊 {period}: closed={n} pnl={total_pnl:+.2f} win={wr:.1f}% ({w}/{l}) pf={pf_s} exp={exp:+.2f} | win20={wr20:.1f}% win50={wr50:.1f}%"
-        if last_regime:
-            base += f" | last_regime={last_regime}"
-        return base
+        report = (
+            f"📊 DONCH Report ({period})\n"
+            f"• Trades: {n_trades} | Wins: {n_wins} | Losses: {n_losses} | Win rate: {win_rate:.1f}%\n"
+            f"• Total PnL: {total_pnl:+.2f} | PF: {pf:.2f}\n"
+            f"• Last regime: {last_regime}\n"
+        )
+
+        # Optional: small recent snapshot (kept short)
+        if recent_pnls:
+            rsum = float(sum(recent_pnls))
+            report += f"• Recent (last 50): {rsum:+.2f}\n"
+
+        return report
+
 
 
     async def _deep_analysis_text(self, period: str = "30d") -> str:
