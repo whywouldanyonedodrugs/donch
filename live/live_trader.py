@@ -937,9 +937,10 @@ class LiveTrader:
             LOG.debug("OHLCV paged fetch failed %s %s: %s", symbol, tf, e)
             return None
 
-
     def _init_ohlcv_cache(self) -> None:
         self._ohlcv_cache: dict[tuple[str, str], pd.DataFrame] = {}
+        self._ohlcv_cache_ts: dict[tuple[str, str], float] = {}
+
 
     def _init_ohlcv_disk_cache(self) -> None:
         # Defaults: disabled unless explicitly enabled in cfg/YAML.
