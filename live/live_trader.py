@@ -5054,8 +5054,37 @@ class LiveTrader:
                     if lr is not None:
                         last_regime = str(lr)
                 except Exception:
-                    # Column may not exist in some deployments; do not fail the report.
-                    last_regime = "n/a"
+                    # Last regime (reporting only; must not affect trading decisions)
+                    rd = getattr(self, "regime_detector", None)
+                    if rd is None:
+                        last_regime = "n/a"
+                    else:
+                        # Prefer a dedicated label method if the detector has one
+                        last_regime = None
+                        for meth in ("report_label", "summary_label", "label", "summary"):
+                            fn = getattr(rd, meth, None)
+                            if callable(fn):
+                                try:
+                                    out = fn()
+                                    if out:
+                                        last_regime = str(out)
+                                        break
+                                except Exception:
+                                    pass
+
+                        # Fallback: stringify key regime/state fields already stored on the detector
+                        if not last_regime:
+                            fields = {}
+                            for k, v in getattr(rd, "__dict__", {}).items():
+                                kl = str(k).lower()
+                                if ("regime" in kl) or ("state" in kl) or ("prob" in kl):
+                                    fields[k] = v
+                            if fields:
+                                last_regime = ", ".join(f"{k}={fields[k]}" for k in sorted(fields.keys()))
+                            else:
+                                last_regime = "n/a"
+
+
 
         except Exception:
             LOG.exception("Failed to fetch PnL for report")
