@@ -2742,6 +2742,34 @@ class LiveTrader:
             eq_feats = self.feature_builder.compute_entry_quality_features(df5, decision_ts)
             meta_full.update(eq_feats)
 
+            # --- Backfill for event-age features that can be NaN if the history window is too short ---
+            ds = meta_full.get("days_since_prev_break", None)
+            if self._is_bad_numeric(ds):
+                # Use the disk-cache keep window as the first backfill target (fast if already cached).
+                backfill_bars = int(getattr(self, "_ohlcv_disk_keep_bars", 0) or 0)
+
+                # If you don't have disk-cache enabled for some reason, fall back to a config knob.
+                if backfill_bars <= 0:
+                    backfill_bars = int(self.cfg.get("ENTRY_QUAL_BACKFILL_BARS", 0))
+
+                if backfill_bars > 0:
+                    LOG.info(
+                        "ENTRY_QUAL_BACKFILL symbol=%s tf=%s from=%d to=%d (days_since_prev_break was NaN)",
+                        symbol, base_tf, int(len(df_base) if df_base is not None else 0), int(backfill_bars),
+                    )
+
+                    df_bf = await self._get_ohlcv(symbol, base_tf, min_bars=int(backfill_bars))
+                    if df_bf is not None and not df_bf.empty and len(df_bf) >= 3:
+                        # Recompute ONLY the entry-quality feats using the larger base window.
+                        eq_bf = self.feature_builder.compute_entry_quality_features(df_bf, decision_ts)
+                        meta_full.update(eq_bf)
+
+                        # Recompute the derived regime-set features that depend on entry-quality feats.
+                        # (If your code calls this later anyway, it is safe to call again; it just overwrites keys.)
+                        self._augment_meta_with_regime_sets(meta_full)
+
+
+
             # --- Strict-parity: regime-set derivations (includes risk_on / risk_on_1 for scope gating) ---
             try:
                 self._augment_meta_with_regime_sets(meta_full)

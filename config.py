@@ -113,10 +113,10 @@ VOLATILITY_FILTER_ENABLED = False
 MIN_ATR_PCT               = 0.005 # Min ATR as a percentage of price
 
 # ── portfolio / kill‑switches ─────────────────────────────────────────────
-MAX_OPEN            = 20          # max concurrent positions
+MAX_OPEN            = 10          # max concurrent positions
 MAX_LOSS_STREAK     = 20
-KILL_EQUITY_LEVEL   = 100.0        # USDT
-MIN_EQUITY_USDT     = 100.0
+KILL_EQUITY_LEVEL   = 50.0        # USDT
+MIN_EQUITY_USDT     = 50.0
 MAX_LEVERAGE        = 10
 MIN_NOTIONAL        = 0.0000001         # exchange min order size
 MIN_STOP_DIST_USD   = 0.0002

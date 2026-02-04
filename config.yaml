@@ -3,7 +3,7 @@ STRATEGY_SPEC_PATH: "strategies/donch_pullback_long.yaml"
 
 # Sizing
 RISK_MODE: "cash"           # or "percent"
-RISK_USD: 1.0              # used if RISK_MODE="cash"
+RISK_USD: 10.0              # used if RISK_MODE="cash"
 RISK_EQUITY_PCT: 0.01       # used if RISK_MODE="percent"
 MIN_TRADE_AUTOPAD_ENABLED: false
 MIN_TRADE_AUTOPAD_CAP_USD: 5.0
@@ -67,7 +67,7 @@ CORR_METHOD: "spearman"
 CORR_MAX_AVG: 0.90
 
 # correlation sizing (optional)
-CORR_SIZING_ENABLED: true
+CORR_SIZING_ENABLED: false
 CORR_SIZING_RHO_LO: 0.60
 CORR_SIZING_RHO_HI: 0.90
 CORR_SIZING_LO: 0.70
