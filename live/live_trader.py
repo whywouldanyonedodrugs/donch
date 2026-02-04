@@ -870,121 +870,114 @@ class LiveTrader:
     async def _fetch_ohlcv_df_paged(self, symbol: str, tf: str, limit: int) -> Optional[pd.DataFrame]:
         """
         Fetch `limit` candles via pagination (CCXT usually caps per-call limit).
-        Returns DataFrame indexed at BAR OPEN TIME (UTC), sorted ascending, and drops the last incomplete bar.
+        Returns DataFrame indexed at BAR OPEN TIME (CCXT timestamp), and drops the last incomplete bar.
         """
         try:
-            page_limit_cfg = int(self.cfg.get("OHLCV_PAGE_LIMIT", 1000))
-
-            # Exchange per-call limits vary; keep default conservative but configurable.
-            low_tf_max = int(self.cfg.get("OHLCV_PAGE_LIMIT_LOW_TF_MAX", 200))
-            if tf in ("1m", "3m", "5m", "15m", "30m"):
-                page_limit = min(page_limit_cfg, low_tf_max)
-            else:
-                page_limit = page_limit_cfg
-
-
+            page_limit = int(self.cfg.get("OHLCV_PAGE_LIMIT", 1000))
             tf_ms = int(_tf_to_timedelta(tf).total_seconds() * 1000)
 
-            need = int(limit) + 2  # +2 for safety; we drop last bar later
-            target = need + page_limit  # fetch extra buffer so we reach "now"
-            rows: list[list] = []
+            # We fetch a bit extra then drop last (possibly incomplete) bar.
+            need = int(limit) + 2
 
-            # Timeouts/progress (diagnostics only; does not affect parity math)
-            fetch_timeout_s = float(self.cfg.get("OHLCV_FETCH_TIMEOUT_S", 25.0))
-            progress_log_s = float(self.cfg.get("OHLCV_PROGRESS_LOG_S", 60.0))
+            # Timeouts / progress
+            page_timeout_s = float(self.cfg.get("OHLCV_PAGE_TIMEOUT_S", 20.0))
             total_timeout_s = float(self.cfg.get("OHLCV_TOTAL_TIMEOUT_S", 180.0))
+            progress_log_s = float(self.cfg.get("OHLCV_PROGRESS_LOG_S", 30.0))
 
-            t_start = time.perf_counter()
-            t_last_log = t_start
-            pages = 0
-
-            # Anchor since in the past; DO NOT start with since=None (would only return latest capped batch).
+            # Choose a deterministic-ish start so pagination actually collects `need` bars.
+            # Start at "now - need*tf" aligned to tf boundary.
             try:
-                now_ms = int(self.exchange.milliseconds())
+                end_ms = int(self.exchange.milliseconds())
             except Exception:
-                now_ms = int(time.time() * 1000)
+                end_ms = int(time.time() * 1000)
 
-            start_ms = now_ms - int(target * tf_ms)
-            since = start_ms
+            start_ms = end_ms - (need * tf_ms)
+            start_ms = start_ms - (start_ms % tf_ms)
+            since = int(start_ms)
 
-            # Pagination loop (forward in time)
-            while len(rows) < target:
-                req_limit = min(page_limit, target - len(rows))
-                prev_since = since
-                pages += 1
+            rows: list[list] = []
+            t0 = time.perf_counter()
+            t_last_log = t0
+            last_ts_seen: Optional[int] = None
+            n_pages = 0
+
+            while len(rows) < need:
+                # Total timeout guard
+                if (time.perf_counter() - t0) > total_timeout_s:
+                    LOG.error(
+                        "OHLCV_TOTAL_TIMEOUT symbol=%s tf=%s need=%d got=%d pages=%d elapsed=%.2fs",
+                        symbol, tf, need, len(rows), n_pages, (time.perf_counter() - t0)
+                    )
+                    break
+
+                req_limit = min(page_limit, need - len(rows))
 
                 try:
                     batch = await asyncio.wait_for(
                         self.exchange.fetch_ohlcv(symbol, tf, since=since, limit=req_limit),
-                        timeout=fetch_timeout_s,
+                        timeout=page_timeout_s,
                     )
                 except asyncio.TimeoutError:
-                    LOG.warning(
-                        "OHLCV_TIMEOUT symbol=%s tf=%s since_ms=%s limit=%d waited=%.1fs got=%d/%d pages=%d",
-                        symbol, tf, str(since), int(req_limit), float(fetch_timeout_s),
-                        int(len(rows)), int(target), int(pages),
+                    LOG.error(
+                        "OHLCV_PAGE_TIMEOUT symbol=%s tf=%s since=%s limit=%d timeout_s=%.1f got=%d pages=%d",
+                        symbol, tf, since, req_limit, page_timeout_s, len(rows), n_pages
                     )
                     break
+
+                n_pages += 1
 
                 if not batch:
                     break
 
-                # Ensure ascending timestamps and de-overlap
-                batch = sorted(batch, key=lambda r: r[0])
-                if rows:
-                    last_ts = rows[-1][0]
-                    batch = [r for r in batch if r[0] > last_ts]
-                    if not batch:
-                        break
+                # Detect non-advancing pagination (prevents infinite loops)
+                this_last = int(batch[-1][0])
+                if last_ts_seen is not None and this_last <= last_ts_seen:
+                    LOG.error(
+                        "OHLCV_NONADVANCING symbol=%s tf=%s since=%s last_ts_seen=%s this_last=%s pages=%d got=%d",
+                        symbol, tf, since, last_ts_seen, this_last, n_pages, len(rows)
+                    )
+                    break
+                last_ts_seen = this_last
 
                 rows.extend(batch)
+                since = this_last + tf_ms
 
-                # Advance "since" to just after the last returned candle open time
-                since = rows[-1][0] + tf_ms
-
-                # Safety: if we failed to advance, stop to avoid an infinite loop
-                if since <= prev_since:
-                    break
-
-                # Periodic progress log (so “Checking X…” doesn’t look like a hang)
                 now = time.perf_counter()
                 if (now - t_last_log) >= progress_log_s:
-                    last_ts = rows[-1][0] if rows else None
                     LOG.info(
-                        "OHLCV_PROGRESS symbol=%s tf=%s got=%d/%d pages=%d elapsed=%.1fs since_ms=%s last_ts_ms=%s",
-                        symbol, tf, int(len(rows)), int(target), int(pages), float(now - t_start),
-                        str(since), str(last_ts),
+                        "OHLCV_PROGRESS symbol=%s tf=%s got=%d/%d pages=%d elapsed=%.2fs",
+                        symbol, tf, len(rows), need, n_pages, (now - t0)
                     )
                     t_last_log = now
 
-                if (now - t_start) >= total_timeout_s:
-                    LOG.warning(
-                        "OHLCV_TOTAL_TIMEOUT symbol=%s tf=%s got=%d/%d pages=%d elapsed=%.1fs",
-                        symbol, tf, int(len(rows)), int(target), int(pages), float(now - t_start),
-                    )
-                    break
-
+                # Small yield to keep loop responsive even under heavy paging
+                await asyncio.sleep(0)
 
             if len(rows) < 2:
                 return None
 
+            # Build DF
             df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
             df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
             df = df.set_index("timestamp").sort_index()
 
-            # Drop last possibly-incomplete bar
-            if len(df) > 1:
+            # Drop duplicate timestamps (can happen with exchange quirks)
+            df = df[~df.index.duplicated(keep="last")]
+
+            # Drop last (possibly incomplete) bar deterministically
+            if len(df) >= 2:
                 df = df.iloc[:-1]
 
-            # Keep only last `limit` rows (the most recent window)
-            if len(df) > limit:
-                df = df.iloc[-limit:]
+            # Enforce exact window size
+            if len(df) > int(limit):
+                df = df.iloc[-int(limit):]
 
             return df
 
         except Exception as e:
-            LOG.debug("OHLCV paged fetch failed %s %s: %s", symbol, tf, e)
+            LOG.exception("Error fetching OHLCV paged for %s %s: %s", symbol, tf, e)
             return None
+
 
 
     def _init_ohlcv_cache(self) -> None:
@@ -1064,13 +1057,16 @@ class LiveTrader:
             df_flush = df
 
         try:
-            await asyncio.to_thread(
-                store.upsert_df,
-                symbol,
-                tf,
-                df_flush,
-                keep_last=int(getattr(self, "_ohlcv_disk_keep_bars", 20000)),
-            )
+            flush_timeout_s = float(self.cfg.get("OHLCV_DISK_FLUSH_TIMEOUT_S", 15.0))
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(self._ohlcv_store.upsert_df, symbol, tf, df_flush),
+                    timeout=flush_timeout_s,
+                )
+            except asyncio.TimeoutError:
+                LOG.error("OHLCV_DISK_FLUSH_TIMEOUT symbol=%s tf=%s rows=%d timeout_s=%.1f", symbol, tf, len(df_flush), flush_timeout_s)
+                return
+
             self._ohlcv_disk_last_flush[key] = last_ts
         except Exception as e:
             LOG.warning("OHLCV_DISK_FLUSH_FAIL symbol=%s tf=%s err=%s", symbol, tf, e)
@@ -1096,7 +1092,17 @@ class LiveTrader:
                     # Load at least min_bars, but allow config to request a larger warm-start window.
                     load_bars = int(self.cfg.get("OHLCV_DISK_LOAD_BARS", min_bars))
                     load_bars = max(load_bars, int(min_bars))
-                    df_disk = await asyncio.to_thread(self._ohlcv_store.load, symbol, tf, limit_bars=load_bars)
+
+                    load_timeout_s = float(self.cfg.get("OHLCV_DISK_LOAD_TIMEOUT_S", 10.0))
+                    try:
+                        df_disk = await asyncio.wait_for(
+                            asyncio.to_thread(self._ohlcv_store.load, symbol, tf=tf, limit=load_bars),
+                            timeout=load_timeout_s,
+                        )
+                    except asyncio.TimeoutError:
+                        LOG.error("OHLCV_DISK_LOAD_TIMEOUT symbol=%s tf=%s limit=%d timeout_s=%.1f", symbol, tf, load_bars, load_timeout_s)
+                        df_disk = None
+
                     if df_disk is not None and not df_disk.empty:
                         df = df_disk
                         self._ohlcv_cache[key] = df
@@ -1152,29 +1158,30 @@ class LiveTrader:
 
             return df
 
-
     async def _fetch_ohlcv_df_simple(self, symbol: str, tf: str, limit: int) -> Optional[pd.DataFrame]:
-        """
-        Minimal OHLCV fetch -> DataFrame with UTC datetime index at BAR OPEN (left-labeled),
-        matching offline/base semantics. Drops the last bar if it is still forming.
-        """
         try:
-            ohlcv = await self.exchange.fetch_ohlcv(symbol, tf, limit=limit)
-            if not ohlcv:
+            page_timeout_s = float(self.cfg.get("OHLCV_PAGE_TIMEOUT_S", 20.0))
+            ohlcv = await asyncio.wait_for(
+                self.exchange.fetch_ohlcv(symbol, tf, limit=int(limit)),
+                timeout=page_timeout_s,
+            )
+            if not ohlcv or len(ohlcv) < 2:
                 return None
 
             df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
-            # CCXT timestamps are candle OPEN time; keep as OPEN time for parity with offline base candles
             df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
             df = df.set_index("timestamp").sort_index()
+            df = df[~df.index.duplicated(keep="last")]
 
-            # Drop last bar deterministically (conservative; avoids wall-clock leakage)
-            if len(df) > 1:
-                df = df.iloc[:-1]
+            # Drop last incomplete bar
+            df = df.iloc[:-1]
 
             return df
+        except asyncio.TimeoutError:
+            LOG.error("OHLCV_SIMPLE_TIMEOUT symbol=%s tf=%s limit=%s timeout_s=%.1f", symbol, tf, limit, page_timeout_s)
+            return None
         except Exception as e:
-            LOG.debug("OHLCV fetch failed %s %s: %s", symbol, tf, e)
+            LOG.exception("Error fetching OHLCV simple for %s %s: %s", symbol, tf, e)
             return None
 
     def _asof_series_value(self, s: pd.Series, ts: pd.Timestamp) -> float:
