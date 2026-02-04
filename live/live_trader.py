@@ -868,11 +868,13 @@ class LiveTrader:
         try:
             page_limit_cfg = int(self.cfg.get("OHLCV_PAGE_LIMIT", 1000))
 
-            # Bybit v5 commonly caps low timeframes to ~200 candles per call.
+            # Exchange per-call limits vary; keep default conservative but configurable.
+            low_tf_max = int(self.cfg.get("OHLCV_PAGE_LIMIT_LOW_TF_MAX", 200))
             if tf in ("1m", "3m", "5m", "15m", "30m"):
-                page_limit = min(page_limit_cfg, 200)
+                page_limit = min(page_limit_cfg, low_tf_max)
             else:
                 page_limit = page_limit_cfg
+
 
             tf_ms = int(_tf_to_timedelta(tf).total_seconds() * 1000)
 
@@ -883,6 +885,8 @@ class LiveTrader:
             # Timeouts/progress (diagnostics only; does not affect parity math)
             fetch_timeout_s = float(self.cfg.get("OHLCV_FETCH_TIMEOUT_S", 25.0))
             progress_log_s = float(self.cfg.get("OHLCV_PROGRESS_LOG_S", 60.0))
+            total_timeout_s = float(self.cfg.get("OHLCV_TOTAL_TIMEOUT_S", 180.0))
+
             t_start = time.perf_counter()
             t_last_log = t_start
             pages = 0
@@ -938,11 +942,21 @@ class LiveTrader:
                 # Periodic progress log (so “Checking X…” doesn’t look like a hang)
                 now = time.perf_counter()
                 if (now - t_last_log) >= progress_log_s:
+                    last_ts = rows[-1][0] if rows else None
                     LOG.info(
-                        "OHLCV_PROGRESS symbol=%s tf=%s got=%d/%d pages=%d elapsed=%.1fs",
+                        "OHLCV_PROGRESS symbol=%s tf=%s got=%d/%d pages=%d elapsed=%.1fs since_ms=%s last_ts_ms=%s",
                         symbol, tf, int(len(rows)), int(target), int(pages), float(now - t_start),
+                        str(since), str(last_ts),
                     )
                     t_last_log = now
+
+                if (now - t_start) >= total_timeout_s:
+                    LOG.warning(
+                        "OHLCV_TOTAL_TIMEOUT symbol=%s tf=%s got=%d/%d pages=%d elapsed=%.1fs",
+                        symbol, tf, int(len(rows)), int(target), int(pages), float(now - t_start),
+                    )
+                    break
+
 
             if len(rows) < 2:
                 return None
@@ -991,7 +1005,27 @@ class LiveTrader:
         self._ohlcv_disk_tfs = {str(x).strip() for x in (tfs or []) if str(x).strip()}
 
         self._ohlcv_disk_flush_bars = int(self.cfg.get("OHLCV_DISK_FLUSH_BARS", 12))  # 12x5m=1h default
-        self._ohlcv_disk_keep_bars = int(self.cfg.get("OHLCV_DISK_KEEP_BARS", 20000))
+
+        # Ensure keep_bars is sufficient for the configured warmup requirements (parity-safe: cache only).
+        # GOV ctx uses GOV_CTX_DAYS_5M * 288 + 500 (see _get_gov_ctx).
+        gov_days = int(self.cfg.get("GOV_CTX_DAYS_5M", 60))
+        req_gov_5m = gov_days * 288 + 500
+
+        # Symbol scan uses the base_limit derived from VOL_LOOKBACK/DON_N_DAYS/VOL_CAP_BARS (5m base).
+        vol_days = int(self.cfg.get("VOL_LOOKBACK_DAYS", 30)) + 2
+        don_days = int(self.cfg.get("DON_N_DAYS", 20)) + 2
+        req_scan_5m = max(1500, 288 * vol_days, 288 * don_days, int(self.cfg.get("VOL_CAP_BARS", 9000)))
+
+        default_keep = max(20000, req_gov_5m, req_scan_5m)
+        keep_cfg = int(self.cfg.get("OHLCV_DISK_KEEP_BARS", default_keep))
+        self._ohlcv_disk_keep_bars = max(keep_cfg, default_keep)
+
+        if self._ohlcv_disk_keep_bars < req_gov_5m:
+            LOG.warning(
+                "OHLCV disk keep_bars too small for GOV_CTX: keep=%d req=%d (GOV_CTX_DAYS_5M=%d)",
+                int(self._ohlcv_disk_keep_bars), int(req_gov_5m), int(gov_days),
+            )
+
 
         LOG.info(
             "OHLCV disk cache enabled: sqlite=%s tfs=%s flush_bars=%d keep_bars=%d",
@@ -1034,7 +1068,8 @@ class LiveTrader:
         except Exception as e:
             LOG.warning("OHLCV_DISK_FLUSH_FAIL symbol=%s tf=%s err=%s", symbol, tf, e)
 
-    async def _get_ohlcv(self, symbol: str, tf: str, min_bars: int) -> pd.DataFrame:
+    async def _get_ohlcv(self, symbol: str, tf: str, min_bars: int) -> Optional[pd.DataFrame]:
+
         """
         Returns OHLCV indexed at candle OPEN time (UTC), with the last incomplete bar removed.
         Uses in-memory cache; optionally uses disk-backed SQLite cache to survive restarts.
@@ -1070,12 +1105,22 @@ class LiveTrader:
                 dt = time.perf_counter() - t0
                 if dt > 5.0:
                     LOG.warning("SLOW_OHLCV symbol=%s tf=%s bars=%d took=%.2fs", symbol, tf, min_bars, dt)
+
+                # Fail-closed: if we couldn't obtain the required history window, do not trade on it.
+                if df is None or df.empty or len(df) < int(min_bars):
+                    LOG.warning(
+                        "OHLCV_INSUFFICIENT symbol=%s tf=%s have=%s need=%d",
+                        symbol, tf, 0 if df is None else int(len(df)), int(min_bars),
+                    )
+                    return None
+
                 self._ohlcv_cache[key] = df
                 self._ohlcv_cache_ts[key] = time.time()
 
                 # Force flush the full window once (rate-limited later).
                 await self._maybe_flush_ohlcv_to_disk(symbol, tf, df, force=True)
                 return df
+
 
             # Incremental refresh (tail fetch) — merge/dedup and keep last min_bars.
             tail = int(self.cfg.get("OHLCV_TAIL_FETCH", 400))
@@ -2256,10 +2301,23 @@ class LiveTrader:
             need_cap = int(self.cfg.get("VOL_CAP_BARS", 9000))
             base_limit = max(1500, need_vol, need_don, need_cap)
 
+            slow_s = float(self.cfg.get("SLOW_OHLCV_WARN_S", 8.0))
+
             t0_fetch = time.perf_counter()
-            async with self.api_semaphore:
+            t0_sem = time.perf_counter()
+            await self.api_semaphore.acquire()
+            sem_wait = time.perf_counter() - t0_sem
+            if sem_wait >= 1.0:
+                LOG.warning("API_SEM_WAIT symbol=%s waited=%.2fs", symbol, float(sem_wait))
+            try:
                 df_base = await self._get_ohlcv(symbol, base_tf, min_bars=base_limit)
+            finally:
+                self.api_semaphore.release()
+
             dt_fetch = time.perf_counter() - t0_fetch
+            if dt_fetch >= slow_s:
+                LOG.warning("SLOW_OHLCV symbol=%s tf=%s bars=%d took=%.2fs", symbol, base_tf, int(base_limit), dt_fetch)
+
             slow_s = float(self.cfg.get("SLOW_OHLCV_WARN_S", 8.0))
             if dt_fetch >= slow_s:
                 LOG.warning("SLOW_OHLCV symbol=%s tf=%s bars=%d took=%.2fs", symbol, base_tf, int(base_limit), dt_fetch)
