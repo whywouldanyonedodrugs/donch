@@ -1807,6 +1807,38 @@ class LiveTrader:
             except Exception:
                 pass
 
+    def _is_bad_numeric(self, v) -> bool:
+        """
+        Fail-closed numeric validity check for required features.
+        Returns True if v is missing/invalid (None, NaN, inf, non-scalar, non-parsable).
+        """
+        if v is None:
+            return True
+
+        # bool is acceptable (common model feature encoding)
+        if isinstance(v, (bool, np.bool_)):
+            return False
+
+        # numpy numeric scalars
+        if isinstance(v, (np.integer, np.floating)):
+            return not np.isfinite(float(v))
+
+        # python numeric scalars
+        if isinstance(v, (int, float)):
+            return not np.isfinite(float(v))
+
+        # strings: attempt parse
+        if isinstance(v, str):
+            s = v.strip()
+            if s == "":
+                return True
+            try:
+                return not np.isfinite(float(s))
+            except Exception:
+                return True
+
+        # anything else: treat as invalid (fail-closed)
+        return True
 
 
     def _missing_required_features(self, row: dict, required: list[str]) -> list[str]:
