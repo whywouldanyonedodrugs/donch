@@ -2318,45 +2318,46 @@ class LiveTrader:
             # ---------------- OHLCV fetch (PARITY: fetch base TF only; resample HTFs) ----------------
             bars_per_day = int(pd.Timedelta("1D") / _tf_to_timedelta(base_tf))
 
-            need_vol = bars_per_day * (int(self.cfg.get("VOL_LOOKBACK_DAYS", 30)) + 2)
-            need_don = bars_per_day * (int(self.cfg.get("DON_N_DAYS", 20)) + 2)
-            need_cap = int(self.cfg.get("VOL_CAP_BARS", 9000))
-            base_limit = max(1500, need_vol, need_don, need_cap)
+            vol_days = int(self.cfg.get("VOL_LOOKBACK_DAYS", 30))
+            don_days = int(self.cfg.get("DON_N_DAYS", 20))
+            cap_bars = int(self.cfg.get("VOL_CAP_BARS", 9000))
+
+            need_vol = bars_per_day * (vol_days + 2)
+            need_don = bars_per_day * (don_days + 2)
+
+            # Base requirement from feature lookbacks (floored at 1500)
+            need_base = max(1500, need_vol, need_don)
+
+            # Treat VOL_CAP_BARS as a hard cap (not a floor)
+            base_limit = min(need_base, cap_bars)
+
+            # Optional: log the computed requirement so you can confirm it matches expectations
+            LOG.info(
+                "OHLCV_LIMIT symbol=%s base_tf=%s bars_per_day=%d vol_days=%d don_days=%d cap_bars=%d need_vol=%d need_don=%d base_limit=%d",
+                symbol, base_tf, int(bars_per_day), int(vol_days), int(don_days), int(cap_bars),
+                int(need_vol), int(need_don), int(base_limit),
+            )
 
             slow_s = float(self.cfg.get("SLOW_OHLCV_WARN_S", 8.0))
 
             t0_fetch = time.perf_counter()
-
-            # Semaphore acquisition (instrument + bounded)
-            acq_timeout_s = float(self.cfg.get("API_SEM_ACQUIRE_TIMEOUT_S", 30.0))
             t0_sem = time.perf_counter()
-            try:
-                await asyncio.wait_for(self.api_semaphore.acquire(), timeout=acq_timeout_s)
-            except asyncio.TimeoutError:
-                sem_wait = time.perf_counter() - t0_sem
-                LOG.error(
-                    "API_SEM_ACQUIRE_TIMEOUT symbol=%s waited=%.2fs timeout_s=%.1f",
-                    symbol, float(sem_wait), float(acq_timeout_s),
-                )
-                LOG.warning("SCAN_SKIP symbol=%s stage=api_sem_timeout tf=%s", symbol, base_tf)
-                return None
-
+            await self.api_semaphore.acquire()
             sem_wait = time.perf_counter() - t0_sem
             if sem_wait >= 1.0:
                 LOG.warning("API_SEM_WAIT symbol=%s waited=%.2fs", symbol, float(sem_wait))
-
             try:
                 df_base = await self._get_ohlcv(symbol, base_tf, min_bars=base_limit)
             finally:
                 self.api_semaphore.release()
 
             dt_fetch = time.perf_counter() - t0_fetch
-            slow_s = float(self.cfg.get("SLOW_OHLCV_WARN_S", 8.0))
             if dt_fetch >= slow_s:
                 LOG.warning(
                     "SLOW_OHLCV symbol=%s tf=%s bars=%d took=%.2fs",
-                    symbol, base_tf, int(base_limit), float(dt_fetch),
+                    symbol, base_tf, int(base_limit), dt_fetch
                 )
+
 
 
 
