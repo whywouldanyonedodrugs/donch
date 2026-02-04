@@ -74,6 +74,12 @@ import logging
 logging.getLogger("watchdog").setLevel(logging.WARNING)
 logging.getLogger("watchdog.observers.inotify_buffer").setLevel(logging.WARNING)
 
+try:
+    import psycopg2
+except Exception:
+    psycopg2 = None
+
+
 UNIVERSE_CACHE_PATH = Path("universe_cache.json")
 
 REGIME_CODE_MAP = {
@@ -4508,7 +4514,14 @@ class LiveTrader:
                             self._wd_stage = "scan"
                             self._wd_since = time.time()
 
-                            scan_timeout_s = float(self.cfg.get("SCAN_SYMBOL_TIMEOUT_S", 60.0))
+                            scan_timeout_s = float(
+                                self.cfg.get(
+                                    "SCAN_SYMBOL_TIMEOUT_S",
+                                    float(self.cfg.get("OHLCV_TOTAL_TIMEOUT_S", 180.0)) + 60.0,
+                                )
+                            )
+
+
                             try:
                                 signal = await asyncio.wait_for(
                                     self._scan_symbol_for_signal(
@@ -4529,8 +4542,8 @@ class LiveTrader:
 
 
                         except Exception as e:
-                            if self._maybe_quarantine_symbol(symbol, e, where="scan_exception"):
-                                return None
+                            if self._maybe_quarantine_symbol(sym, e, where="scan_exception"):
+                                continue
 
 
 
@@ -4932,6 +4945,12 @@ class LiveTrader:
         LOG.info("<-- Resume complete.")
 
     def _generate_summary_report(self, period: str = "6h") -> str:
+
+        if psycopg2 is None:
+            LOG.error("Reporting PnL unavailable: psycopg2 not installed/importable.")
+            # Return report without DB PnL section (or return an empty PnL dict)
+            return "PnL unavailable (psycopg2 missing)."
+
         now = datetime.now(timezone.utc)
         if period == "6h":
             start = now - timedelta(hours=6)
