@@ -218,10 +218,21 @@ def compute_daily_regime_snapshot(daily_ohlc: pd.DataFrame, *, asof_ts: Any, cfg
         raise ValueError(f"compute_daily_regime_snapshot: no row asof={asof} (min={ser.index.min()} max={ser.index.max()})")
 
     row = ser2.iloc[-1]
+
+    name = str(row.get("regime_name", "UNKNOWN"))
+    if name.lower() == "nan":
+        name = "UNKNOWN"
+
     return {
         "regime_code_1d": int(row["regime_code"]),
         "vol_prob_low_1d": float(row["vol_prob_low"]),
+
+        # Text labels used by live_trader.RegimeDetector and optional downstream logic
+        "daily_regime_str_1d": name,
+        "trend_regime_1d": "BULL" if "BULL" in name else "BEAR",
+        "vol_regime_1d": "LOW_VOL" if "LOW_VOL" in name else "HIGH_VOL",
     }
+
 
 
 def compute_markov4h_series(

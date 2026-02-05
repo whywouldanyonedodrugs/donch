@@ -53,7 +53,9 @@ from .database import DB
 from .telegram import TelegramBot
 from .winprob_loader import WinProbScorer
 from .golden_features import GoldenFeatureStore
-from .regime_features import compute_daily_regime_snapshot, compute_markov4h_snapshot, drop_incomplete_last_bar
+
+from .regime_features import RegimeConfig, compute_daily_regime_snapshot, compute_markov4h_snapshot, drop_incomplete_last_bar
+
 from .regime_truth import macro_regimes_asof
 
 from .online_state import OnlinePerformanceState
@@ -297,17 +299,18 @@ class RegimeDetector:
             df_d = self._to_ohlcv_df(ohlcv_d)
             df_d = drop_incomplete_last_bar(df_d, "1d", asof_ts)
 
+            # Daily regime snapshot (offline parity)
             ma_period = int(getattr(cfg, "REGIME_MA_PERIOD", 100))
             atr_period = int(getattr(cfg, "REGIME_ATR_PERIOD", 20))
             atr_mult = float(getattr(cfg, "REGIME_ATR_MULT", 2.0))
 
+            reg_cfg = RegimeConfig(ma_period=ma_period, atr_period=atr_period, atr_mult=atr_mult)
             snap = compute_daily_regime_snapshot(
                 df_d,
                 asof_ts=asof_ts,
-                ma_period=ma_period,
-                atr_period=atr_period,
-                atr_mult=atr_mult,
+                cfg=reg_cfg,
             )
+
 
             self._cached_regime = str(snap["daily_regime_str_1d"])
             self._cached_day_key = day_key
@@ -1426,7 +1429,9 @@ class LiveTrader:
                     raise RuntimeError("empty 4h frame")
 
                 df4 = drop_incomplete_last_bar(df4, "4h", decision_ts_gov)
-                snap = compute_markov4h_snapshot(df4, asof_ts=decision_ts_gov, ewma_alpha=alpha)
+
+                markov_cfg = RegimeConfig(markov4h_prob_ewma_alpha=alpha)
+                snap = compute_markov4h_snapshot(df4, asof_ts=decision_ts_gov, cfg=markov_cfg)
 
                 ctx["markov_prob_up_4h"] = float(snap["markov_prob_up_4h"])
                 ctx["markov_state_4h"] = int(snap["markov_state_4h"])
@@ -2636,10 +2641,12 @@ class LiveTrader:
 
             rs_pct = float(univ.get("rs_pct", 0.0) or 0.0)
 
-            # ETH MACD hist & above-signal
             eth_hist = float((eth_macd or {}).get("hist", 0.0) or 0.0)
             eth_above = 1.0 if float((eth_macd or {}).get("macd", 0.0)) > float((eth_macd or {}).get("signal", 0.0)) else 0.0
-            regime_up = 1.0 if (eth_hist > 0 and eth_above == 1.0) else 0.0
+
+            # Offline parity: regime_up is ETH 4h MACD histogram sign only.
+            regime_up = 1.0 if eth_hist > 0 else 0.0
+
 
             # time cyclicals (strict-parity): derive from the decision timestamp, not wall-clock now()
             ts_utc = decision_ts if decision_ts is not None else df5.index[-1].to_pydatetime()
