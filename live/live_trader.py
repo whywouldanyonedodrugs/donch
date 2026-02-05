@@ -2808,10 +2808,90 @@ class LiveTrader:
             except Exception as e:
                 LOG.warning("bundle=%s augment_meta_with_regime_sets failed: %s", getattr(self, "bundle_id", "no_bundle"), e)
 
-            # ---- Sprint 2 / Option A: freeze macro regime inputs from golden truth ----
-            macro = macro_regimes_asof(self.meta_bundle, decision_ts) if getattr(self, "meta_bundle", None) is not None else {}
-            if isinstance(macro, dict) and macro:
-                meta_full.update(macro)
+            # ---- Optional: macro regime truth override (parity diagnostics only; default OFF) ----
+            # Production MUST NOT silently clamp/ffill beyond the truth parquet range.
+            if bool(self.cfg.get("REGIME_TRUTH_OVERRIDE", False)):
+                try:
+                    # Determine the truth max timestamp once per bundle (fail-closed).
+                    cache_key = getattr(self, "bundle_id", None)
+                    if (
+                        getattr(self, "_regime_truth_max_ts_bundle_id", None) != cache_key
+                        or getattr(self, "_regime_truth_max_ts_cache", None) is None
+                    ):
+                        def _max_ts_from_parquet(path_obj) -> Optional[pd.Timestamp]:
+                            if not path_obj:
+                                return None
+                            p = Path(str(path_obj))
+                            if not p.exists():
+                                return None
+                            df = pd.read_parquet(p)
+                            # Prefer datetime index
+                            if isinstance(df.index, pd.DatetimeIndex):
+                                mx = df.index.max()
+                                return pd.to_datetime(mx, utc=True, errors="coerce")
+                            # Fallback to common timestamp columns
+                            for c in ("ts", "timestamp", "time", "date", "asof_ts", "asof"):
+                                if c in df.columns:
+                                    s = pd.to_datetime(df[c], utc=True, errors="coerce")
+                                    if s.notna().any():
+                                        return pd.to_datetime(s.max(), utc=True, errors="coerce")
+                            return None
+
+                        daily_p = getattr(self.meta_bundle, "regime_daily_truth_path", None) if getattr(self, "meta_bundle", None) is not None else None
+                        markov_p = getattr(self.meta_bundle, "regime_markov4h_truth_path", None) if getattr(self, "meta_bundle", None) is not None else None
+
+                        daily_max = _max_ts_from_parquet(daily_p)
+                        markov_max = _max_ts_from_parquet(markov_p)
+
+                        # Fail-closed: require BOTH to be present and parseable.
+                        if daily_max is None or markov_max is None:
+                            truth_max = None
+                        else:
+                            truth_max = min(daily_max, markov_max)
+
+                        self._regime_truth_max_ts_bundle_id = cache_key
+                        self._regime_truth_max_ts_cache = truth_max
+
+                    truth_max = getattr(self, "_regime_truth_max_ts_cache", None)
+
+                    if truth_max is None:
+                        LOG.warning(
+                            "bundle=%s REGIME_TRUTH_OVERRIDE disabled (cannot determine truth max ts).",
+                            getattr(self, "bundle_id", "no_bundle"),
+                        )
+                    else:
+                        decision_ts_u = pd.to_datetime(decision_ts, utc=True, errors="coerce")
+                        if pd.isna(decision_ts_u):
+                            raise ValueError("invalid decision_ts for REGIME_TRUTH_OVERRIDE")
+
+                        # Hard stop: never apply truth beyond its coverage unless explicitly allowed.
+                        allow_stale = bool(self.cfg.get("REGIME_TRUTH_ALLOW_STALE", False))
+                        if (decision_ts_u > truth_max) and (not allow_stale):
+                            LOG.warning(
+                                "bundle=%s REGIME_TRUTH_OVERRIDE skipped (decision_ts=%s beyond truth_max_ts=%s).",
+                                getattr(self, "bundle_id", "no_bundle"),
+                                str(decision_ts_u),
+                                str(truth_max),
+                            )
+                        else:
+                            macro = (
+                                macro_regimes_asof(self.meta_bundle, decision_ts_u)
+                                if getattr(self, "meta_bundle", None) is not None
+                                else {}
+                            )
+                            if isinstance(macro, dict) and macro:
+                                meta_full.update(macro)
+
+                except Exception as e:
+                    LOG.warning(
+                        "bundle=%s REGIME_TRUTH_OVERRIDE failed (disabled for this cycle): %s",
+                        getattr(self, "bundle_id", "no_bundle"),
+                        e,
+                    )
+            # -----------------------------------------------------------------------
+
+
+
 
             # Keep regime_up consistent with regime_code_1d (if regime_up is still used downstream)
             # (Adjust mapping only if your offline team defines it differently.)
