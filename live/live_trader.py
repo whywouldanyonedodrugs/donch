@@ -1426,7 +1426,8 @@ class LiveTrader:
                     raise RuntimeError("empty 4h frame")
 
                 df4 = drop_incomplete_last_bar(df4, "4h", decision_ts_gov)
-                snap = compute_markov4h_snapshot(df4, asof_ts=decision_ts_gov, alpha=alpha)
+                snap = compute_markov4h_snapshot(df4, asof_ts=decision_ts_gov, ewma_alpha=alpha)
+
                 ctx["markov_prob_up_4h"] = float(snap["markov_prob_up_4h"])
                 ctx["markov_state_4h"] = int(snap["markov_state_4h"])
                 ctx.setdefault("markov_state_up_4h", int(snap["markov_state_4h"]))
