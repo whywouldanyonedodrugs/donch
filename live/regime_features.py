@@ -116,7 +116,9 @@ def compute_daily_regime_series(
     close = df["close"].astype(float)
 
     tma = _triangular_moving_average(close, int(ma_period))
-    atr = ta.atr(df[["open", "high", "low", "close"]], length=int(atr_period)).astype(float)
+
+    atr = ta.atr(df[["open", "high", "low", "close"]], int(atr_period)).astype(float)
+
 
     upper = tma + float(atr_mult) * atr
     lower = tma - float(atr_mult) * atr

@@ -401,11 +401,19 @@ class LiveTrader:
 
         # Exchange & regime detector
         self.exchange = ExchangeProxy(self._init_ccxt())
+
+        bench_sym = self.cfg.get("REGIME_BENCHMARK_SYMBOL")
+        if not bench_sym:
+            bench_sym = self.cfg.get("REGIME_ASSET")
+        if not bench_sym:
+            bench_sym = "ETHUSDT"
+
         self.regime_detector = RegimeDetector(
             self.exchange,
-            self.cfg.get("REGIME_BENCHMARK_SYMBOL", "ETHUSDT"),
+            bench_sym,
             int(self.cfg.get("REGIME_CACHE_MINUTES", 60)),
         )
+
 
 
         self.symbols = self._load_symbols()
