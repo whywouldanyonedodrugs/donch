@@ -2898,18 +2898,14 @@ class LiveTrader:
                     )
             # -----------------------------------------------------------------------
 
-
-
-
-            # Keep regime_up consistent with regime_code_1d (if regime_up is still used downstream)
-            # (Adjust mapping only if your offline team defines it differently.)
-            try:
-                rc = int(meta_full["regime_code_1d"])
-                meta_full["regime_up"] = 1 if rc in (2, 3) else 0
-            except Exception:
-                pass
-            # -------------------------------------------------------------------------
-
+            # regime_up (offline parity): derived from ETHUSDT 4h MACD histogram sign.
+            # IMPORTANT: do NOT overwrite regime_up from regime_code_1d (different concept).
+            # If regime_up is missing, leave it missing so strict schema validation fails closed.
+            if ("regime_up" not in meta_full) or pd.isna(meta_full.get("regime_up")):
+                LOG.warning(
+                    "bundle=%s missing regime_up after ETH MACD computation; leaving missing for fail-closed schema.",
+                    getattr(self, "bundle_id", "no_bundle"),
+                )
 
 
             # ---------------- 10. Strict Slice & Score ----------------
