@@ -170,7 +170,7 @@ SYMBOL_COOLDOWN_HOURS = 4    # skip new signals for the same symbol during X h
 # Parameters for the live market regime detector.
 
 # The benchmark asset to determine the overall market state (e.g., BTCUSDT, ETHUSDT).
-REGIME_BENCHMARK_SYMBOL = "BTCUSDT"
+REGIME_BENCHMARK_SYMBOL = "ETHUSDTS"
 
 # How many minutes to cache the calculated regime before re-calculating.
 # A value of 60 means it will run the calculation at most once per hour.

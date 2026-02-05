@@ -256,10 +256,17 @@ def compute_markov4h_series(
     p0 = res.filtered_marginal_probabilities[0]
     p1 = res.filtered_marginal_probabilities[1]
 
-    # Weighted mean returns under filtered probs
     m0 = float((ret * p0).sum() / max(1e-12, float(p0.sum())))
     m1 = float((ret * p1).sum() / max(1e-12, float(p1.sum())))
-    up_state = 0 if m0 > m1 else 1
+
+    # Bundle-truth parity:
+    # The exported `markov_prob_up_4h` / `markov_state_4h` in meta_export behaves like the complement
+    # of the "up-state = higher mean return" convention. Empirically: p_truth ≈ 1 - p_int and
+    # state_truth ≈ 1 - state_int across truth timestamps.
+    #
+    # Therefore we define the "up" state here as the regime with the LOWER weighted-mean return.
+    up_state = 0 if m0 < m1 else 1
+
 
     prob_up_raw = (p0 if up_state == 0 else p1).reindex(df.index).ffill()
     prob_up = prob_up_raw.ewm(alpha=float(prob_ewma_alpha), adjust=False).mean()
