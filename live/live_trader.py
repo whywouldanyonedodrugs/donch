@@ -403,7 +403,7 @@ class LiveTrader:
         self.exchange = ExchangeProxy(self._init_ccxt())
         self.regime_detector = RegimeDetector(
             self.exchange,
-            self.cfg.get("REGIME_BENCHMARK_SYMBOL", "BTCUSDT"),
+            self.cfg.get("REGIME_BENCHMARK_SYMBOL", "ETHUSDT"),
             int(self.cfg.get("REGIME_CACHE_MINUTES", 60)),
         )
 

@@ -1,307 +1,302 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Any
+from typing import Any, Dict, Optional
 
 import numpy as np
 import pandas as pd
-
 from statsmodels.tsa.regime_switching.markov_regression import MarkovRegression
 
 from . import indicators as ta
 
 
-# Offline label mapping: keep stable codes
+# Offline mapping (per offline team):
+# {"BEAR_HIGH_VOL":0, "BEAR_LOW_VOL":1, "BULL_HIGH_VOL":2, "BULL_LOW_VOL":3}
 REGIME_CODE_MAP = {
-    "BULL_LOW_VOL": 0,
-    "BULL_HIGH_VOL": 1,
-    "BEAR_LOW_VOL": 2,
-    "BEAR_HIGH_VOL": 3,
+    "BEAR_HIGH_VOL": 0,
+    "BEAR_LOW_VOL": 1,
+    "BULL_HIGH_VOL": 2,
+    "BULL_LOW_VOL": 3,
 }
 
 
 @dataclass(frozen=True)
 class RegimeConfig:
-    # If True, assume the input OHLCV is already right-labeled (bar close timestamps).
-    # If False, a shift may be applied for some datasets.
-    assume_right_labeled_input: bool = True
+    # Match offline defaults (per offline team note)
+    ma_period: int = 200
+    atr_period: int = 20
+    atr_mult: float = 2.0
+    markov4h_prob_ewma_alpha: float = 0.2
 
 
-def _ensure_utc_ts(ts: pd.Timestamp) -> pd.Timestamp:
-    ts = pd.to_datetime(ts, utc=True, errors="coerce")
-    if pd.isna(ts):
-        raise ValueError("Invalid timestamp")
-    if ts.tz is None:
-        ts = ts.tz_localize("UTC")
-    else:
-        ts = ts.tz_convert("UTC")
-    return ts
-
-
-def drop_incomplete_last_bar(df: pd.DataFrame, tf: str, asof_ts: Optional[pd.Timestamp] = None) -> pd.DataFrame:
-    """
-    Drop the last (possibly still forming) bar from df.
-
-    Backward/forward compatible:
-      - Older call-sites: drop_incomplete_last_bar(df, tf)
-      - Newer call-sites: drop_incomplete_last_bar(df, tf, asof_ts)
-    """
+def _ensure_utc_index(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return df
-
-    out = df.sort_index()
-    if asof_ts is None:
-        # Conservative: always drop the last row (treat it as potentially incomplete)
-        return out.iloc[:-1] if len(out) > 1 else out.iloc[0:0]
-
-    asof_ts = _ensure_utc_ts(asof_ts)
-
-    # Determine bar length by tf
-    if tf.endswith("m"):
-        minutes = int(tf[:-1])
-        bar = pd.Timedelta(minutes=minutes)
-    elif tf.endswith("h"):
-        hours = int(tf[:-1])
-        bar = pd.Timedelta(hours=hours)
-    elif tf.endswith("d"):
-        days = int(tf[:-1])
-        bar = pd.Timedelta(days=days)
+    out = df.copy()
+    if not isinstance(out.index, pd.DatetimeIndex):
+        out.index = pd.to_datetime(out.index, utc=True)
     else:
-        raise ValueError(f"Unsupported tf={tf!r}")
-
-    # If the last bar close is > asof_ts, it is definitely incomplete relative to as-of
-    # Otherwise, if asof_ts is inside the interval (last_close - bar, last_close], treat as incomplete.
-    last_close = out.index[-1]
-    if last_close > asof_ts:
-        return out.loc[:asof_ts].iloc[:-1] if len(out.loc[:asof_ts]) > 1 else out.loc[:asof_ts].iloc[0:0]
-
-    if (last_close - bar) < asof_ts <= last_close:
-        return out.iloc[:-1] if len(out) > 1 else out.iloc[0:0]
-
-    # Otherwise keep all rows
+        if out.index.tz is None:
+            out.index = out.index.tz_localize("UTC")
+        else:
+            out.index = out.index.tz_convert("UTC")
+    out = out.sort_index()
+    out = out[~out.index.duplicated(keep="last")]
     return out
 
 
+def _tf_to_timedelta(tf: str) -> pd.Timedelta:
+    tf = str(tf).strip().lower()
+    if tf.endswith("m"):
+        return pd.Timedelta(minutes=int(tf[:-1]))
+    if tf.endswith("h"):
+        return pd.Timedelta(hours=int(tf[:-1]))
+    if tf.endswith("d"):
+        return pd.Timedelta(days=int(tf[:-1]))
+    if tf in ("1d", "1D"):
+        return pd.Timedelta(days=1)
+    raise ValueError(f"Unsupported tf={tf}")
+
+
+def drop_incomplete_last_bar(df: pd.DataFrame, tf: str, asof_ts: Any) -> pd.DataFrame:
+    """
+    Drop the last bar if it's incomplete as-of asof_ts.
+
+    IMPORTANT: In this repo, CCXT OHLCV timestamps are BAR OPEN TIME (left-labeled).
+    Therefore, a bar at index t covers [t, t+bar). It is complete iff (t+bar) <= asof_ts.
+    """
+    if df is None or df.empty:
+        return df
+    df = _ensure_utc_index(df)
+
+    asof = pd.Timestamp(asof_ts)
+    if asof.tzinfo is None:
+        asof = asof.tz_localize("UTC")
+    else:
+        asof = asof.tz_convert("UTC")
+
+    bar = _tf_to_timedelta(tf)
+    last_open = df.index[-1]
+
+    # If the last bar's end is after asof, it's still forming -> drop it.
+    if (last_open + bar) > asof:
+        return df.iloc[:-1]
+    return df
+
+
+def _triangular_moving_average(close: pd.Series, period: int) -> pd.Series:
+    # Offline: TMA = SMA(SMA(close, ma_period), ma_period)
+    sma1 = close.rolling(period, min_periods=period).mean()
+    sma2 = sma1.rolling(period, min_periods=period).mean()
+    return sma2
+
+
 def compute_daily_regime_series(
-    df_daily: pd.DataFrame,
+    daily_ohlc: pd.DataFrame,
     *,
-    ma_period: int = 100,
+    ma_period: int = 200,
     atr_period: int = 20,
     atr_mult: float = 2.0,
 ) -> pd.DataFrame:
     """
-    Deterministic daily regime:
-      - Trend: BULL/BEAR based on close relative to MA +/- ATR*mult envelope
-      - Vol: LOW_VOL/HIGH_VOL from a 2-state MarkovRegression on returns variance, with p(low-vol)
-    Returns a dataframe with columns including:
-      trend_regime, vol_regime, vol_prob_low, regime, regime_code
+    Offline-aligned daily combined regime:
+      - Trend: TMA + ATR channel; BULL if close>upper, BEAR if close<lower, ffill+bfill
+      - Vol: 2-state Markov switching variance on pct returns; use SMOOTHED probs
+      - vol_prob_low = P(low-variance state); LOW_VOL if vol_prob_low>0.5 else HIGH_VOL
+      - regime_code mapping: BEAR_HIGH_VOL=0, BEAR_LOW_VOL=1, BULL_HIGH_VOL=2, BULL_LOW_VOL=3
     """
-    if df_daily is None or df_daily.empty:
-        raise ValueError("df_daily is empty")
+    if daily_ohlc is None or daily_ohlc.empty:
+        raise ValueError("compute_daily_regime_series: empty daily_ohlc")
 
-    df = df_daily.sort_index().copy()
-    close = pd.to_numeric(df["close"], errors="coerce").astype(float)
+    df = _ensure_utc_index(daily_ohlc)
+    for c in ("open", "high", "low", "close"):
+        if c not in df.columns:
+            raise ValueError(f"compute_daily_regime_series: missing column {c}")
 
-    tma = close.rolling(int(ma_period), min_periods=max(5, int(ma_period) // 5)).mean()
+    close = df["close"].astype(float)
 
-    ohlc_cols = ["open", "high", "low", "close"]
-    if all(c in df.columns for c in ohlc_cols):
-        atr = ta.atr(df[ohlc_cols], int(atr_period))
-    else:
-        atr = ta.atr(df[["high", "low", "close"]], int(atr_period))
+    tma = _triangular_moving_average(close, int(ma_period))
+    atr = ta.atr(df[["open", "high", "low", "close"]], length=int(atr_period)).astype(float)
 
     upper = tma + float(atr_mult) * atr
     lower = tma - float(atr_mult) * atr
 
-    trend = pd.Series(index=df.index, dtype="object")
-    trend.loc[close > upper] = "BULL"
-    trend.loc[close < lower] = "BEAR"
-    trend = trend.ffill().fillna("BEAR")
+    trend = pd.Series(index=df.index, dtype=object)
+    trend[close > upper] = "BULL"
+    trend[close < lower] = "BEAR"
+    trend = trend.ffill().bfill()
 
-    # Vol regime via MarkovRegression on daily returns
-    r = close.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
-    if len(r) < 50:
-        # Not enough data to fit: degrade deterministically
-        vol_prob_low = pd.Series(0.5, index=df.index, dtype="float64")
-        vol_regime = pd.Series("UNKNOWN", index=df.index, dtype="object")
+    ret = close.pct_change().dropna()
+    if len(ret) < 50:
+        raise ValueError(f"compute_daily_regime_series: insufficient returns for Markov fit (n={len(ret)})")
+
+    mod = MarkovRegression(ret, k_regimes=2, switching_variance=True, trend="c")
+    res = mod.fit(disp=False)
+
+    # Identify low-vol state by smaller sigma2 estimate (robust extraction)
+    sigma2_items = []
+    for k, v in res.params.items():
+        ks = str(k)
+        if "sigma2" in ks:
+            # common keys look like 'sigma2[0]' / 'sigma2[1]'
+            sigma2_items.append((ks, float(v)))
+    if len(sigma2_items) < 2:
+        # Fallback: assume state 0 is low-vol if we can't extract reliably
+        low_state = 0
     else:
-        model = MarkovRegression(r, k_regimes=2, trend="c", switching_variance=True)
-        res = model.fit(disp=False, maxiter=200)
+        # Prefer bracketed numeric ordering if present
+        def _state_from_key(ks: str) -> Optional[int]:
+            lb = ks.find("[")
+            rb = ks.find("]")
+            if lb >= 0 and rb > lb:
+                try:
+                    return int(ks[lb + 1 : rb])
+                except Exception:
+                    return None
+            return None
 
-        # smoothed marginal probabilities for regime 0/1
-        p = res.smoothed_marginal_probabilities
-        # Pick low-vol regime as the one with smaller variance
-        sig2 = res.params.filter(like="sigma2").values
-        if len(sig2) >= 2:
-            low_idx = int(np.argmin(sig2))
+        parsed = []
+        for ks, v in sigma2_items:
+            st = _state_from_key(ks)
+            if st is not None:
+                parsed.append((st, v))
+        if len(parsed) >= 2:
+            parsed = sorted(parsed, key=lambda x: x[0])
+            low_state = int(min(parsed, key=lambda x: x[1])[0])
         else:
-            low_idx = 0
+            # Just take the smallest sigma2 among the first two items
+            low_state = int(np.argmin([sigma2_items[0][1], sigma2_items[1][1]]))
 
-        p_low = p[low_idx].reindex(df.index).ffill()
-        vol_prob_low = p_low.astype(float)
+    p0 = res.smoothed_marginal_probabilities[0]
+    p1 = res.smoothed_marginal_probabilities[1]
+    vol_prob_low = (p0 if low_state == 0 else p1).reindex(df.index).ffill()
 
-        # Hard label with 0.5 threshold
-        vol_regime = pd.Series(index=df.index, dtype="object")
-        vol_regime.loc[vol_prob_low >= 0.5] = "LOW_VOL"
-        vol_regime.loc[vol_prob_low < 0.5] = "HIGH_VOL"
-        vol_regime = vol_regime.fillna("UNKNOWN")
-
-    regime = trend.astype(str) + "_" + vol_regime.astype(str)
-    regime_code = regime.map(REGIME_CODE_MAP).astype("float64")
+    vol_regime = np.where(vol_prob_low > 0.5, "LOW_VOL", "HIGH_VOL")
+    regime_name = trend.astype(str) + "_" + pd.Series(vol_regime, index=df.index).astype(str)
+    regime_code = regime_name.map(REGIME_CODE_MAP).astype(float)
 
     out = pd.DataFrame(
         {
-            "close": close,
-            "tma": tma,
-            "atr": atr,
-            "upper": upper,
-            "lower": lower,
-            "trend_regime": trend,
-            "vol_regime": vol_regime,
-            "vol_prob_low": vol_prob_low,
-            "regime": regime,
+            "regime_name": regime_name,
             "regime_code": regime_code,
+            "vol_prob_low": vol_prob_low.astype(float),
+            "tma": tma.astype(float),
+            "atr": atr.astype(float),
+            "upper": upper.astype(float),
+            "lower": lower.astype(float),
         },
         index=df.index,
     )
+    out = out.dropna(subset=["regime_code", "vol_prob_low"])
     return out
 
 
-def _asof_row(df: pd.DataFrame, ts: pd.Timestamp) -> pd.Series:
-    ts = _ensure_utc_ts(ts)
-    df = df.sort_index()
-    df2 = df.loc[:ts]
-    if df2.empty:
-        raise ValueError(f"No rows at or before ts={ts}")
-    return df2.iloc[-1]
-
-
-def compute_daily_regime_snapshot(
-    df_daily: pd.DataFrame,
-    decision_ts: Optional[pd.Timestamp] = None,
-    *,
-    asof_ts: Optional[pd.Timestamp] = None,
-    ma_period: int = 100,
-    atr_period: int = 20,
-    atr_mult: float = 2.0,
-    cfg: Optional[RegimeConfig] = None,
-) -> Dict[str, Any]:
-    """
-    Snapshot as-of a decision timestamp.
-
-    Compatibility:
-      - Newer call-sites pass asof_ts=...
-      - Older call-sites pass decision_ts as positional arg
-    """
-    if decision_ts is None:
-        decision_ts = asof_ts
-    if decision_ts is None:
-        raise TypeError("compute_daily_regime_snapshot requires decision_ts or asof_ts")
-
+def compute_daily_regime_snapshot(daily_ohlc: pd.DataFrame, *, asof_ts: Any, cfg: Optional[RegimeConfig] = None) -> Dict[str, Any]:
     cfg = cfg or RegimeConfig()
-    decision_ts = _ensure_utc_ts(decision_ts)
-
-    # Optional shift hook (kept for parity toggles)
-    if cfg.assume_right_labeled_input:
-        df_fit = df_daily.copy()
-    else:
-        df_fit = df_daily.copy()
+    df = _ensure_utc_index(daily_ohlc)
+    df = drop_incomplete_last_bar(df, "1d", asof_ts)
 
     ser = compute_daily_regime_series(
-        df_fit,
-        ma_period=ma_period,
-        atr_period=atr_period,
-        atr_mult=atr_mult,
+        df,
+        ma_period=cfg.ma_period,
+        atr_period=cfg.atr_period,
+        atr_mult=cfg.atr_mult,
     )
+    if ser.empty:
+        raise ValueError("compute_daily_regime_snapshot: empty regime series after drop")
 
-    row = _asof_row(ser, decision_ts)
+    asof = pd.Timestamp(asof_ts)
+    if asof.tzinfo is None:
+        asof = asof.tz_localize("UTC")
+    else:
+        asof = asof.tz_convert("UTC")
 
-    daily_regime_str = str(row["regime"])
-    regime_code = REGIME_CODE_MAP.get(daily_regime_str)
-    vol_prob_low = float(row["vol_prob_low"]) if pd.notna(row["vol_prob_low"]) else np.nan
+    ser2 = ser.loc[:asof]
+    if ser2.empty:
+        raise ValueError(f"compute_daily_regime_snapshot: no row asof={asof} (min={ser.index.min()} max={ser.index.max()})")
 
+    row = ser2.iloc[-1]
     return {
-        # Keys expected by live/live_trader.py
-        "trend_regime_1d": str(row["trend_regime"]),
-        "vol_regime_1d": str(row["vol_regime"]),
-        "vol_prob_low_1d": vol_prob_low,
-        "daily_regime_str_1d": daily_regime_str,
-        "regime_code_1d": int(regime_code) if regime_code is not None else None,
-        # Back-compat / extra
-        "regime_code": int(regime_code) if regime_code is not None else None,
-        "vol_prob_low": vol_prob_low,
+        "regime_code_1d": int(row["regime_code"]),
+        "vol_prob_low_1d": float(row["vol_prob_low"]),
     }
 
 
 def compute_markov4h_series(
-    df_4h: pd.DataFrame,
+    ohlc_4h: pd.DataFrame,
     *,
-    ewma_alpha: float = 0.2,
-    maxiter: int = 200,
+    prob_ewma_alpha: float = 0.2,
 ) -> pd.DataFrame:
-    if df_4h is None or df_4h.empty:
-        raise ValueError("df_4h is empty")
+    """
+    Offline-aligned 4h Markov regime:
+      - returns: log returns
+      - MarkovRegression(k=2, switching_variance=True, trend="c")
+      - probabilities: FILTERED (past-only)
+      - "up" state: higher weighted mean return under filtered probs
+      - prob_up: EWMA(alpha, adjust=False)
+      - state_up = int(prob_up > 0.5)
+    """
+    if ohlc_4h is None or ohlc_4h.empty:
+        raise ValueError("compute_markov4h_series: empty ohlc_4h")
 
-    df = df_4h.sort_index().copy()
-    close = pd.to_numeric(df["close"], errors="coerce").astype(float)
+    df = _ensure_utc_index(ohlc_4h)
+    if "close" not in df.columns:
+        raise ValueError("compute_markov4h_series: missing close")
 
-    r = close.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
-    if len(r) < 80:
-        p_up = pd.Series(0.5, index=df.index, dtype="float64")
-        state = pd.Series(0, index=df.index, dtype="int64")
+    close = df["close"].astype(float)
+    ret = np.log(close).diff().dropna()
+    if len(ret) < 80:
+        raise ValueError(f"compute_markov4h_series: insufficient returns for Markov fit (n={len(ret)})")
+
+    mod = MarkovRegression(ret, k_regimes=2, switching_variance=True, trend="c")
+    res = mod.fit(disp=False)
+
+    p0 = res.filtered_marginal_probabilities[0]
+    p1 = res.filtered_marginal_probabilities[1]
+
+    # Weighted mean returns under filtered probs
+    m0 = float((ret * p0).sum() / max(1e-12, float(p0.sum())))
+    m1 = float((ret * p1).sum() / max(1e-12, float(p1.sum())))
+    up_state = 0 if m0 > m1 else 1
+
+    prob_up_raw = (p0 if up_state == 0 else p1).reindex(df.index).ffill()
+    prob_up = prob_up_raw.ewm(alpha=float(prob_ewma_alpha), adjust=False).mean()
+
+    state_up = (prob_up > 0.5).astype(int)
+
+    out = pd.DataFrame(
+        {
+            "markov_prob_up": prob_up.astype(float),
+            "markov_state_up": state_up.astype(int),
+            "markov_prob_up_raw": prob_up_raw.astype(float),
+        },
+        index=df.index,
+    )
+    out = out.dropna(subset=["markov_prob_up"])
+    return out
+
+
+def compute_markov4h_snapshot(ohlc_4h: pd.DataFrame, *, asof_ts: Any, cfg: Optional[RegimeConfig] = None) -> Dict[str, Any]:
+    cfg = cfg or RegimeConfig()
+    df = _ensure_utc_index(ohlc_4h)
+    df = drop_incomplete_last_bar(df, "4h", asof_ts)
+
+    ser = compute_markov4h_series(df, prob_ewma_alpha=cfg.markov4h_prob_ewma_alpha)
+    if ser.empty:
+        raise ValueError("compute_markov4h_snapshot: empty series after drop")
+
+    asof = pd.Timestamp(asof_ts)
+    if asof.tzinfo is None:
+        asof = asof.tz_localize("UTC")
     else:
-        model = MarkovRegression(r, k_regimes=2, trend="c", switching_variance=True)
-        res = model.fit(disp=False, maxiter=int(maxiter))
+        asof = asof.tz_convert("UTC")
 
-        p = res.smoothed_marginal_probabilities
-        # Define “up” state as the regime with higher mean return (approx via params)
-        # If not available, default to 0
-        mu = res.params.filter(like="const").values
-        if len(mu) >= 2:
-            up_idx = int(np.argmax(mu))
-        else:
-            up_idx = 0
+    ser2 = ser.loc[:asof]
+    if ser2.empty:
+        raise ValueError(f"compute_markov4h_snapshot: no row asof={asof} (min={ser.index.min()} max={ser.index.max()})")
 
-        p_up_raw = p[up_idx].reindex(df.index).ffill().astype(float)
-        p_up = p_up_raw.ewm(alpha=float(ewma_alpha), adjust=False).mean()
-
-        state = (p_up >= 0.5).astype("int64")
-
-    return pd.DataFrame({"close": close, "markov_prob_up": p_up, "markov_state": state}, index=df.index)
-
-
-def compute_markov4h_snapshot(
-    df_4h: pd.DataFrame,
-    decision_ts: Optional[pd.Timestamp] = None,
-    *,
-    asof_ts: Optional[pd.Timestamp] = None,
-    ewma_alpha: Optional[float] = None,
-    alpha: Optional[float] = None,
-    maxiter: int = 200,
-) -> Dict[str, Any]:
-    """
-    Snapshot Markov 4h probability as-of decision timestamp.
-
-    Compatibility:
-      - Newer call-sites pass asof_ts=...
-      - Some call-sites pass alpha=... (alias of ewma_alpha)
-    """
-    if decision_ts is None:
-        decision_ts = asof_ts
-    if decision_ts is None:
-        raise TypeError("compute_markov4h_snapshot requires decision_ts or asof_ts")
-
-    decision_ts = _ensure_utc_ts(decision_ts)
-
-    if ewma_alpha is None and alpha is not None:
-        ewma_alpha = float(alpha)
-    if ewma_alpha is None:
-        ewma_alpha = 0.2
-
-    ser = compute_markov4h_series(df_4h, ewma_alpha=float(ewma_alpha), maxiter=int(maxiter))
-    row = _asof_row(ser, decision_ts)
-
+    row = ser2.iloc[-1]
     return {
-        "markov_prob_up_4h": float(row["markov_prob_up"]) if pd.notna(row["markov_prob_up"]) else np.nan,
-        "markov_state_4h": int(row["markov_state"]) if pd.notna(row["markov_state"]) else 0,
+        "markov_state_4h": int(row["markov_state_up"]),
+        "markov_prob_up_4h": float(row["markov_prob_up"]),
     }

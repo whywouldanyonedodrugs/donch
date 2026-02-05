@@ -46,6 +46,13 @@ class RegimeTruthStore:
 
     def daily_asof(self, decision_ts: Any) -> Optional[Dict[str, Any]]:
         ts = _ensure_utc_ts(decision_ts)
+
+        # Fail-closed: do NOT clamp forward beyond the truth range.
+        if len(self.daily.index) == 0:
+            return None
+        if ts > self.daily.index[-1]:
+            return None
+
         idx = self.daily.index.values
         pos = idx.searchsorted(ts.to_datetime64(), side="right") - 1
         if pos < 0:
@@ -62,11 +69,19 @@ class RegimeTruthStore:
 
     def markov4h_asof(self, decision_ts: Any) -> Optional[Dict[str, Any]]:
         ts = _ensure_utc_ts(decision_ts)
+
+        # Fail-closed: do NOT clamp forward beyond the truth range.
+        if len(self.markov4h.index) == 0:
+            return None
+        if ts > self.markov4h.index[-1]:
+            return None
+
         idx = self.markov4h.index.values
         pos = idx.searchsorted(ts.to_datetime64(), side="right") - 1
         if pos < 0:
             return None
         row = self.markov4h.iloc[int(pos)]
+
         s = row["markov_state_4h"]
         p = row["markov_prob_up_4h"]
         if pd.isna(s) or pd.isna(p):
