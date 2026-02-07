@@ -1,0 +1,25 @@
+# Local secrets / virtualenv
+.env
+.venv/
+
+# Python caches
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+
+# Local runtime/export artifacts
+results/runtime/
+results/reports/
+results/meta_export/
+results/meta_export_*/
+
+# Local market data cache
+parquet/
+universe_cache.json
+
+# Live runtime exports/backups
+live/*.bak
+live/*.bak_*
+live/bybit-donch.csv
+live/positions_*.csv

@@ -2,8 +2,9 @@
 STRATEGY_SPEC_PATH: "strategies/donch_pullback_long.yaml"
 
 # Sizing
-RISK_MODE: "cash"           # or "percent"
-RISK_USD: 10.0              # used if RISK_MODE="cash"
+RISK_MODE: "fixed"          # or "percent"
+RISK_USD: 5.0               # base per-trade risk (USDT)
+RISK_USD_MAX: 5.0           # hard cap to keep live trades small during validation
 RISK_EQUITY_PCT: 0.01       # used if RISK_MODE="percent"
 MIN_TRADE_AUTOPAD_ENABLED: false
 MIN_TRADE_AUTOPAD_CAP_USD: 5.0

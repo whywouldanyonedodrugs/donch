@@ -99,9 +99,9 @@ def compute_daily_regime_series(
     atr_mult: float = 2.0,
 ) -> pd.DataFrame:
     """
-    Offline-aligned daily combined regime:
+    Daily combined regime (past-only):
       - Trend: TMA + ATR channel; BULL if close>upper, BEAR if close<lower, ffill+bfill
-      - Vol: 2-state Markov switching variance on pct returns; use SMOOTHED probs
+      - Vol: 2-state Markov switching variance on pct returns; use FILTERED probs
       - vol_prob_low = P(low-variance state); LOW_VOL if vol_prob_low>0.5 else HIGH_VOL
       - regime_code mapping: BEAR_HIGH_VOL=0, BEAR_LOW_VOL=1, BULL_HIGH_VOL=2, BULL_LOW_VOL=3
     """
@@ -169,8 +169,9 @@ def compute_daily_regime_series(
             # Just take the smallest sigma2 among the first two items
             low_state = int(np.argmin([sigma2_items[0][1], sigma2_items[1][1]]))
 
-    p0 = res.smoothed_marginal_probabilities[0]
-    p1 = res.smoothed_marginal_probabilities[1]
+    # Use filtered probabilities to avoid forward-looking leakage in live decisions.
+    p0 = res.filtered_marginal_probabilities[0]
+    p1 = res.filtered_marginal_probabilities[1]
     vol_prob_low = (p0 if low_state == 0 else p1).reindex(df.index).ffill()
 
     vol_regime = np.where(vol_prob_low > 0.5, "LOW_VOL", "HIGH_VOL")

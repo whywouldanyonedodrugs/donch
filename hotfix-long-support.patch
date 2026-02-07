@@ -1,0 +1,47 @@
+diff --git a/live/live_trader.py b/live/live_trader.py
+index 1111111..2222222 100644
+--- a/live/live_trader.py
++++ b/live/live_trader.py
+@@ -548,7 +548,7 @@ class LiveTrader:
+-            listing_age = ((datetime.utcnow().date() - self._listing_dates_cache[symbol]).days
++            listing_age = ((datetime.now(timezone.utc).date() - self._listing_dates_cache[symbol]).days
+                         if symbol in self._listing_dates_cache else None)
+@@ -615,15 +615,18 @@ class LiveTrader:
+-            # ---- Built-in entry heuristic (short-only, conservative defaults) -------
+-            enter_ok = True
+-            if bool(self.cfg.get("ENTRY_REQUIRE_EMA_CROSS", True)):
+-                enter_ok = enter_ok and bool(is_ema_crossed_down)
+-            if bool(self.cfg.get("ENTRY_REQUIRE_VWAP_CONSOL", False)):
+-                enter_ok = enter_ok and bool(last.get('vwap_consolidated', False))
+-            min_atr_pct = float(self.cfg.get("ENTRY_MIN_ATR_PCT", 0.0))
+-            if min_atr_pct > 0:
+-                enter_ok = enter_ok and (atr_pct >= min_atr_pct)
++            # ---- Built-in entry heuristic (SIDE-AWARE; OFF by default) ------------
++            enter_ok = True
++            need_cross = bool(self.cfg.get("ENTRY_REQUIRE_EMA_CROSS", False))
++            if need_cross:
++                if side == "long":
++                    enter_ok = enter_ok and bool(last['ema_fast'] > last['ema_slow'])
++                else:
++                    enter_ok = enter_ok and bool(last['ema_fast'] < last['ema_slow'])
++            if bool(self.cfg.get("ENTRY_REQUIRE_VWAP_CONSOL", False)):
++                enter_ok = enter_ok and bool(last.get('vwap_consolidated', False))
++            min_atr_pct = float(self.cfg.get("ENTRY_MIN_ATR_PCT", 0.0))
++            if min_atr_pct > 0:
++                enter_ok = enter_ok and (atr_pct >= min_atr_pct)
+             if not enter_ok:
+                 return None
+@@ -640,10 +643,11 @@ class LiveTrader:
+                 ema_fast=float(last['ema_fast']), ema_slow=float(last['ema_slow']),
+                 listing_age_days=listing_age_days, session_tag=session_tag,
+-                day_of_week=day_of_week, hour_of_day=hour_of_day,
++                day_of_week=day_of_week, hour_of_day=hour_of_day,
+                 vwap_consolidated=bool(last.get('vwap_consolidated', False)),
+-                is_ema_crossed_down=bool(is_ema_crossed_down)
++                is_ema_crossed_down=bool(is_ema_crossed_down),
++                side=side
+             )
+@@ -1017,7 +1021,7 @@ class LiveTrader:
+-                            listing_age = (datetime.utcnow().date() - self._listing_dates_cache.get(sym, datetime.utcnow().date())).days \
++                            listing_age = (datetime.now(timezone.utc).date() - self._listing_dates_cache.get(sym, datetime.now(timezone.utc).date())).days \
+                                           if sym in self._listing_dates_cache else None
