@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -38,10 +39,71 @@ class TestDailyRegimeAndMarkovGolden(unittest.TestCase):
             raise RuntimeError(f"golden missing columns: {missing}")
 
         df = df[use].sort_values(["timestamp"]).groupby("timestamp", as_index=False).first()
-        cls.golden_macro = df
+        cls.golden_macro_all = df
+
+        daily_path = cls.meta_dir / "regime_daily_truth.parquet"
+        markov_path = cls.meta_dir / "regime_markov4h_truth.parquet"
+        if not daily_path.exists():
+            raise RuntimeError(f"Missing regime_daily_truth.parquet at {daily_path}")
+        if not markov_path.exists():
+            raise RuntimeError(f"Missing regime_markov4h_truth.parquet at {markov_path}")
+
+        daily_df = pd.read_parquet(daily_path)
+        markov_df = pd.read_parquet(markov_path)
+
+        daily_ts = pd.to_datetime(
+            daily_df["timestamp"] if "timestamp" in daily_df.columns else daily_df.index,
+            utc=True,
+        )
+        markov_ts = pd.to_datetime(
+            markov_df["timestamp"] if "timestamp" in markov_df.columns else markov_df.index,
+            utc=True,
+        )
+
+        cls.golden_max_ts = pd.to_datetime(cls.golden_macro_all["timestamp"], utc=True).max()
+        cls.daily_max_ts = pd.to_datetime(daily_ts, utc=True).max()
+        cls.markov_max_ts = pd.to_datetime(markov_ts, utc=True).max()
+
+        daily_lag = cls.golden_max_ts - cls.daily_max_ts
+        markov_lag = cls.golden_max_ts - cls.markov_max_ts
+        cls.daily_tail_lag = daily_lag if daily_lag > pd.Timedelta(0) else pd.Timedelta(0)
+        cls.markov_tail_lag = markov_lag if markov_lag > pd.Timedelta(0) else pd.Timedelta(0)
+
+        cls.overlap_end_ts = min(cls.daily_max_ts, cls.markov_max_ts)
+        cls.golden_macro = cls.golden_macro_all[cls.golden_macro_all["timestamp"] <= cls.overlap_end_ts].copy()
+
+    def test_truth_coverage_lag_within_expected_bounds(self) -> None:
+        self.assertLessEqual(
+            self.daily_tail_lag,
+            pd.Timedelta(days=1),
+            msg=(
+                f"Daily truth coverage lag too large: golden_max={self.golden_max_ts} "
+                f"daily_max={self.daily_max_ts} lag={self.daily_tail_lag} (expected <=1D)"
+            ),
+        )
+        self.assertLessEqual(
+            self.markov_tail_lag,
+            pd.Timedelta(hours=4),
+            msg=(
+                f"Markov truth coverage lag too large: golden_max={self.golden_max_ts} "
+                f"markov_max={self.markov_max_ts} lag={self.markov_tail_lag} (expected <=4H)"
+            ),
+        )
+
+        if self.daily_tail_lag > pd.Timedelta(0) or self.markov_tail_lag > pd.Timedelta(0):
+            warnings.warn(
+                "Macro regime test clipped to overlap window due incomplete truth tail coverage: "
+                f"daily_lag={self.daily_tail_lag}, markov_lag={self.markov_tail_lag}, "
+                f"overlap_end={self.overlap_end_ts}",
+                stacklevel=1,
+            )
 
     def test_macro_regimes_match_golden_asof(self) -> None:
         g = self.golden_macro
+        if g.empty:
+            raise RuntimeError(
+                f"Overlap window is empty: daily_max={self.daily_max_ts}, markov_max={self.markov_max_ts}"
+            )
 
         # Keep runtime bounded; golden contains many rows. This is an integration parity check.
         # Deterministic selection: take first N rows.

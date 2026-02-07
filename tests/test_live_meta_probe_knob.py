@@ -69,3 +69,9 @@ class TestLiveMetaProbeKnob(unittest.TestCase):
         src = inspect.getsource(LiveTrader._handle_cmd)
         self.assertIn('elif root == "/regime":', src)
         self.assertIn("get_current_regime", src)
+
+    def test_no_meta_gate_does_not_apply_scope_veto(self) -> None:
+        src = inspect.getsource(LiveTrader._scan_symbol_for_signal)
+        self.assertIn("if pstar is None:", src)
+        self.assertIn('reason = "no_prob_gate"', src)
+        self.assertIn("if scope_gate_enabled and (not bool(scope_ok))", src)
