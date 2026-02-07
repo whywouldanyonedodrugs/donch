@@ -3618,20 +3618,8 @@ class LiveTrader:
         except Exception as _e:
             LOG.warning("De-dup check failed for %s: %s (continuing)", sig.symbol, _e)
 
-        # --- Meta probability entry gate (optional) ---
-        # Offline Option 1 run uses META_PROB_THRESHOLD=None, so this gate is disabled by default.
-        thr_cfg = self.cfg.get("META_PROB_THRESHOLD", None)
-        if thr_cfg is None:
-            thr_cfg = self.cfg.get("MIN_WINPROB_TO_TRADE", None)
-        if thr_cfg is not None:
-            try:
-                thr = float(thr_cfg)
-                wp = float(getattr(sig, "win_probability", 0.0) or 0.0)
-                if wp < thr:
-                    LOG.info("Skip %s: Meta p_cal %.3f < threshold %.3f", sig.symbol, wp, thr)
-                    return
-            except Exception as _e:
-                LOG.warning("Invalid meta prob gate config (value=%r): %s (continuing, no gate)", thr_cfg, _e)
+        # No secondary probability veto here:
+        # scan-time meta decision already enforces gating/parity rules.
 
 
         # --- Resolve side & direction-dependent helpers ---
@@ -4028,12 +4016,17 @@ class LiveTrader:
             vol_needed   = float(self.cfg.get("VOL_MULTIPLE", 2.0))
             regime_block = bool(self.cfg.get("REGIME_BLOCK_WHEN_DOWN", True))
             min_atr_pct  = float(self.cfg.get("ENTRY_MIN_ATR_PCT", 0.0))
-            meta_thresh  = float(self.cfg.get("META_PROB_THRESHOLD", 0.0))
+            meta_thresh_raw = self.cfg.get("META_PROB_THRESHOLD", None)
+            try:
+                meta_thresh = float(meta_thresh_raw) if meta_thresh_raw is not None else None
+            except Exception:
+                meta_thresh = None
 
             # values from signal (set during scan)
             rs_pct      = float(getattr(sig, "rs_pct", 0.0) or 0.0)
             liq_ok      = bool(getattr(sig, "liq_ok", True))
             vol_mult    = float(getattr(sig, "vol_mult", 0.0) or 0.0)
+            wp          = float(getattr(sig, "win_probability", 0.0) or 0.0)
             don_len     = getattr(sig, "don_break_len", None)
             don_level   = getattr(sig, "don_break_level", None)
             don_dist    = getattr(sig, "don_dist_atr", None)
@@ -4062,7 +4055,7 @@ class LiveTrader:
             g_reg   = (reg_up or (not regime_block))
             g_vol   = (vol_mult >= vol_needed)
             g_micro = ((float(sig.atr_pct)/100.0) >= min_atr_pct)
-            g_meta  = (wp >= meta_thresh)
+            g_meta  = True if meta_thresh is None else (wp >= meta_thresh)
 
             # TP preview (even if partials enabled, show final)
             final_tp_mult  = float(self.cfg.get("FINAL_TP_ATR_MULT", self.cfg.get("TP_ATR_MULT", 8.0)))
@@ -4922,6 +4915,44 @@ class LiveTrader:
                 "loss_streak": self.risk.loss_streak,
             }, indent=2))
 
+        elif root == "/regime":
+            try:
+                rd = getattr(self, "regime_detector", None)
+                if rd is None:
+                    await self.tg.send("Regime detector unavailable.")
+                    return
+
+                asof_ts = pd.to_datetime(getattr(self, "_cycle_data_ts", None), utc=True, errors="coerce")
+                if pd.isna(asof_ts):
+                    asof_ts = pd.Timestamp(datetime.now(timezone.utc))
+
+                current = await rd.get_current_regime(asof_ts)
+                meta = rd.get_latest_meta_features() or {}
+
+                reg_code = meta.get("regime_code_1d")
+                vol_prob = meta.get("vol_prob_low_1d")
+                trend = meta.get("trend_regime_1d")
+                vol = meta.get("vol_regime_1d")
+
+                reg_code_s = "n/a" if reg_code is None else str(reg_code)
+                vol_prob_s = "n/a" if vol_prob is None else f"{float(vol_prob):.4f}"
+                trend_s = "n/a" if trend is None else str(trend)
+                vol_s = "n/a" if vol is None else str(vol)
+
+                msg = (
+                    f"🧭 Regime (as-of {asof_ts.isoformat()})\n"
+                    f"• current: {str(current)}\n"
+                    f"• regime_code_1d: {reg_code_s}\n"
+                    f"• vol_prob_low_1d: {vol_prob_s}\n"
+                    f"• trend_regime_1d: {trend_s}\n"
+                    f"• vol_regime_1d: {vol_s}"
+                )
+                await self.tg.send(msg)
+            except Exception as e:
+                LOG.exception("Failed /regime command")
+                await self.tg.send(f"❌ /regime failed: {e}")
+            return
+
         elif root == "/analyze":
             # Usage: /analyze [6h|daily|weekly|monthly|7d|30d|90d|180d|365d|all]
             period = (parts[1].lower() if len(parts) >= 2 else "30d")
@@ -5107,7 +5138,8 @@ class LiveTrader:
 
         period_pnls: list[float] = []
         recent_pnls: list[float] = []
-        last_regime = "n/a"
+        last_closed_regime = "n/a"
+        current_regime = "n/a"
 
         # Fetch from Postgres via asyncpg pool
         try:
@@ -5123,47 +5155,34 @@ class LiveTrader:
                 )
                 recent_pnls = [float(r["pnl"]) for r in rows2 if r["pnl"] is not None]
 
-                try:
-                    lr = await conn.fetchval(
-                        "SELECT market_regime FROM positions WHERE closed_at IS NOT NULL ORDER BY closed_at DESC LIMIT 1"
-                    )
-                    if lr is not None:
-                        last_regime = str(lr)
-                except Exception:
-                    # Last regime (reporting only; must not affect trading decisions)
-                    rd = getattr(self, "regime_detector", None)
-                    if rd is None:
-                        last_regime = "n/a"
-                    else:
-                        # Prefer a dedicated label method if the detector has one
-                        last_regime = None
-                        for meth in ("report_label", "summary_label", "label", "summary"):
-                            fn = getattr(rd, meth, None)
-                            if callable(fn):
-                                try:
-                                    out = fn()
-                                    if out:
-                                        last_regime = str(out)
-                                        break
-                                except Exception:
-                                    pass
-
-                        # Fallback: stringify key regime/state fields already stored on the detector
-                        if not last_regime:
-                            fields = {}
-                            for k, v in getattr(rd, "__dict__", {}).items():
-                                kl = str(k).lower()
-                                if ("regime" in kl) or ("state" in kl) or ("prob" in kl):
-                                    fields[k] = v
-                            if fields:
-                                last_regime = ", ".join(f"{k}={fields[k]}" for k in sorted(fields.keys()))
-                            else:
-                                last_regime = "n/a"
+                lr = await conn.fetchval(
+                    "SELECT market_regime FROM positions WHERE closed_at IS NOT NULL ORDER BY closed_at DESC LIMIT 1"
+                )
+                if lr is not None:
+                    last_closed_regime = str(lr)
 
 
 
         except Exception:
             LOG.exception("Failed to fetch PnL for report")
+
+        # Current regime from detector (as-of data clock if available).
+        try:
+            rd = getattr(self, "regime_detector", None)
+            if rd is not None:
+                asof_ts = pd.to_datetime(getattr(self, "_cycle_data_ts", None), utc=True, errors="coerce")
+                if pd.isna(asof_ts):
+                    asof_ts = pd.Timestamp(now, tz="UTC")
+                current = await rd.get_current_regime(asof_ts)
+                current_regime = str(current) if current is not None else "n/a"
+        except Exception:
+            LOG.exception("Failed to fetch current regime for report")
+            try:
+                cached = getattr(getattr(self, "regime_detector", None), "_cached_regime", None)
+                if cached:
+                    current_regime = str(cached)
+            except Exception:
+                pass
 
         total_pnl = float(sum(period_pnls))
         n_trades = int(len(period_pnls))
@@ -5179,7 +5198,8 @@ class LiveTrader:
             f"📊 DONCH Report ({period})\n"
             f"• Trades: {n_trades} | Wins: {n_wins} | Losses: {n_losses} | Win rate: {win_rate:.1f}%\n"
             f"• Total PnL: {total_pnl:+.2f} | PF: {pf:.2f}\n"
-            f"• Last regime: {last_regime}\n"
+            f"• Regime (current): {current_regime}\n"
+            f"• Regime (last closed trade): {last_closed_regime}\n"
         )
 
         # Optional: small recent snapshot (kept short)

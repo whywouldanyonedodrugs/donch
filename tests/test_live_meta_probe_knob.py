@@ -1,4 +1,5 @@
 import unittest
+import inspect
 
 from live.live_trader import LiveTrader
 
@@ -49,3 +50,22 @@ class TestLiveMetaProbeKnob(unittest.TestCase):
 
         m = LiveTrader._resolve_meta_multiplier(trader, 0.70, 1.0)
         self.assertAlmostEqual(m, 0.03, places=8)
+
+    def test_open_position_has_no_legacy_min_winprob_fallback(self) -> None:
+        src = inspect.getsource(LiveTrader._open_position)
+        self.assertNotIn("MIN_WINPROB_TO_TRADE", src)
+
+    def test_open_position_meta_threshold_handles_none(self) -> None:
+        src = inspect.getsource(LiveTrader._open_position)
+        self.assertIn("meta_thresh_raw = self.cfg.get(\"META_PROB_THRESHOLD\", None)", src)
+        self.assertNotIn("float(self.cfg.get(\"META_PROB_THRESHOLD\", 0.0))", src)
+
+    def test_summary_report_uses_current_regime_detector(self) -> None:
+        src = inspect.getsource(LiveTrader._generate_summary_report)
+        self.assertIn("get_current_regime", src)
+        self.assertIn("Regime (current)", src)
+
+    def test_handle_cmd_includes_regime_command(self) -> None:
+        src = inspect.getsource(LiveTrader._handle_cmd)
+        self.assertIn('elif root == "/regime":', src)
+        self.assertIn("get_current_regime", src)
