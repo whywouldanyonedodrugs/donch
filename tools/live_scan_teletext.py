@@ -49,6 +49,26 @@ LOG_RE_FEATURE_MISSING = re.compile(r"FEATURE_MISSING.*?symbol=([A-Z0-9]+).*?mis
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
+C_RESET = "\033[0m"
+C_RED = "\033[91m"
+C_GREEN = "\033[92m"
+C_YELLOW = "\033[93m"
+C_BLUE = "\033[94m"
+C_MAGENTA = "\033[95m"
+C_CYAN = "\033[96m"
+C_GRAY = "\033[90m"
+
+
+def _c(text: str, color: str, use_ansi: bool) -> str:
+    if not use_ansi:
+        return text
+    return f"{color}{text}{C_RESET}"
+
+
+def _strip_ansi(text: str) -> str:
+    return ANSI_RE.sub("", text)
+
+
 def _ansi_supported() -> bool:
     term = os.getenv("TERM", "").strip().lower()
     return sys.stdout.isatty() and term not in {"", "dumb"}
@@ -105,6 +125,14 @@ def _fmt_bool(v: Optional[bool]) -> str:
     if v is None:
         return " ? "
     return " Y " if v else " N "
+
+
+def _fmt_bool_c(v: Optional[bool], use_ansi: bool) -> str:
+    if v is None:
+        return _c(" ? ", C_GRAY, use_ansi)
+    if v:
+        return _c(" Y ", C_GREEN, use_ansi)
+    return _c(" N ", C_RED, use_ansi)
 
 
 def _fmt_float(v: Optional[float], width: int = 7, prec: int = 3) -> str:
@@ -235,9 +263,10 @@ class OhlcvSparkReader:
             except Exception:
                 pass
 
-    def render_symbol(self, symbol: str) -> Optional[str]:
+    def render_symbol(self, symbol: str, use_ansi: bool) -> Optional[str]:
         if not self.enabled or self.conn is None:
-            return None
+            return None123Cryptozjbs123
+            
         rows = self._load_recent_closes(symbol=symbol, tf=self.tf, limit=self.bars)
         if not rows:
             return None
@@ -248,7 +277,71 @@ class OhlcvSparkReader:
         first = vals[0]
         last = vals[-1]
         change = ((last / first) - 1.0) * 100.0 if first > 0 else 0.0
-        return f"{spark}  {change:+.2f}%"
+        color = C_GREEN if change >= 0 else C_RED
+        spark_s = _c(spark, color, use_ansi)
+        change_s = _c(f"{change:+.2f}%", color, use_ansi)
+        return f"{spark_s}  {change_s}"
+
+    def render_big_chart(self, symbol: str, use_ansi: bool, height: int, width: int) -> List[str]:
+        if not self.enabled or self.conn is None:
+            return []
+
+        # Reserve space for labels (e.g. 12 chars)
+        chart_w = max(10, width - 12)
+        data = self._load_recent_ohlc(symbol, self.tf, chart_w)
+        if not data:
+            return []
+
+        highs = [x[1] for x in data]
+        lows = [x[2] for x in data]
+        g_max = max(highs)
+        g_min = min(lows)
+        if g_max <= g_min:
+            g_max = g_min + 1e-9
+
+        scale = (height - 1) / (g_max - g_min)
+
+        grid = [[" " for _ in range(len(data))] for _ in range(height)]
+
+        for x, (o, h, l, c) in enumerate(data):
+            y_h = int((h - g_min) * scale)
+            y_l = int((l - g_min) * scale)
+            y_o = int((o - g_min) * scale)
+            y_c = int((c - g_min) * scale)
+
+            # Clamp
+            y_h = min(height - 1, max(0, y_h))
+            y_l = min(height - 1, max(0, y_l))
+            y_o = min(height - 1, max(0, y_o))
+            y_c = min(height - 1, max(0, y_c))
+
+            is_up = c >= o
+            color = C_GREEN if is_up else C_RED
+
+            # Wick
+            for y in range(y_l, y_h + 1):
+                grid[height - 1 - y][x] = _c("│", color, use_ansi)
+
+            # Body
+            b_start = min(y_o, y_c)
+            b_end = max(y_o, y_c)
+            for y in range(b_start, b_end + 1):
+                grid[height - 1 - y][x] = _c("█", color, use_ansi)
+
+        lines = []
+        # Add symbol info at top
+        change = ((data[-1][3] / data[0][0]) - 1) * 100
+        c_color = C_GREEN if change >= 0 else C_RED
+        info = f"{symbol} {self.tf} {len(data)} bars  Change: " + _c(f"{change:+.2f}%", c_color, use_ansi)
+        lines.append(info)
+
+        # Add price labels on the right
+        for i, row_chars in enumerate(grid):
+            price_level = g_max - (i / max(1, height - 1)) * (g_max - g_min)
+            label = f" {price_level:.4f}"
+            lines.append("".join(row_chars) + _c(label, C_GRAY, use_ansi))
+
+        return lines
 
     def _load_recent_closes(self, symbol: str, tf: str, limit: int) -> List[float]:
         assert self.conn is not None
@@ -272,6 +365,21 @@ class OhlcvSparkReader:
                 continue
         return vals
 
+    def _load_recent_ohlc(self, symbol: str, tf: str, limit: int) -> List[Tuple[float, float, float, float]]:
+        assert self.conn is not None
+        cur = self.conn.cursor()
+        try:
+            cur.execute(
+                "SELECT open, high, low, close FROM ohlcv WHERE symbol=? AND tf=? ORDER BY ts DESC LIMIT ?",
+                (symbol, tf, int(limit)),
+            )
+            rows = cur.fetchall()
+            if not rows:
+                return []
+            return [(float(r[0]), float(r[1]), float(r[2]), float(r[3])) for r in reversed(rows)]
+        except Exception:
+            return []
+
     @staticmethod
     def _spark(values: List[float], width: int) -> str:
         if not values:
@@ -283,11 +391,11 @@ class OhlcvSparkReader:
                 idx = min(len(values) - 1, int((i + 1) * step) - 1)
                 sampled.append(values[idx])
             values = sampled
-        chars = "._-:=+*#%@"
+        chars = " ▂▃▄▅▆▇█"
         lo = min(values)
         hi = max(values)
         if hi <= lo:
-            return "-" * len(values)
+            return "▄" * len(values)
         out: List[str] = []
         scale = float(len(chars) - 1) / float(hi - lo)
         for v in values:
@@ -710,13 +818,16 @@ class DBReader:
 
 
 def _trim(text: str, width: int) -> str:
-    if len(text) <= width:
+    vis = _strip_ansi(text)
+    if len(vis) < width:
+        return text + " " * (width - len(vis))
+    if len(vis) == width:
         return text
     if width <= 1:
-        return text[:width]
+        return vis[:width]
     if width <= 3:
-        return text[:width]
-    return text[: width - 3] + "..."
+        return vis[:width]
+    return vis[: width - 3] + "..."
 
 
 def _parse_units(unit_arg: str) -> List[str]:
@@ -739,7 +850,9 @@ def render(
     max_symbols: int,
     lookback_hours: int,
     units: List[str],
-    spark_rows: Optional[List[str]] = None,
+    use_ansi: bool,
+    spark_rows: List[str],
+    chart_lines: Optional[List[str]] = None,
 ) -> str:
     term_cols = shutil.get_terminal_size((140, 40)).columns
     cols = max(100, min(int(term_cols), 170))
@@ -749,7 +862,6 @@ def render(
     lines: List[str] = []
     lines.append(sep)
     lines.append(_trim(f"DONCH TELETEXT MONITOR   {now}", cols))
-    lines.append(_trim(f"LOG_UNITS={','.join(units)}", cols))
 
     if snap is None:
         lines.append(_trim("DB: unavailable", cols))
@@ -758,6 +870,10 @@ def render(
         wr = "-" if snap.winrate_period is None else f"{snap.winrate_period * 100.0:.1f}%"
         sh = "-" if snap.sharpe_period is None else f"{snap.sharpe_period:.2f}"
         pnl = "-" if snap.pnl_period is None else f"{snap.pnl_period:+.2f}"
+        if snap.pnl_period is not None:
+            c = C_GREEN if snap.pnl_period >= 0 else C_RED
+            pnl = _c(pnl, c, use_ansi)
+
         reg = snap.last_closed_regime or "n/a"
         lines.append(
             _trim(
@@ -803,10 +919,14 @@ def render(
         note = ",".join(note_parts[:5]) if note_parts else "-"
         note = _trim(note, note_width)
 
+        p_cal_str = _fmt_float(st.p_cal, 7, 3)
+        if st.p_cal is not None and st.pstar is not None and st.p_cal >= st.pstar:
+            p_cal_str = _c(p_cal_str, C_GREEN, use_ansi)
+
         row = (
             f"{st.symbol:<10} {_fmt_ago(st.last_seen):>4} {st.last_event[:9]:<9} "
-            f"{_fmt_float(st.p_cal,7,3)} {_fmt_float(st.pstar,4,2)} "
-            f"{_fmt_bool(st.schema_ok)}{_fmt_bool(st.meta_ok)}{_fmt_bool(st.strat_ok)}{_fmt_bool(st.scope_ok)} "
+            f"{p_cal_str} {_fmt_float(st.pstar,4,2)} "
+            f"{_fmt_bool_c(st.schema_ok, use_ansi)}{_fmt_bool_c(st.meta_ok, use_ansi)}{_fmt_bool_c(st.strat_ok, use_ansi)}{_fmt_bool_c(st.scope_ok, use_ansi)} "
             f"{reason[:12]:<12} {note}"
         )
         lines.append(_trim(row, cols))
@@ -827,20 +947,18 @@ def render(
         lines.append(_trim("LAST TRADES", cols))
         for tr in snap.recent_trades[:6]:
             ts = tr.closed_at.astimezone(timezone.utc).strftime("%m-%d %H:%M")
+            pnl_s = f"{tr.pnl:+8.2f}"
+            if tr.pnl >= 0:
+                pnl_s = _c(pnl_s, C_GREEN, use_ansi)
+            else:
+                pnl_s = _c(pnl_s, C_RED, use_ansi)
+
             row = (
-                f"{ts} {tr.symbol:<10} {tr.side:<5} pnl={tr.pnl:+8.2f} "
+                f"{ts} {tr.symbol:<10} {tr.side:<5} pnl={pnl_s} "
                 f"exit={tr.exit_reason or '-'} reg={tr.market_regime or '-'}"
             )
             lines.append(_trim(row, cols))
 
-    lines.append(sep)
-    lines.append(
-        _trim(
-            "Hints: p*=nan + reason=no_prob_gate => no-meta-veto mode. "
-            "str=N with meta=Y means strategy (not meta) rejected.",
-            cols,
-        )
-    )
     return "\n".join(lines)
 
 
@@ -888,7 +1006,8 @@ def main() -> int:
         bars=int(args.spark_bars),
         width=int(args.spark_width),
     )
-    screen = Screen(use_ansi=(_ansi_supported() and not args.no_ansi))
+    use_ansi = _ansi_supported() and not args.no_ansi
+    screen = Screen(use_ansi=use_ansi)
 
     stop = {"flag": False}
 
@@ -921,17 +1040,25 @@ def main() -> int:
                         parser.events.append(f"DB snapshot error: {type(e).__name__}")
                 next_stats_at = now_mono + max(1.0, args.stats_sec)
 
+            states = sorted(
+                parser.symbols.values(),
+                key=lambda s: s.last_seen or datetime(1970, 1, 1, tzinfo=timezone.utc),
+                reverse=True,
+            )
+
             spark_rows: List[str] = []
-            if sparks.enabled and int(args.spark_rows) > 0:
-                states = sorted(
-                    parser.symbols.values(),
-                    key=lambda s: s.last_seen or datetime(1970, 1, 1, tzinfo=timezone.utc),
-                    reverse=True,
-                )
-                for st in states[: int(args.spark_rows)]:
-                    row = sparks.render_symbol(st.symbol)
-                    if row:
-                        spark_rows.append(f"{st.symbol:<10} {row}")
+            if sparks.enabled and args.spark_rows > 0:
+                for st in states[: args.spark_rows]:
+                    rendered = sparks.render_symbol(st.symbol, use_ansi)
+                    if rendered:
+                        spark_rows.append(f"{st.symbol:<10} {rendered}")
+
+            chart_lines: List[str] = []
+            if sparks.enabled:
+                if states:
+                    term_w = shutil.get_terminal_size((140, 40)).columns
+                    chart_w = max(40, min(int(term_w), 170) - 2)
+                    chart_lines = sparks.render_big_chart(states[0].symbol, use_ansi, height=12, width=chart_w)
 
             screen.draw(
                 render(
@@ -940,7 +1067,9 @@ def main() -> int:
                     max_symbols=args.max_symbols,
                     lookback_hours=args.lookback_hours,
                     units=units,
+                    use_ansi=use_ansi,
                     spark_rows=spark_rows,
+                    chart_lines=chart_lines,
                 )
             )
             time.sleep(max(0.1, args.refresh_sec))

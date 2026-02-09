@@ -548,7 +548,18 @@ class LiveTrader:
             # Optional: golden row injector for parity testing (disabled by default).
             self.golden_store = None
             try:
-                if bool(self.cfg.get("META_GOLDEN_ENABLED", False)):
+                replay_flag = self.cfg.get("META_GOLDEN_ENABLED", None)
+                if replay_flag is None:
+                    # Backtest naming alias used by ops handovers.
+                    replay_flag = self.cfg.get("BT_META_REPLAY_ENABLED", False)
+
+                replay_enabled = (
+                    bool(replay_flag)
+                    if not isinstance(replay_flag, str)
+                    else replay_flag.strip().lower() in ("1", "true", "yes", "on")
+                )
+
+                if replay_enabled:
                     golden_path = Path(self.cfg.get("META_GOLDEN_PATH", "golden_features.parquet"))
                     allow_syms_raw = self.cfg.get("META_GOLDEN_SYMBOLS", "") or ""
                     allow_syms = [s.strip() for s in str(allow_syms_raw).split(",") if s.strip()] or None
@@ -1720,7 +1731,7 @@ class LiveTrader:
         # -----------------------------
         # risk_on / risk_on_1 (scope feature)
         # Offline logic:
-        #   risk_on = int((regime_up == 1) and (btc_trend_slope >= 0) and (btc_vol_level < btc_vol_hi))
+        #   risk_on = int((regime_up == 1) and (btc_trend_slope > 0) and (btc_vol_level < btc_vol_hi))
         # with fallback keys:
         #   btc_trend_slope: btcusdt_trend_slope else btc_trend_slope
         #   btc_vol_level:   btcusdt_vol_regime_level else btc_vol_regime_level
@@ -1759,7 +1770,7 @@ class LiveTrader:
         if (
             regime_up == 1
             and np.isfinite(btc_trend_slope)
-            and (btc_trend_slope >= 0.0)
+            and (btc_trend_slope > 0.0)
             and np.isfinite(btc_vol_level)
             and np.isfinite(btc_vol_hi)
             and (btc_vol_level < btc_vol_hi)
@@ -2335,10 +2346,12 @@ class LiveTrader:
         key_up = key.upper()
         aliases = {
             "FIXED_RISK_USDT": "RISK_USD",
+            "FIXED_RISK_CASH": "RISK_USD",
             "RISK_USDT": "RISK_USD",
             "RISK_PCT": "RISK_EQUITY_PCT",
             "WINPROB_SIZE_FLOOR": "WINPROB_PROB_FLOOR",
             "WINPROB_SIZE_CAP":   "WINPROB_PROB_CAP",
+            "BT_META_REPLAY_ENABLED": "META_GOLDEN_ENABLED",
         }
         return aliases.get(key_up, key_up)
 
@@ -3034,8 +3047,25 @@ class LiveTrader:
                 pstar = None
                 pstar_src = "cfg:parse_error"
 
-            # Optional: scope gating (deployment policy), OFF by default for offline-run parity.
+            # Optional scope gating policy.
+            # Legacy:
+            #   META_SCOPE_GATE_ENABLED=<bool>
+            # New:
+            #   META_GATE_SCOPE=all|artifact|<explicit_scope>
+            #   META_GATE_FAIL_CLOSED=<bool>
             scope_gate_enabled = bool(self.cfg.get("META_SCOPE_GATE_ENABLED", False))
+            gate_scope_raw = str(self.cfg.get("META_GATE_SCOPE", "") or "").strip()
+            gate_scope_l = gate_scope_raw.lower()
+            if gate_scope_raw:
+                if gate_scope_l in ("all", "none", "off", "disabled"):
+                    scope_gate_enabled = False
+                elif gate_scope_l in ("artifact", "bundle", "auto", "default"):
+                    scope_gate_enabled = True
+                else:
+                    # explicit scope override string
+                    scope_gate_enabled = True
+
+            meta_gate_fail_closed = bool(self.cfg.get("META_GATE_FAIL_CLOSED", True))
 
 
             # Strategy verdict *before* meta veto (observability only)
@@ -3045,6 +3075,14 @@ class LiveTrader:
             meta_required = bool(getattr(cfg, "META_MODEL_ENABLED", True))
 
             pstar_scope = getattr(wp, "pstar_scope", None) if wp is not None else None
+            if gate_scope_raw:
+                if gate_scope_l in ("all", "none", "off", "disabled"):
+                    pstar_scope = None
+                elif gate_scope_l in ("artifact", "bundle", "auto", "default"):
+                    # keep artifact scope as-is
+                    pass
+                else:
+                    pstar_scope = gate_scope_raw
             scope_ok, scope_info = eval_meta_scope(pstar_scope, meta_row)
 
             risk_on_1_raw = scope_info.get("risk_on_1_raw", None)
@@ -3088,7 +3126,8 @@ class LiveTrader:
 
                 else:
                     # pstar present -> optionally enforce scope, then threshold
-                    if scope_gate_enabled and (not bool(scope_ok)):
+                    scope_blocked = scope_gate_enabled and (not bool(scope_ok))
+                    if scope_blocked and meta_gate_fail_closed:
                         meta_ok = False
                         if missing_cols:
                             reason = f"scope_error:{(pstar_scope or 'NONE')}"
@@ -3098,6 +3137,9 @@ class LiveTrader:
                             reason = f"scope_fail:{(pstar_scope or 'NONE')}"
 
                     else:
+                        if scope_blocked:
+                            # Fail-open mode requested by config.
+                            reason = f"scope_bypass:{(pstar_scope or 'NONE')}"
                         try:
                             p_cal_f = float(p_cal) if p_cal is not None else float("nan")
                         except Exception:
@@ -3406,10 +3448,12 @@ class LiveTrader:
 
     def _winprob_multiplier(self, wp: float) -> float:
         """
-        Map win-probability 'wp' to size multiplier, controlled by YAML.
+        Map calibrated meta probability to a sizing multiplier.
+        Prefers META_* keys and falls back to legacy WINPROB_* keys.
         """
         cfgd = self.cfg
-        if not bool(cfgd.get("WINPROB_SIZING_ENABLED", True)):
+        enabled = cfgd.get("META_SIZING_ENABLED", cfgd.get("WINPROB_SIZING_ENABLED", True))
+        if not bool(enabled):
             return 1.0
         try:
             wp = float(wp)
@@ -3419,13 +3463,23 @@ class LiveTrader:
             return 1.0
         wp = float(np.clip(wp, 0.0, 1.0))
 
-        prob_lo = float(cfgd.get("WINPROB_PROB_FLOOR", cfgd.get("WINPROB_SIZE_FLOOR", 0.50)))
-        prob_hi = float(cfgd.get("WINPROB_PROB_CAP",   cfgd.get("WINPROB_SIZE_CAP",   0.90)))
+        prob_lo = float(
+            cfgd.get(
+                "META_SIZING_P0",
+                cfgd.get("WINPROB_PROB_FLOOR", cfgd.get("WINPROB_SIZE_FLOOR", 0.50)),
+            )
+        )
+        prob_hi = float(
+            cfgd.get(
+                "META_SIZING_P1",
+                cfgd.get("WINPROB_PROB_CAP", cfgd.get("WINPROB_SIZE_CAP", 0.90)),
+            )
+        )
         if prob_hi <= prob_lo:
             prob_hi = prob_lo + 1e-6
 
-        mult_lo = float(cfgd.get("WINPROB_MIN_MULTIPLIER", 0.70))
-        mult_hi = float(cfgd.get("WINPROB_MAX_MULTIPLIER", 1.30))
+        mult_lo = float(cfgd.get("META_SIZING_MIN", cfgd.get("WINPROB_MIN_MULTIPLIER", 0.70)))
+        mult_hi = float(cfgd.get("META_SIZING_MAX", cfgd.get("WINPROB_MAX_MULTIPLIER", 1.30)))
         if abs(mult_hi - mult_lo) < 1e-12:
             return mult_lo
 
@@ -3632,17 +3686,22 @@ class LiveTrader:
         tp_trigger_dir = 1 if is_long else 2               # long: rising, short: falling
         side_label = "LONG" if is_long else "SHORT"
 
-        # --- Base risk selection (fixed | percent of equity) ---
+        # --- Base risk selection (cash | percent of equity) ---
         mode = str(self.cfg.get("RISK_MODE", "fixed")).lower()
-        fixed_risk = float(self.cfg.get("RISK_USD", 10.0))
+        fixed_risk = float(
+            self.cfg.get(
+                "FIXED_RISK_CASH",
+                self.cfg.get("FIXED_RISK_USDT", self.cfg.get("RISK_USD", 10.0)),
+            )
+        )
         base_risk_usd = fixed_risk
-        if mode == "percent":
+        if mode in ("percent", "pct"):
             try:
                 latest_eq = await self.db.latest_equity()
                 latest_eq = float(latest_eq) if latest_eq is not None else 0.0
             except Exception:
                 latest_eq = 0.0
-            pct = float(self.cfg.get("RISK_EQUITY_PCT", 0.01))  # default 1%
+            pct = float(self.cfg.get("RISK_PCT", self.cfg.get("RISK_EQUITY_PCT", 0.01)))
             base_risk_usd = max(0.0, latest_eq * pct) if latest_eq > 0 else fixed_risk
 
         # --- Multipliers ---
@@ -3665,24 +3724,64 @@ class LiveTrader:
             except Exception as e:
                 LOG.warning("ETH barometer unavailable (%s). Proceeding with base risk.", e)
 
-        # 2) VWAP stack multiplier (from scan diagnostics)
-        vw_mult = self._vwap_stack_multiplier(
-            getattr(sig, "vwap_stack_frac", None),
-            getattr(sig, "vwap_stack_expansion_pct", None),
-        )
-
-        # 3) Meta sizing multiplier (offline parity: sizing_curve.csv on p_cal)
+        # 2) Meta sizing multiplier (offline parity: sizing_curve.csv on p_cal)
         p_cal = float(getattr(sig, "win_probability", float("nan")))
         try:
             risk_on_f = float(getattr(sig, "risk_on", 0.0) or 0.0)
         except Exception:
             risk_on_f = 0.0
-        meta_mult = self._resolve_meta_multiplier(p_cal, risk_on_f)
+        # IMPORTANT: resolve base meta multiplier without applying probe here.
+        # Probe capping must be on the combined size multiplier (meta x regime), not meta alone.
+        meta_mult = self._resolve_meta_multiplier(p_cal, 1.0)
 
-        LOG.info("SIZING_META symbol=%s p_cal=%s meta_mult=%.4f risk_on=%s",
-                sig.symbol, str(p_cal), float(meta_mult), str(getattr(sig, "risk_on", None)))
+        # 3) Regime downsize (ETH barometer) then multiplier clamps.
+        core_size_mult = float(meta_mult) * float(eth_mult)
 
-        # 4) YAML scalers (generic, linear maps feature→mult). Local helper.
+        size_min_cap_raw = self.cfg.get("SIZE_MIN_CAP", self.cfg.get("SIZING_MULT_MIN", None))
+        size_max_cap_raw = self.cfg.get("SIZE_MAX_CAP", self.cfg.get("SIZING_MULT_MAX", None))
+        try:
+            size_min_cap = float(size_min_cap_raw) if size_min_cap_raw is not None else 0.0
+        except Exception:
+            size_min_cap = 0.0
+        try:
+            size_max_cap = float(size_max_cap_raw) if size_max_cap_raw is not None else 1e9
+        except Exception:
+            size_max_cap = 1e9
+
+        if np.isfinite(size_min_cap) and size_min_cap > 0.0:
+            core_size_mult = max(core_size_mult, size_min_cap)
+        if np.isfinite(size_max_cap) and size_max_cap > 0.0:
+            core_size_mult = min(core_size_mult, size_max_cap)
+
+        # 4) Risk-off probe cap (exact behavior: cap resulting size multiplier when risk_on==0).
+        probe_cap_applied = False
+        if bool(self.cfg.get("META_RISK_OFF_PROBE_ENABLED", True)) and risk_on_f != 1.0:
+            try:
+                probe = float(self.cfg.get("RISK_OFF_PROBE_MULT", 0.01))
+            except Exception:
+                probe = 0.01
+            if np.isfinite(probe) and probe > 0.0:
+                core_size_mult = min(core_size_mult, probe)
+                probe_cap_applied = True
+
+        LOG.info(
+            "SIZING_META symbol=%s p_cal=%s meta_mult=%.4f eth_mult=%.4f core_mult=%.4f risk_on=%s probe_cap=%s",
+            sig.symbol,
+            str(p_cal),
+            float(meta_mult),
+            float(eth_mult),
+            float(core_size_mult),
+            str(getattr(sig, "risk_on", None)),
+            str(probe_cap_applied),
+        )
+
+        # 5) VWAP stack multiplier (from scan diagnostics)
+        vw_mult = self._vwap_stack_multiplier(
+            getattr(sig, "vwap_stack_frac", None),
+            getattr(sig, "vwap_stack_expansion_pct", None),
+        )
+
+        # 6) YAML scalers (generic, linear maps feature→mult). Local helper.
         def _apply_yaml_scalers(sig_obj: Signal) -> float:
             scalers = self.cfg.get("SIZING_SCALERS", []) or []
             if not isinstance(scalers, list) or not scalers:
@@ -3732,8 +3831,9 @@ class LiveTrader:
 
         yaml_mult = _apply_yaml_scalers(sig)
 
-        # Combine & clamp final risk
-        risk_usd = base_risk_usd * eth_mult * vw_mult * meta_mult * yaml_mult
+        # Final size multiplier and cash-risk target.
+        size_mult = float(core_size_mult) * float(vw_mult) * float(yaml_mult)
+        risk_usd = base_risk_usd * size_mult
 
         if self.cfg.get("RISK_USD_MIN") is not None:
             risk_usd = max(float(self.cfg["RISK_USD_MIN"]), risk_usd)
@@ -3741,8 +3841,22 @@ class LiveTrader:
             risk_usd = min(float(self.cfg["RISK_USD_MAX"]), risk_usd)
         sig.risk_usd = float(risk_usd)
 
-        LOG.info("Sizing(%s) base=%.2f · eth×=%.2f · vwap×=%.2f · p_cal=%.4f (meta×=%.4f, risk_on=%.0f) · yaml×=%.2f → risk=%.2f",
-                side_label, base_risk_usd, eth_mult, vw_mult, p_cal, meta_mult, risk_on_f, yaml_mult, risk_usd)
+        LOG.info(
+            "Sizing(%s) mode=%s base=%.2f · p_cal=%.4f · core×=%.4f (meta×=%.4f, eth×=%.4f, risk_on=%.0f, probe_cap=%s) · vwap×=%.2f · yaml×=%.2f · total×=%.4f → risk=%.2f",
+            side_label,
+            mode,
+            base_risk_usd,
+            p_cal,
+            float(core_size_mult),
+            float(meta_mult),
+            float(eth_mult),
+            risk_on_f,
+            str(probe_cap_applied),
+            float(vw_mult),
+            float(yaml_mult),
+            float(size_mult),
+            risk_usd,
+        )
 
 
         # --- Compute size from live price / ATR distance ---

@@ -74,4 +74,32 @@ class TestLiveMetaProbeKnob(unittest.TestCase):
         src = inspect.getsource(LiveTrader._scan_symbol_for_signal)
         self.assertIn("if pstar is None:", src)
         self.assertIn('reason = "no_prob_gate"', src)
-        self.assertIn("if scope_gate_enabled and (not bool(scope_ok))", src)
+        self.assertIn("scope_blocked = scope_gate_enabled and (not bool(scope_ok))", src)
+
+    def test_winprob_multiplier_supports_meta_sizing_knobs(self) -> None:
+        trader = LiveTrader.__new__(LiveTrader)
+        trader.cfg = {
+            "META_SIZING_ENABLED": True,
+            "META_SIZING_P0": 0.60,
+            "META_SIZING_P1": 0.90,
+            "META_SIZING_MIN": 0.80,
+            "META_SIZING_MAX": 1.60,
+        }
+
+        self.assertAlmostEqual(LiveTrader._winprob_multiplier(trader, 0.60), 0.80, places=8)
+        self.assertAlmostEqual(LiveTrader._winprob_multiplier(trader, 0.90), 1.60, places=8)
+        self.assertAlmostEqual(LiveTrader._winprob_multiplier(trader, 0.75), 1.20, places=8)
+
+    def test_scan_supports_meta_gate_scope_and_fail_closed_flags(self) -> None:
+        src = inspect.getsource(LiveTrader._scan_symbol_for_signal)
+        self.assertIn("META_GATE_SCOPE", src)
+        self.assertIn("META_GATE_FAIL_CLOSED", src)
+
+    def test_meta_replay_alias_supported(self) -> None:
+        src = inspect.getsource(LiveTrader.__init__)
+        self.assertIn("BT_META_REPLAY_ENABLED", src)
+
+    def test_open_position_caps_probe_after_core_multiplier(self) -> None:
+        src = inspect.getsource(LiveTrader._open_position)
+        self.assertIn("_resolve_meta_multiplier(p_cal, 1.0)", src)
+        self.assertIn("core_size_mult = min(core_size_mult, probe)", src)

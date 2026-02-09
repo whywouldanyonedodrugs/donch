@@ -3,9 +3,11 @@ STRATEGY_SPEC_PATH: "strategies/donch_pullback_long.yaml"
 
 # Sizing
 RISK_MODE: "fixed"          # or "percent"
-RISK_USD: 5.0               # base per-trade risk (USDT)
-RISK_USD_MAX: 5.0           # hard cap to keep live trades small during validation
+RISK_USD: 10.0              # temporary canary base risk (USDT)
+FIXED_RISK_CASH: 10.0       # alias used by parity handovers
+RISK_USD_MAX: 10.0          # keep conservative until parity + canary acceptance
 RISK_EQUITY_PCT: 0.01       # used if RISK_MODE="percent"
+RISK_PCT: 0.01              # alias used by parity handovers
 MIN_TRADE_AUTOPAD_ENABLED: false
 MIN_TRADE_AUTOPAD_CAP_USD: 5.0
 
@@ -32,12 +34,18 @@ WINPROB_ARTIFACT_DIR: results/meta_export
 MIN_WINPROB_TO_TRADE: null
 ETH_BAROMETER_ENABLED: true        # as requested for testing
 REGIME_BLOCK_WHEN_DOWN: false       # let entries through while testing
+BT_META_REPLAY_ENABLED: false       # temporary: no replay path while waiting for new bundle
 # optional sizing-by-prob (already supported in your bot)
 WINPROB_SIZING_ENABLED: true
 WINPROB_MIN_MULTIPLIER: 0.80
 WINPROB_MAX_MULTIPLIER: 1.60
 WINPROB_PROB_FLOOR: 0.60
 WINPROB_PROB_CAP: 0.90
+META_SIZING_P0: 0.60
+META_SIZING_P1: 0.90
+META_SIZING_MIN: 0.80
+META_SIZING_MAX: 1.60
+VWAP_STACK_SIZING_ENABLED: false    # temporary: keep sizing chain parity-focused
 
 
 UNIVERSE_CTX_REFRESH_MIN: 1440 
@@ -97,11 +105,13 @@ VOL_CAP_BARS: 15000
 
 # Meta gating
 META_PROB_GATE_ENABLED: false          # Option 1 = false
-META_PROB_THRESHOLD: null             # keep null for parity with offline run
+META_PROB_THRESHOLD: null              # temporary parity-safe: disable prob threshold
+META_GATE_SCOPE: "all"                 # temporary parity-safe: no scope veto while threshold is disabled
+META_GATE_FAIL_CLOSED: false           # temporary parity-safe
 
 # Meta sizing
 META_SIZING_ENABLED: true
-RISK_OFF_PROBE_MULT: 0.01
+RISK_OFF_PROBE_MULT: 0.05
 META_SIZING_CURVE_PATH: null          # if null: use <meta_dir>/sizing_curve.csv
 META_SIZING_FAIL_CLOSED: true         # if curve missing/invalid: do not upsize; cap to probe
 
