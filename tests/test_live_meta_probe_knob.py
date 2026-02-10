@@ -101,5 +101,5 @@ class TestLiveMetaProbeKnob(unittest.TestCase):
 
     def test_open_position_caps_probe_after_core_multiplier(self) -> None:
         src = inspect.getsource(LiveTrader._open_position)
-        self.assertIn("_resolve_meta_multiplier(p_cal, 1.0)", src)
-        self.assertIn("core_size_mult = min(core_size_mult, probe)", src)
+        self.assertIn("size_mult_final = min(size_mult_final, probe)", src)
+        self.assertIn("risk_scale_raw = getattr(sig, \"risk_scale\", None)", src)

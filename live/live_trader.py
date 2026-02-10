@@ -366,6 +366,7 @@ class Signal:
     # Offline risk-on flags (used for probe sizing when risk_off)
     risk_on: int = 0
     risk_on_1: int = 0
+    risk_scale: Optional[float] = None
 
     def __post_init__(self):
         self.side = str(self.side).upper()
@@ -653,6 +654,40 @@ class LiveTrader:
 
         return 1.0
 
+    def _btc_vol_hi_threshold(self) -> float:
+        """
+        Priority:
+          1) regimes_report.json threshold (btc_vol_hi)
+          2) config default (BTC_VOL_HI)
+        """
+        try:
+            thresholds = getattr(self, "regime_thresholds", None) or {}
+            if "btc_vol_hi" in thresholds:
+                v = float(thresholds.get("btc_vol_hi"))
+                if np.isfinite(v):
+                    return v
+        except Exception:
+            pass
+        try:
+            v = float(self.cfg.get("BTC_VOL_HI"))
+            if np.isfinite(v):
+                return v
+        except Exception:
+            pass
+        return float("nan")
+
+    @staticmethod
+    def _valid_prob_01(value: Any) -> tuple[bool, float]:
+        try:
+            p = float(value)
+        except Exception:
+            return False, float("nan")
+        if not np.isfinite(p):
+            return False, p
+        if p < 0.0 or p > 1.0:
+            return False, p
+        return True, p
+
     def _offline_risk_on(self, meta_row: dict) -> int:
         # Prefer already-built feature if present
         v = meta_row.get("risk_on", None)
@@ -667,7 +702,7 @@ class LiveTrader:
             regime_up = float(meta_row.get("regime_up", np.nan))
             btc_trend_slope = float(meta_row.get("btc_trend_slope", np.nan))
             btc_vol_regime_level = float(meta_row.get("btc_vol_regime_level", np.nan))
-            btc_vol_hi = float(self.regime_thresholds.get("btc_vol_hi"))
+            btc_vol_hi = float(self._btc_vol_hi_threshold())
         except Exception:
             return 0
 
@@ -1744,7 +1779,7 @@ class LiveTrader:
             return None
 
         try:
-            btc_vol_hi = float(self.regime_thresholds["btc_vol_hi"])
+            btc_vol_hi = float(self._btc_vol_hi_threshold())
         except Exception:
             btc_vol_hi = np.nan
 
@@ -3140,24 +3175,19 @@ class LiveTrader:
                         if scope_blocked:
                             # Fail-open mode requested by config.
                             reason = f"scope_bypass:{(pstar_scope or 'NONE')}"
-                        try:
-                            p_cal_f = float(p_cal) if p_cal is not None else float("nan")
-                        except Exception:
-                            p_cal_f = float("nan")
-
+                        p_ok, p_cal_f = self._valid_prob_01(p_cal)
                         try:
                             pstar_f = float(pstar)
                         except Exception:
                             pstar_f = float("nan")
 
-                        if np.isfinite(p_cal_f) and np.isfinite(pstar_f):
+                        if p_ok and np.isfinite(pstar_f):
                             meta_ok = (p_cal_f >= pstar_f)
                             reason = "ok" if meta_ok else "below_pstar"
                         else:
-                            meta_ok = False
-                            reason = "bad_p_cal_or_pstar"
-                            if err is None:
-                                err = "bad_p_cal_or_pstar"
+                            # Parity rule: invalid/missing probability does not trigger threshold veto.
+                            meta_ok = True
+                            reason = "prob_invalid_no_gate"
 
             # ---------------- META_DECISION log (expanded observability) ----------------
             bundle = getattr(self, "bundle_id", None) or "no_bundle"
@@ -3382,6 +3412,16 @@ class LiveTrader:
             except Exception:
                 signal_obj.risk_on_1 = 0
 
+            # Optional direct size override from signal row (backtest parity path).
+            risk_scale_raw = last.get("risk_scale", None)
+            if risk_scale_raw is None:
+                risk_scale_raw = meta_full.get("risk_scale", None)
+            try:
+                risk_scale_f = float(risk_scale_raw)
+                signal_obj.risk_scale = risk_scale_f if np.isfinite(risk_scale_f) else None
+            except Exception:
+                signal_obj.risk_scale = None
+
 
 
             # -------------- Final INFO line ----------------------
@@ -3459,7 +3499,7 @@ class LiveTrader:
             wp = float(wp)
         except Exception:
             return 1.0
-        if not np.isfinite(wp) or wp <= 0.0:
+        if not np.isfinite(wp):
             return 1.0
         wp = float(np.clip(wp, 0.0, 1.0))
 
@@ -3485,6 +3525,56 @@ class LiveTrader:
 
         x = (np.clip(wp, prob_lo, prob_hi) - prob_lo) / (prob_hi - prob_lo)
         return float(mult_lo + x * (mult_hi - mult_lo))
+
+    def _dyn_size_multiplier(self, prob_val: Any, eth_hist_val: Any) -> float:
+        """
+        Backtest parity sizing path:
+          - META probability linear map (P0/P1 -> MIN/MAX)
+          - ETH hist down-mult when hist < DYN_MACD_HIST_THRESH
+          - Clamp to [SIZE_MIN_CAP, SIZE_MAX_CAP]
+        """
+        size_mult = 1.0
+
+        prob_ok, p = self._valid_prob_01(prob_val)
+        if bool(self.cfg.get("META_SIZING_ENABLED", True)) and prob_ok:
+            size_mult = float(self._winprob_multiplier(p))
+
+        try:
+            eth_hist = float(eth_hist_val)
+        except Exception:
+            eth_hist = float("nan")
+        try:
+            hist_thresh = float(self.cfg.get("DYN_MACD_HIST_THRESH", 0.0))
+        except Exception:
+            hist_thresh = 0.0
+        try:
+            regime_down_mult = float(self.cfg.get("REGIME_DOWNSIZE_MULT", 1.0))
+        except Exception:
+            regime_down_mult = 1.0
+
+        if np.isfinite(eth_hist) and np.isfinite(hist_thresh) and np.isfinite(regime_down_mult):
+            if eth_hist < hist_thresh:
+                size_mult *= regime_down_mult
+
+        size_min_cap_raw = self.cfg.get("SIZE_MIN_CAP", self.cfg.get("SIZING_MULT_MIN", None))
+        size_max_cap_raw = self.cfg.get("SIZE_MAX_CAP", self.cfg.get("SIZING_MULT_MAX", None))
+        try:
+            size_min_cap = float(size_min_cap_raw) if size_min_cap_raw is not None else 0.0
+        except Exception:
+            size_min_cap = 0.0
+        try:
+            size_max_cap = float(size_max_cap_raw) if size_max_cap_raw is not None else float("inf")
+        except Exception:
+            size_max_cap = float("inf")
+
+        if np.isfinite(size_min_cap) and size_min_cap > 0.0:
+            size_mult = max(size_mult, size_min_cap)
+        if np.isfinite(size_max_cap) and size_max_cap > 0.0:
+            size_mult = min(size_mult, size_max_cap)
+
+        if (not np.isfinite(size_mult)) or size_mult < 0.0:
+            return 0.0
+        return float(size_mult)
 
     def _yaml_sizing_multiplier(self, sig: Signal) -> float:
         """
@@ -3642,7 +3732,7 @@ class LiveTrader:
         """
         Open a LONG or SHORT with:
         - base risk (fixed or % equity)
-        - multipliers: ETH barometer, VWAP-stack, WinProb, YAML scalers
+        - parity sizing chain (risk_scale override OR dyn meta sizing, risk-off probe cap)
         - OCO protection: SL + (optional) TP1 + final TP
         - full DB journaling + Telegram
         """
@@ -3686,7 +3776,32 @@ class LiveTrader:
         tp_trigger_dir = 1 if is_long else 2               # long: rising, short: falling
         side_label = "LONG" if is_long else "SHORT"
 
-        # --- Base risk selection (cash | percent of equity) ---
+        # --- Regime handling FIRST (parity with backtest order) ---
+        regime_block = bool(self.cfg.get("REGIME_BLOCK_WHEN_DOWN", True))
+        try:
+            regime_up = float(getattr(sig, "regime_up_flag", 0.0) or 0.0) == 1.0
+        except Exception:
+            regime_up = bool(getattr(sig, "regime_up_flag", False))
+        if regime_block and (not regime_up):
+            LOG.info("ENTRY_SKIP_REGIME symbol=%s regime_up=%s regime_block=%s", sig.symbol, str(regime_up), str(regime_block))
+            return
+
+        try:
+            latest_eq_raw = await self.db.latest_equity()
+            latest_eq = float(latest_eq_raw) if latest_eq_raw is not None else float("nan")
+        except Exception:
+            latest_eq = float("nan")
+
+        equity_for_sizing = latest_eq if np.isfinite(latest_eq) and latest_eq > 0.0 else 0.0
+        if (not regime_up) and (not regime_block):
+            try:
+                regime_size_down = float(self.cfg.get("REGIME_SIZE_WHEN_DOWN", 1.0))
+            except Exception:
+                regime_size_down = 1.0
+            if np.isfinite(regime_size_down) and regime_size_down >= 0.0 and equity_for_sizing > 0.0:
+                equity_for_sizing = equity_for_sizing * regime_size_down
+
+        # --- Convert multiplier into risk override (parity path) ---
         mode = str(self.cfg.get("RISK_MODE", "fixed")).lower()
         fixed_risk = float(
             self.cfg.get(
@@ -3694,66 +3809,33 @@ class LiveTrader:
                 self.cfg.get("FIXED_RISK_USDT", self.cfg.get("RISK_USD", 10.0)),
             )
         )
-        base_risk_usd = fixed_risk
-        if mode in ("percent", "pct"):
-            try:
-                latest_eq = await self.db.latest_equity()
-                latest_eq = float(latest_eq) if latest_eq is not None else 0.0
-            except Exception:
-                latest_eq = 0.0
-            pct = float(self.cfg.get("RISK_PCT", self.cfg.get("RISK_EQUITY_PCT", 0.01)))
-            base_risk_usd = max(0.0, latest_eq * pct) if latest_eq > 0 else fixed_risk
+        risk_pct = float(self.cfg.get("RISK_PCT", self.cfg.get("RISK_EQUITY_PCT", 0.01)))
 
-        # --- Multipliers ---
-        # 1) ETH 4h MACD barometer
-        eth_mult = 1.0
-        if bool(self.cfg.get("ETH_BAROMETER_ENABLED", True)):
-            try:
-                eth = await self._get_eth_macd_barometer()
-                hist = float(eth.get("hist", 0.0)) if eth else 0.0
-                if is_long:
-                    cutoff = float(self.cfg.get("ETH_MACD_HIST_CUTOFF_NEG", 0.0))
-                    unfavorable = (hist < cutoff)
-                else:
-                    cutoff = float(self.cfg.get("ETH_MACD_HIST_CUTOFF_POS", 0.0))
-                    unfavorable = (hist > cutoff)
-                if unfavorable:
-                    eth_mult = float(self.cfg.get("UNFAVORABLE_RISK_RESIZE_FACTOR", 0.2))
-                    LOG.info("ETH barometer unfavorable → resize x%.2f (hist=%.3f cutoff=%.3f side=%s)",
-                             eth_mult, hist, cutoff, side_label)
-            except Exception as e:
-                LOG.warning("ETH barometer unavailable (%s). Proceeding with base risk.", e)
-
-        # 2) Meta sizing multiplier (offline parity: sizing_curve.csv on p_cal)
         p_cal = float(getattr(sig, "win_probability", float("nan")))
+        eth_hist = getattr(sig, "eth_macd_hist_4h", float("nan"))
+
+        risk_scale_used = False
+        risk_scale_raw = getattr(sig, "risk_scale", None)
+        try:
+            risk_scale_f = float(risk_scale_raw)
+            if np.isfinite(risk_scale_f):
+                size_mult_pre_probe = float(risk_scale_f)
+                risk_scale_used = True
+            else:
+                size_mult_pre_probe = float(self._dyn_size_multiplier(p_cal, eth_hist))
+        except Exception:
+            size_mult_pre_probe = float(self._dyn_size_multiplier(p_cal, eth_hist))
+
+        if not np.isfinite(size_mult_pre_probe):
+            size_mult_pre_probe = 0.0
+        size_mult_pre_probe = max(0.0, float(size_mult_pre_probe))
+
         try:
             risk_on_f = float(getattr(sig, "risk_on", 0.0) or 0.0)
         except Exception:
             risk_on_f = 0.0
-        # IMPORTANT: resolve base meta multiplier without applying probe here.
-        # Probe capping must be on the combined size multiplier (meta x regime), not meta alone.
-        meta_mult = self._resolve_meta_multiplier(p_cal, 1.0)
 
-        # 3) Regime downsize (ETH barometer) then multiplier clamps.
-        core_size_mult = float(meta_mult) * float(eth_mult)
-
-        size_min_cap_raw = self.cfg.get("SIZE_MIN_CAP", self.cfg.get("SIZING_MULT_MIN", None))
-        size_max_cap_raw = self.cfg.get("SIZE_MAX_CAP", self.cfg.get("SIZING_MULT_MAX", None))
-        try:
-            size_min_cap = float(size_min_cap_raw) if size_min_cap_raw is not None else 0.0
-        except Exception:
-            size_min_cap = 0.0
-        try:
-            size_max_cap = float(size_max_cap_raw) if size_max_cap_raw is not None else 1e9
-        except Exception:
-            size_max_cap = 1e9
-
-        if np.isfinite(size_min_cap) and size_min_cap > 0.0:
-            core_size_mult = max(core_size_mult, size_min_cap)
-        if np.isfinite(size_max_cap) and size_max_cap > 0.0:
-            core_size_mult = min(core_size_mult, size_max_cap)
-
-        # 4) Risk-off probe cap (exact behavior: cap resulting size multiplier when risk_on==0).
+        size_mult_final = float(size_mult_pre_probe)
         probe_cap_applied = False
         if bool(self.cfg.get("META_RISK_OFF_PROBE_ENABLED", True)) and risk_on_f != 1.0:
             try:
@@ -3761,100 +3843,55 @@ class LiveTrader:
             except Exception:
                 probe = 0.01
             if np.isfinite(probe) and probe > 0.0:
-                core_size_mult = min(core_size_mult, probe)
+                size_mult_final = min(size_mult_final, probe)
                 probe_cap_applied = True
 
+        size_mult_final = max(0.0, float(size_mult_final))
+
+        if mode in ("percent", "pct"):
+            base_risk_usd = max(0.0, equity_for_sizing * risk_pct) if equity_for_sizing > 0.0 else fixed_risk
+            risk_pct_override = risk_pct * size_mult_final
+            if equity_for_sizing > 0.0:
+                risk_cash_target = max(0.0, equity_for_sizing * risk_pct_override)
+            else:
+                risk_cash_target = max(0.0, fixed_risk * size_mult_final)
+        else:
+            base_risk_usd = fixed_risk
+            fixed_cash_override = fixed_risk * size_mult_final
+            risk_cash_target = max(0.0, fixed_cash_override)
+
+        risk_usd = float(risk_cash_target)
+        sig.risk_usd = float(risk_usd)
+        sig.size_mult_pre_probe = float(size_mult_pre_probe)
+        sig.size_mult_final = float(size_mult_final)
+        sig.equity_for_sizing = float(equity_for_sizing)
+        sig.risk_cash_target = float(risk_cash_target)
+
         LOG.info(
-            "SIZING_META symbol=%s p_cal=%s meta_mult=%.4f eth_mult=%.4f core_mult=%.4f risk_on=%s probe_cap=%s",
+            "SIZING_META symbol=%s p_cal=%s risk_scale=%s risk_scale_used=%s size_mult_pre_probe=%.4f size_mult_final=%.4f risk_on=%.0f probe_cap=%s equity_for_sizing=%.2f risk_cash_target=%.2f",
             sig.symbol,
             str(p_cal),
-            float(meta_mult),
-            float(eth_mult),
-            float(core_size_mult),
-            str(getattr(sig, "risk_on", None)),
+            str(risk_scale_raw),
+            str(risk_scale_used),
+            float(size_mult_pre_probe),
+            float(size_mult_final),
+            float(risk_on_f),
             str(probe_cap_applied),
+            float(equity_for_sizing),
+            float(risk_cash_target),
         )
-
-        # 5) VWAP stack multiplier (from scan diagnostics)
-        vw_mult = self._vwap_stack_multiplier(
-            getattr(sig, "vwap_stack_frac", None),
-            getattr(sig, "vwap_stack_expansion_pct", None),
-        )
-
-        # 6) YAML scalers (generic, linear maps feature→mult). Local helper.
-        def _apply_yaml_scalers(sig_obj: Signal) -> float:
-            scalers = self.cfg.get("SIZING_SCALERS", []) or []
-            if not isinstance(scalers, list) or not scalers:
-                return 1.0
-            data = dict(vars(sig_obj))
-            # ensure common extras exist
-            data.setdefault("win_probability", float(getattr(sig_obj, "win_probability", 0.0) or 0.0))
-            data.setdefault("vwap_stack_frac", getattr(sig_obj, "vwap_stack_frac", None))
-            data.setdefault("vwap_stack_expansion_pct", getattr(sig_obj, "vwap_stack_expansion_pct", None))
-            data.setdefault("vwap_stack_slope_pph", getattr(sig_obj, "vwap_stack_slope_pph", None))
-
-            def linmap(x, in_lo, in_hi, out_lo, out_hi):
-                in_hi = in_hi if in_hi > in_lo else (in_lo + 1e-9)
-                x = float(x)
-                x = min(max(x, in_lo), in_hi)
-                t = (x - in_lo) / (in_hi - in_lo)
-                return out_lo + t * (out_hi - out_lo)
-
-            mult = 1.0
-            for s in scalers:
-                if not isinstance(s, dict):
-                    continue
-                feat = s.get("feature") or s.get("field")
-                if not feat:
-                    continue
-                x = data.get(feat, s.get("default", 0.0))
-                try:
-                    x = float(x) if x is not None and np.isfinite(x) else float(s.get("default", 0.0))
-                except Exception:
-                    x = float(s.get("default", 0.0))
-                in_lo = float(s.get("in_min", s.get("min", 0.0)))
-                in_hi = float(s.get("in_max", s.get("max", 1.0)))
-                out_lo = float(s.get("mult_min", 1.0))
-                out_hi = float(s.get("mult_max", 1.0))
-                m = linmap(x, in_lo, in_hi, out_lo, out_hi)
-                if "cap_min" in s or "cap_max" in s:
-                    cap_min = float(s.get("cap_min", -1e18))
-                    cap_max = float(s.get("cap_max", +1e18))
-                    m = min(max(m, cap_min), cap_max)
-                mult *= float(m)
-
-            # optional global clamp
-            gmin = float(self.cfg.get("SIZING_MULT_MIN", 0.0))
-            gmax = float(self.cfg.get("SIZING_MULT_MAX", 1e9))
-            mult = float(min(max(mult, gmin if gmin > 0 else 0.0), gmax))
-            return mult
-
-        yaml_mult = _apply_yaml_scalers(sig)
-
-        # Final size multiplier and cash-risk target.
-        size_mult = float(core_size_mult) * float(vw_mult) * float(yaml_mult)
-        risk_usd = base_risk_usd * size_mult
-
-        if self.cfg.get("RISK_USD_MIN") is not None:
-            risk_usd = max(float(self.cfg["RISK_USD_MIN"]), risk_usd)
-        if self.cfg.get("RISK_USD_MAX") is not None:
-            risk_usd = min(float(self.cfg["RISK_USD_MAX"]), risk_usd)
-        sig.risk_usd = float(risk_usd)
 
         LOG.info(
-            "Sizing(%s) mode=%s base=%.2f · p_cal=%.4f · core×=%.4f (meta×=%.4f, eth×=%.4f, risk_on=%.0f, probe_cap=%s) · vwap×=%.2f · yaml×=%.2f · total×=%.4f → risk=%.2f",
+            "Sizing(%s) mode=%s base=%.2f · p_cal=%.4f · pre_probe×=%.4f · final×=%.4f (risk_on=%.0f, probe_cap=%s, risk_scale_used=%s) → risk=%.2f",
             side_label,
             mode,
             base_risk_usd,
             p_cal,
-            float(core_size_mult),
-            float(meta_mult),
-            float(eth_mult),
+            float(size_mult_pre_probe),
+            float(size_mult_final),
             risk_on_f,
             str(probe_cap_applied),
-            float(vw_mult),
-            float(yaml_mult),
-            float(size_mult),
+            str(risk_scale_used),
             risk_usd,
         )
 
@@ -3874,6 +3911,52 @@ class LiveTrader:
             LOG.warning("Stop distance is zero for %s. Skip.", sig.symbol)
             return
         intended_size = max(risk_usd / stop_dist, 0.0)
+
+        # Mandatory notional/leverage cap for parity.
+        try:
+            notional_cap_pct = float(self.cfg.get("NOTIONAL_CAP_PCT_OF_EQUITY", 1.0))
+        except Exception:
+            notional_cap_pct = 1.0
+        try:
+            max_leverage_cap = float(self.cfg.get("MAX_LEVERAGE", 1.0))
+        except Exception:
+            max_leverage_cap = 1.0
+
+        if (not np.isfinite(equity_for_sizing)) or equity_for_sizing <= 0.0:
+            LOG.warning(
+                "Cannot enforce notional cap for %s (equity_for_sizing=%s). Skipping entry for parity safety.",
+                sig.symbol,
+                str(equity_for_sizing),
+            )
+            return
+
+        max_notional = float(equity_for_sizing) * max(0.0, float(notional_cap_pct)) * max(0.0, float(max_leverage_cap))
+        if (not np.isfinite(max_notional)) or max_notional <= 0.0:
+            LOG.warning(
+                "Invalid max_notional for %s (equity_for_sizing=%.6f cap_pct=%s max_lev=%s). Skipping entry.",
+                sig.symbol,
+                float(equity_for_sizing),
+                str(notional_cap_pct),
+                str(max_leverage_cap),
+            )
+            return
+
+        curr_notional = intended_size * px
+        if np.isfinite(curr_notional) and curr_notional > max_notional:
+            capped_size = max_notional / px
+            LOG.info(
+                "NOTIONAL_CAP symbol=%s pre_qty=%.10f capped_qty=%.10f pre_notional=%.4f max_notional=%.4f",
+                sig.symbol,
+                float(intended_size),
+                float(capped_size),
+                float(curr_notional),
+                float(max_notional),
+            )
+            intended_size = max(0.0, float(capped_size))
+
+        if intended_size <= 0.0:
+            LOG.warning("Capped size <= 0 for %s after notional cap. Skip.", sig.symbol)
+            return
 
         try:
             mkt = self.exchange._exchange.market(sig.symbol)  # unified market
@@ -3957,6 +4040,16 @@ class LiveTrader:
             return
 
         intended_size = size_prec
+        LOG.info(
+            "PARITY_ROW symbol=%s risk_on=%s size_mult_pre_probe=%.6f size_mult_final=%.6f equity_for_sizing=%.6f risk_cash_target=%.6f qty=%.10f",
+            sig.symbol,
+            str(getattr(sig, "risk_on", 0)),
+            float(getattr(sig, "size_mult_pre_probe", float("nan"))),
+            float(getattr(sig, "size_mult_final", float("nan"))),
+            float(getattr(sig, "equity_for_sizing", float("nan"))),
+            float(getattr(sig, "risk_cash_target", risk_usd)),
+            float(intended_size),
+        )
 
         # --- Ensure leverage/mode ---
         try:

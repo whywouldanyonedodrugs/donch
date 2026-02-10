@@ -44,9 +44,17 @@ PRICE_SLOWDOWN_PCT      = 0.01
 # ── risk sizing ────────────────────────────────────────────────────────────
 RISK_MODE          = "FIXED"     # or "FIXED"
 FIXED_RISK_USDT    = 10.0
+FIXED_RISK_CASH    = 10.0
 
 RISK_PCT           = 0.05         # 0.5 %
 SLIPPAGE_BUFFER_PCT = 0.0005
+NOTIONAL_CAP_PCT_OF_EQUITY = 1.0
+
+# Regime + meta sizing parity knobs
+REGIME_SIZE_WHEN_DOWN = 0.2
+DYN_MACD_HIST_THRESH = 0.0
+REGIME_DOWNSIZE_MULT = 1.0
+BTC_VOL_HI = 0.753777980804443
 
 #WINPROB_SIZE_FLOOR = 1.00
 #WINPROB_SIZE_CAP   = 1.00
@@ -203,5 +211,4 @@ STRICT_META_BUNDLE: bool = True
 # Optional: list of additional artifact filenames that must be present in META_EXPORT_DIR
 # (e.g., ["thresholds.json", "sizing_curve.csv", "regime_sets.yaml"]).
 META_REQUIRED_EXTRA_FILES: list[str] = []
-
 

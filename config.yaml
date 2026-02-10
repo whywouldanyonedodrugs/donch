@@ -3,11 +3,13 @@ STRATEGY_SPEC_PATH: "strategies/donch_pullback_long.yaml"
 
 # Sizing
 RISK_MODE: "fixed"          # or "percent"
-RISK_USD: 10.0              # temporary canary base risk (USDT)
-FIXED_RISK_CASH: 10.0       # alias used by parity handovers
-RISK_USD_MAX: 10.0          # keep conservative until parity + canary acceptance
+RISK_USD: 50.0              # temporary canary base risk (USDT)
+FIXED_RISK_CASH: 50.0       # alias used by parity handovers
+RISK_USD_MAX: 100.0         # legacy safety knob; parity sizing path uses notional cap
 RISK_EQUITY_PCT: 0.01       # used if RISK_MODE="percent"
 RISK_PCT: 0.01              # alias used by parity handovers
+NOTIONAL_CAP_PCT_OF_EQUITY: 1.0
+MAX_LEVERAGE: 10.0
 MIN_TRADE_AUTOPAD_ENABLED: false
 MIN_TRADE_AUTOPAD_CAP_USD: 5.0
 
@@ -26,25 +28,27 @@ SCAN_INTERVAL_SEC: 60
 DEDUP_WINDOW_HOURS: 2
 
 # where you scp’d the artifact
-WINPROB_MODEL_DIR: "results/meta_export"
-WINPROB_ARTIFACT_DIR: results/meta_export
+META_EXPORT_DIR: "/root/apps/donch/results/meta_export_pstar_042"
+WINPROB_MODEL_DIR: "/root/apps/donch/results/meta_export_pstar_042"
+WINPROB_ARTIFACT_DIR: "/root/apps/donch/results/meta_export_pstar_042"
 
 # live gate; can be tuned without re-exporting the model
 # Legacy key (kept for compatibility; live parity path ignores it)
 MIN_WINPROB_TO_TRADE: null
-ETH_BAROMETER_ENABLED: true        # as requested for testing
+ETH_BAROMETER_ENABLED: false       # parity: no separate ETH sizing resize path in live
 REGIME_BLOCK_WHEN_DOWN: false       # let entries through while testing
+REGIME_SIZE_WHEN_DOWN: 0.2
 BT_META_REPLAY_ENABLED: false       # temporary: no replay path while waiting for new bundle
 # optional sizing-by-prob (already supported in your bot)
 WINPROB_SIZING_ENABLED: true
 WINPROB_MIN_MULTIPLIER: 0.80
 WINPROB_MAX_MULTIPLIER: 1.60
-WINPROB_PROB_FLOOR: 0.60
+WINPROB_PROB_FLOOR: 0.42
 WINPROB_PROB_CAP: 0.90
-META_SIZING_P0: 0.60
+META_SIZING_P0: 0.42
 META_SIZING_P1: 0.90
-META_SIZING_MIN: 0.80
-META_SIZING_MAX: 1.60
+META_SIZING_MIN: 1.00
+META_SIZING_MAX: 2.00
 VWAP_STACK_SIZING_ENABLED: false    # temporary: keep sizing chain parity-focused
 
 
@@ -96,7 +100,7 @@ META_REQUIRED: true                # (optional) fail-closed on feature mismatch
 
 META_SCHEMA_DIAG_SYMBOLS: "BTCUSDT,ETHUSDT"
 
-REGIMES_REPORT_PATH: "/root/apps/donch/results/meta_export/regimes_report.json"
+REGIMES_REPORT_PATH: "/root/apps/donch/results/meta_export_pstar_042/regimes_report.json"
 
 GOV_CTX_DAYS_5M: 90
 VOL_CAP_BARS: 15000
@@ -105,14 +109,17 @@ VOL_CAP_BARS: 15000
 
 # Meta gating
 META_PROB_GATE_ENABLED: false          # Option 1 = false
-META_PROB_THRESHOLD: null              # temporary parity-safe: disable prob threshold
-META_GATE_SCOPE: "all"                 # temporary parity-safe: no scope veto while threshold is disabled
-META_GATE_FAIL_CLOSED: false           # temporary parity-safe
+META_PROB_THRESHOLD: 0.42              # enforce bundle-selected decision threshold
+META_GATE_SCOPE: "all"                 # scope=ALL policy from export
+META_GATE_FAIL_CLOSED: false           # scope is disabled for ALL, kept explicit
 
 # Meta sizing
 META_SIZING_ENABLED: true
-RISK_OFF_PROBE_MULT: 0.05
-META_SIZING_CURVE_PATH: null          # if null: use <meta_dir>/sizing_curve.csv
+RISK_OFF_PROBE_MULT: 0.25
+DYN_MACD_HIST_THRESH: 0.0
+REGIME_DOWNSIZE_MULT: 1.0
+BTC_VOL_HI: 0.753777980804443
+META_SIZING_CURVE_PATH: null          # artifact retained; strict parity sizing path does not use curve-first mapping
 META_SIZING_FAIL_CLOSED: true         # if curve missing/invalid: do not upsize; cap to probe
 
 # OHLCV caching

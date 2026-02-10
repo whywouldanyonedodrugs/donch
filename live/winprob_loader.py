@@ -599,11 +599,33 @@ class WinProbScorer:
             pass
 
         if isinstance(cal, dict):
-            ctype = str(cal.get("type", cal.get("kind", ""))).lower()
-            if ctype == "platt":
-                a = float(cal.get("a", 1.0))
-                b = float(cal.get("b", 0.0))
-                z = a * float(p_raw) + b
+            ctype = str(
+                cal.get(
+                    "type",
+                    cal.get("kind", cal.get("chosen_method", cal.get("method", ""))),
+                )
+            ).lower()
+
+            if ctype in ("platt", "sigmoid", "logistic"):
+                params = cal.get("params") if isinstance(cal.get("params"), dict) else {}
+                a = float(params.get("a", cal.get("a", 1.0)))
+                b = float(params.get("b", cal.get("b", 0.0)))
+                eps = float(params.get("eps", cal.get("eps", 1e-12)))
+
+                formula = str(cal.get("formula", "")).lower()
+                use_logit = ("logit" in formula) or bool(cal.get("use_logit", False)) or (ctype == "sigmoid")
+
+                p = float(p_raw)
+                if use_logit:
+                    # Offline export format:
+                    # p_cal = sigmoid(a * logit(clip(p_raw, eps, 1-eps)) + b)
+                    p = float(np.clip(p, eps, 1.0 - eps))
+                    logit_p = float(np.log(p / (1.0 - p)))
+                    z = a * logit_p + b
+                else:
+                    # Legacy platt form: sigmoid(a * p_raw + b)
+                    z = a * p + b
+
                 return float(1.0 / (1.0 + np.exp(-z)))
             if ctype == "isotonic":
                 xs = cal.get("xs") or cal.get("x")
@@ -647,4 +669,3 @@ class WinProbScorer:
         else:
             self._last_hash = vec_hash
             self._same_vec_count = 0
-
