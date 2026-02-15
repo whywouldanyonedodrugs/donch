@@ -4050,6 +4050,15 @@ class LiveTrader:
             float(getattr(sig, "risk_cash_target", risk_usd)),
             float(intended_size),
         )
+        LOG.info(
+            "SIZING_DECISION symbol=%s p_cal=%s risk_on=%s size_mult=%.6f risk_usd=%.6f qty=%.10f",
+            sig.symbol,
+            str(getattr(sig, "win_probability", float("nan"))),
+            str(getattr(sig, "risk_on", 0)),
+            float(getattr(sig, "size_mult_final", float("nan"))),
+            float(getattr(sig, "risk_cash_target", risk_usd)),
+            float(intended_size),
+        )
 
         # --- Ensure leverage/mode ---
         try:
