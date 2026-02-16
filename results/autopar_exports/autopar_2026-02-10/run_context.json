@@ -1,0 +1,16 @@
+{
+  "bundle_id": "58db9f454f251ef3",
+  "config_hash": "5fed59c5c113447c62ccb15ab0c5208f29a47b72e54b9fb314a83872440a8c92",
+  "decisions_count": 13096,
+  "exported_at_utc": "2026-02-11T00:20:18+00:00",
+  "meta_scope": "all",
+  "meta_threshold": 0.42,
+  "risk_mode": "fixed",
+  "risk_usd_base": 100.0,
+  "strategy_version": "strategies/donch_pullback_long.yaml@298c106897f1",
+  "symbols_count": 554,
+  "timezone": "UTC",
+  "trades_count": 0,
+  "window_end_utc": "2026-02-11T00:00:00+00:00",
+  "window_start_utc": "2026-02-10T00:00:00+00:00"
+}

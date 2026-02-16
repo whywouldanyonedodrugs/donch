@@ -1,0 +1,28 @@
+{
+  "bundle_id": "58db9f454f251ef3",
+  "bybit_testnet": false,
+  "config_hash": "0579f2b07d424897a763d665ad7540422527643b8898ead93b6d9e00097f3827",
+  "decisions_count": 13272,
+  "exported_at_utc": "2026-02-16T00:20:22+00:00",
+  "meta_scope": "all",
+  "meta_threshold": 0.42,
+  "reason_canonical_agreement_rate": 1.0,
+  "risk_mode": "cash",
+  "risk_usd_base": 100.0,
+  "schema_fail_class_counts": {
+    "integration_defect": 656,
+    "unknown": 0,
+    "warmup_expected": 78
+  },
+  "schema_fail_count": 734,
+  "schema_fail_rate": 0.0553044002411091,
+  "schema_incident_recommended": false,
+  "schema_top_non_warmup_missing_fields": [],
+  "strategy_version": "strategies/donch_pullback_long.yaml@298c106897f1",
+  "symbol_metadata_source": "exchange_instrument_metadata",
+  "symbols_count": 553,
+  "timezone": "UTC",
+  "trades_count": 0,
+  "window_end_utc": "2026-02-16T00:00:00+00:00",
+  "window_start_utc": "2026-02-15T00:00:00+00:00"
+}

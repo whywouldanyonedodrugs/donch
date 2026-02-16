@@ -1,0 +1,233 @@
+{
+  "decisions_count": 13272,
+  "expected_warmup_missing_fields": [
+    "S6_fresh_x_compress",
+    "days_since_prev_break"
+  ],
+  "incident_recommended": false,
+  "incident_rule": "recommended when non-warmup missing field repeats >= 3 rows/day",
+  "non_warmup_schema_fail_count": 0,
+  "schema_fail_class_counts": {
+    "integration_defect": 656,
+    "unknown": 0,
+    "warmup_expected": 78
+  },
+  "schema_fail_count": 734,
+  "schema_fail_rate": 0.0553044002411091,
+  "top_affected_symbols": [
+    {
+      "count": 27,
+      "symbol": "IRYSUSDT"
+    },
+    {
+      "count": 27,
+      "symbol": "LITUSDT"
+    },
+    {
+      "count": 27,
+      "symbol": "MERLUSDT"
+    },
+    {
+      "count": 27,
+      "symbol": "METISUSDT"
+    },
+    {
+      "count": 27,
+      "symbol": "APEXUSDT"
+    },
+    {
+      "count": 26,
+      "symbol": "NIGHTUSDT"
+    },
+    {
+      "count": 26,
+      "symbol": "PLUMEUSDT"
+    },
+    {
+      "count": 26,
+      "symbol": "PROMUSDT"
+    },
+    {
+      "count": 26,
+      "symbol": "PUMPBTCUSDT"
+    },
+    {
+      "count": 26,
+      "symbol": "RLSUSDT"
+    },
+    {
+      "count": 26,
+      "symbol": "SOLAYERUSDT"
+    },
+    {
+      "count": 26,
+      "symbol": "SOONUSDT"
+    },
+    {
+      "count": 26,
+      "symbol": "USUSDT"
+    },
+    {
+      "count": 26,
+      "symbol": "VANAUSDT"
+    },
+    {
+      "count": 26,
+      "symbol": "WETUSDT"
+    },
+    {
+      "count": 26,
+      "symbol": "ZAMAUSDT"
+    },
+    {
+      "count": 26,
+      "symbol": "ZKPUSDT"
+    },
+    {
+      "count": 26,
+      "symbol": "BOBBOBUSDT"
+    },
+    {
+      "count": 26,
+      "symbol": "BREVUSDT"
+    },
+    {
+      "count": 26,
+      "symbol": "CYBERUSDT"
+    }
+  ],
+  "top_affected_symbols_by_class": {
+    "integration_defect": [
+      {
+        "count": 27,
+        "symbol": "IRYSUSDT"
+      },
+      {
+        "count": 27,
+        "symbol": "LITUSDT"
+      },
+      {
+        "count": 27,
+        "symbol": "MERLUSDT"
+      },
+      {
+        "count": 27,
+        "symbol": "METISUSDT"
+      },
+      {
+        "count": 27,
+        "symbol": "APEXUSDT"
+      },
+      {
+        "count": 26,
+        "symbol": "NIGHTUSDT"
+      },
+      {
+        "count": 26,
+        "symbol": "PLUMEUSDT"
+      },
+      {
+        "count": 26,
+        "symbol": "PROMUSDT"
+      },
+      {
+        "count": 26,
+        "symbol": "PUMPBTCUSDT"
+      },
+      {
+        "count": 26,
+        "symbol": "RLSUSDT"
+      },
+      {
+        "count": 26,
+        "symbol": "SOLAYERUSDT"
+      },
+      {
+        "count": 26,
+        "symbol": "SOONUSDT"
+      },
+      {
+        "count": 26,
+        "symbol": "USUSDT"
+      },
+      {
+        "count": 26,
+        "symbol": "VANAUSDT"
+      },
+      {
+        "count": 26,
+        "symbol": "WETUSDT"
+      },
+      {
+        "count": 26,
+        "symbol": "ZKPUSDT"
+      },
+      {
+        "count": 26,
+        "symbol": "BOBBOBUSDT"
+      },
+      {
+        "count": 26,
+        "symbol": "BREVUSDT"
+      },
+      {
+        "count": 26,
+        "symbol": "CYBERUSDT"
+      },
+      {
+        "count": 26,
+        "symbol": "FFUSDT"
+      }
+    ],
+    "unknown": [],
+    "warmup_expected": [
+      {
+        "count": 26,
+        "symbol": "ZAMAUSDT"
+      },
+      {
+        "count": 26,
+        "symbol": "FHEUSDT"
+      },
+      {
+        "count": 26,
+        "symbol": "FOGOUSDT"
+      }
+    ]
+  },
+  "top_missing_fields": [
+    {
+      "count": 734,
+      "field": "days_since_prev_break"
+    },
+    {
+      "count": 734,
+      "field": "S6_fresh_x_compress"
+    }
+  ],
+  "top_missing_fields_by_class": {
+    "integration_defect": [
+      {
+        "count": 656,
+        "field": "days_since_prev_break"
+      },
+      {
+        "count": 656,
+        "field": "S6_fresh_x_compress"
+      }
+    ],
+    "unknown": [],
+    "warmup_expected": [
+      {
+        "count": 78,
+        "field": "days_since_prev_break"
+      },
+      {
+        "count": 78,
+        "field": "S6_fresh_x_compress"
+      }
+    ]
+  },
+  "top_non_warmup_missing_fields": [],
+  "warmup_only_schema_fail_count": 734
+}

@@ -1,0 +1,17 @@
+aiohttp
+asyncpg
+ccxt
+joblib
+numpy
+pandas
+pandas-ta
+psycopg2-binary
+pyarrow
+pydantic
+pydantic-settings
+python-dotenv
+PyYAML
+scikit-learn
+statsmodels
+tenacity
+watchdog

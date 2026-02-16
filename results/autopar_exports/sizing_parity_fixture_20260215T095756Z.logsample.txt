@@ -1,0 +1,5 @@
+FIXTURE_SIZING symbol=CASE0 p_cal=0.0942 risk_on=0 size_mult=0.250000 risk_usd=25.000000 qty=8.8381018428
+FIXTURE_SIZING symbol=CASE1 p_cal=0.8228 risk_on=0 size_mult=0.250000 risk_usd=25.000000 qty=19.4299524540
+FIXTURE_SIZING symbol=CASE2 p_cal=0.7784 risk_on=0 size_mult=0.250000 risk_usd=25.000000 qty=133.6082426857
+FIXTURE_SIZING symbol=CASE3 p_cal=0.3705 risk_on=0 size_mult=0.250000 risk_usd=25.000000 qty=8.8862698877
+FIXTURE_SIZING symbol=CASE4 p_cal=0.8323 risk_on=0 size_mult=0.250000 risk_usd=25.000000 qty=5.2240355854

@@ -1,0 +1,11 @@
+{
+  "config_path": "config.yaml",
+  "generated_at_utc": "2026-02-15T09:57:56+00:00",
+  "max_risk_usd_abs_error": 0.0,
+  "max_size_mult_abs_error": 0.0,
+  "risk_usd_mean_abs_error": 0.0,
+  "risk_usd_p90_abs_error": 0.0,
+  "rows": 100,
+  "size_mult_mean_abs_error": 0.0,
+  "size_mult_p90_abs_error": 0.0
+}

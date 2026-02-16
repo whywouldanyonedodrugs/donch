@@ -1,0 +1,51 @@
+name: DonchPullbackLong_v1
+
+
+
+timeframes:
+  base: 5m
+  donch: 1d
+  atr: 1h
+
+params:
+  DONCH_PERIOD: 20
+  VOLUME_DAYS: 30
+  VOLUME_MIN_MULT: 2.0
+  RETEST_EPS_PCT: 0.003
+  RETEST_LOOKBACK_BARS: 288
+  RS_MIN_PCT: 70
+  LIQ_MIN_USD: 500000
+  MICRO_VOL_MIN: 0.0001
+
+entry:
+  side: long
+  all:
+    - universe_rs_pct_gte: { min: "@params.RS_MIN_PCT" }
+    - liquidity_median_24h_usd_gte: { min_usd: "@params.LIQ_MIN_USD" }
+
+
+    - donch_breakout_daily_confirm:
+        donch_tf: donch
+        period: "@params.DONCH_PERIOD"
+
+    - volume_median_multiple:
+        tf: base
+        days: "@params.VOLUME_DAYS"
+        min_mult: "@params.VOLUME_MIN_MULT"
+        cap_bars: 9000
+
+    - pullback_retest_close_above_break:
+        tf: base
+        eps_pct: "@params.RETEST_EPS_PCT"
+        lookback_bars: "@params.RETEST_LOOKBACK_BARS"
+
+    - micro_vol_filter:
+        atr_tf: atr
+        atr_len: 14
+        min_ratio: "@params.MICRO_VOL_MIN"
+
+veto:
+  any:
+    - cooldown_hours: { hours: 2 }
+    - min_listing_age_days: { days: 7 }
+    - blacklist_symbol: {}

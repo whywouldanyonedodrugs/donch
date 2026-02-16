@@ -1,0 +1,16 @@
+[Unit]
+Description=Donch daily autopar export + Bybit universe sync
+Wants=network-online.target
+After=network-online.target donch.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/apps/donch
+Environment=PYTHONUNBUFFERED=1
+# Optional overrides (example):
+#   AUTOPAR_PUBLISH_DIR=/mnt/shared/autopar
+EnvironmentFile=-/root/apps/donch/.env.autopar
+ExecStart=/root/apps/donch/.venv/bin/python /root/apps/donch/tools/autopar_daily_task.py --zip --include-live-log --include-settings-snapshot --overwrite
+
+[Install]
+WantedBy=multi-user.target

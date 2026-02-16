@@ -5073,10 +5073,26 @@ class LiveTrader:
             return {"total": {"USDT": 0.0}, "free": {"USDT": 0.0}}
 
     async def _telegram_loop(self):
+        backoff = 1.0
+        max_backoff = 30.0
         while True:
-            async for cmd in self.tg.poll_cmds():
-                await self._handle_cmd(cmd)
-            await asyncio.sleep(1)
+            try:
+                async for cmd in self.tg.poll_cmds():
+                    try:
+                        await self._handle_cmd(cmd)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        LOG.exception("Telegram command handler failed for cmd=%r: %s", cmd, e)
+
+                backoff = 1.0
+                await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                LOG.warning("Telegram polling failed (will retry in %.1fs): %s", backoff, e)
+                await asyncio.sleep(backoff)
+                backoff = min(max_backoff, backoff * 2.0)
 
     async def _handle_cmd(self, cmd: str):
         parts = cmd.split()

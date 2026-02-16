@@ -2,10 +2,10 @@
 STRATEGY_SPEC_PATH: "strategies/donch_pullback_long.yaml"
 
 # Sizing
-RISK_MODE: "fixed"          # or "percent"
-RISK_USD: 50.0              # temporary canary base risk (USDT)
-FIXED_RISK_CASH: 50.0       # alias used by parity handovers
-RISK_USD_MAX: 100.0         # legacy safety knob; parity sizing path uses notional cap
+RISK_MODE: "cash"           # "cash"/"fixed" alias path, or "percent"
+RISK_USD: 100.0              # temporary canary base risk (USDT)
+FIXED_RISK_CASH: 100.0       # alias used by parity handovers
+RISK_USD_MAX: 200.0         # legacy safety knob; parity sizing path uses notional cap
 RISK_EQUITY_PCT: 0.01       # used if RISK_MODE="percent"
 RISK_PCT: 0.01              # alias used by parity handovers
 NOTIONAL_CAP_PCT_OF_EQUITY: 1.0

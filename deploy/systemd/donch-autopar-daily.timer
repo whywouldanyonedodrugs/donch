@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Donch autopar export daily (UTC)
+
+[Timer]
+# Run after day-close so package is for a complete previous UTC day.
+OnCalendar=*-*-* 00:20:00 UTC
+Persistent=true
+Unit=donch-autopar-daily.service
+
+[Install]
+WantedBy=timers.target

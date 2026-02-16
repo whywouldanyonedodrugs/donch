@@ -1,0 +1,5566 @@
+from __future__ import annotations
+
+import secrets
+import asyncio
+import dataclasses
+import json
+import logging
+import os
+import sys
+import traceback
+import hashlib
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from collections import defaultdict
+from typing import Any, Dict, List, Optional
+import subprocess
+import math
+import time
+import faulthandler
+import signal
+import inspect
+
+
+import aiohttp
+import asyncpg
+import ccxt.async_support as ccxt
+import joblib
+import pandas as pd
+import numpy as np
+import statsmodels.api as sm
+import yaml
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+import config as cfg
+from . import indicators as ta
+from .indicators import vwap_stack_features
+from . import filters
+from .shared_utils import is_blacklisted
+from watchdog.events import FileSystemEventHandler
+from watchdog.observers import Observer
+from .exchange_proxy import ExchangeProxy
+from .ohlcv_store import OHLCVSqliteStore
+from .database import DB
+from .telegram import TelegramBot
+from .winprob_loader import WinProbScorer
+from .golden_features import GoldenFeatureStore
+
+from .regime_features import RegimeConfig, compute_daily_regime_snapshot, compute_markov4h_snapshot, drop_incomplete_last_bar
+
+from .regime_truth import macro_regimes_asof
+
+from .online_state import OnlinePerformanceState
+
+from .artifact_bundle import load_bundle, BundleError, SchemaError
+
+from pydantic import Field, ValidationError
+from pydantic_settings import BaseSettings
+from .strategy_engine import StrategyEngine
+
+from .feature_builder import FeatureBuilder
+from .parity_utils import resample_ohlcv, donchian_upper_days_no_lookahead, eval_meta_scope
+
+from .oi_funding import fetch_series_5m, compute_oi_funding_features, StaleDerivativesDataError
+
+
+import logging
+logging.getLogger("watchdog").setLevel(logging.WARNING)
+logging.getLogger("watchdog.observers.inotify_buffer").setLevel(logging.WARNING)
+
+try:
+    import psycopg2
+except Exception:
+    psycopg2 = None
+
+
+UNIVERSE_CACHE_PATH = Path("universe_cache.json")
+
+REGIME_CODE_MAP = {
+    "BEAR_HIGH_VOL": 0,
+    "BEAR_LOW_VOL": 1,
+    "BULL_HIGH_VOL": 2,
+    "BULL_LOW_VOL": 3,
+}
+
+
+class ModelBundle:
+
+    pass
+
+def _tf_to_timedelta(tf: str) -> pd.Timedelta:
+    tf = tf.strip().lower()
+    if tf.endswith("m"):
+        return pd.Timedelta(minutes=int(tf[:-1]))
+    if tf.endswith("h"):
+        return pd.Timedelta(hours=int(tf[:-1]))
+    if tf.endswith("d"):
+        return pd.Timedelta(days=int(tf[:-1]))
+    raise ValueError(f"Unsupported timeframe: {tf}")
+
+def _hour_cyc(X):
+
+    h = np.asarray(X).astype(float).reshape(-1, 1)
+    sin = np.sin(2 * np.pi * h / 24.0)
+    cos = np.cos(2 * np.pi * h / 24.0)
+    return np.hstack([sin, cos])
+
+def _dow_onehot(X):
+
+    d = np.asarray(X).astype(int).reshape(-1, 1)
+    out = np.zeros((d.shape[0], 7), dtype=float)
+    m = (d >= 0) & (d < 7)
+    out[np.arange(d.shape[0])[m.ravel()], d[m].ravel()] = 1.0
+    return out
+
+def triangular_moving_average(series: pd.Series, period: int) -> pd.Series:
+
+    return series.rolling(window=period, min_periods=period).mean().rolling(window=period, min_periods=period).mean()
+
+
+LISTING_PATH = Path("listing_dates.json")
+
+
+_BUNDLE_ID = "no_bundle"
+
+class _BundleIdFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not hasattr(record, "bundle_id"):
+            record.bundle_id = _BUNDLE_ID
+        return True
+
+def _set_bundle_id_for_logs(bid: str | None) -> None:
+    global _BUNDLE_ID
+    _BUNDLE_ID = bid or "no_bundle"
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG = logging.getLogger("live_trader")
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s [%(levelname)s] bundle=%(bundle_id)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
+_root = logging.getLogger()
+for h in _root.handlers:
+    h.addFilter(_BundleIdFilter())
+
+logging.getLogger("ccxt").setLevel(logging.WARNING)
+logging.getLogger("aiohttp").setLevel(logging.WARNING)
+
+
+class Settings(BaseSettings):
+
+    bybit_api_key: str = Field(..., validation_alias="BYBIT_API_KEY")
+    bybit_api_secret: str = Field(..., validation_alias="BYBIT_API_SECRET")
+    bybit_testnet: bool = Field(False, validation_alias="BYBIT_TESTNET")
+    tg_bot_token: str = Field(..., validation_alias="TG_BOT_TOKEN")
+    tg_chat_id: str = Field(..., validation_alias="TG_CHAT_ID")
+    pg_dsn: str = Field(..., validation_alias="DATABASE_URL")
+    default_leverage: int = 10
+
+    class Config:
+        env_file = ".env"
+        case_sensitive = False
+        extra = 'ignore'
+
+
+CONFIG_PATH = Path("config.yaml")
+SYMBOLS_PATH = Path("symbols.txt")
+INVALID_SYMBOLS_PATH = Path("results/runtime/invalid_symbols.txt")
+
+
+def load_yaml(p: Path) -> Dict[str, Any]:
+    if not p.exists():
+        raise FileNotFoundError(p)
+    return yaml.safe_load(p.read_text()) or {}
+
+
+class _Watcher(FileSystemEventHandler):
+    def __init__(self, path: Path, cb):
+        self.path = path.resolve()
+        self.cb = cb
+        obs = Observer()
+        obs.schedule(self, self.path.parent.as_posix(), recursive=False)
+        obs.daemon = True
+        obs.start()
+
+
+    def on_modified(self, e):
+        if Path(e.src_path).resolve() == self.path:
+            self.cb()
+
+
+class RiskManager:
+    def __init__(self, cfg_dict: Dict[str, Any]):
+        self.cfg = cfg_dict
+        self.loss_streak = 0
+        self.kill_switch = False
+
+    async def on_trade_close(self, pnl: float, telegram: TelegramBot):
+        if pnl < 0:
+            self.loss_streak += 1
+        else:
+            self.loss_streak = 0
+        if self.loss_streak >= self.cfg.get("MAX_LOSS_STREAK", 3):
+            self.kill_switch = True
+            await telegram.send("❌ Kill-switch: max loss streak reached")
+
+    def can_trade(self) -> bool:
+        return not self.kill_switch
+
+
+class RegimeDetector:
+
+
+    def __init__(self, exchange, benchmark_symbol: str = "BTCUSDT", cache_minutes: int = 60):
+        self.exchange = exchange
+        self.benchmark_symbol = str(benchmark_symbol).upper()
+
+
+        self._cached_day_key: Optional[pd.Timestamp] = None
+        self._cached_regime: Optional[str] = None
+
+        self.latest_meta = {
+            "trend_regime_1d": None,
+            "vol_regime_1d": None,
+            "vol_prob_low_1d": None,
+            "regime_code_1d": None,
+            "daily_regime_str_1d": None,
+        }
+
+    def get_latest_meta_features(self) -> dict:
+        return dict(self.latest_meta)
+
+    def _to_ohlcv_df(self, ohlcv) -> pd.DataFrame:
+        df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
+        df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+        df = df.set_index("ts").sort_index()
+        df = df[~df.index.duplicated(keep="last")]
+        return df
+
+    async def get_current_regime(self, asof_ts: pd.Timestamp) -> str:
+
+
+        asof_ts = pd.to_datetime(asof_ts, utc=True, errors="coerce")
+        if pd.isna(asof_ts):
+            raise ValueError("RegimeDetector requires a valid asof_ts (UTC)")
+
+        day_key = asof_ts.floor("D")
+        if day_key.tz is None:
+            day_key = day_key.tz_localize("UTC")
+        else:
+            day_key = day_key.tz_convert("UTC")
+
+        if self._cached_day_key is not None and self._cached_day_key == day_key and self._cached_regime is not None:
+            return self._cached_regime
+
+        try:
+
+            ohlcv_d = await self.exchange.fetch_ohlcv(self.benchmark_symbol, timeframe="1d", limit=900)
+            df_d = self._to_ohlcv_df(ohlcv_d)
+            df_d = drop_incomplete_last_bar(df_d, "1d", asof_ts)
+
+
+            ma_period = int(getattr(cfg, "REGIME_MA_PERIOD", 100))
+            atr_period = int(getattr(cfg, "REGIME_ATR_PERIOD", 20))
+            atr_mult = float(getattr(cfg, "REGIME_ATR_MULT", 2.0))
+
+            reg_cfg = RegimeConfig(ma_period=ma_period, atr_period=atr_period, atr_mult=atr_mult)
+            snap = compute_daily_regime_snapshot(
+                df_d,
+                asof_ts=asof_ts,
+                cfg=reg_cfg,
+            )
+
+
+            self._cached_regime = str(snap["daily_regime_str_1d"])
+            self._cached_day_key = day_key
+
+            self.latest_meta["trend_regime_1d"] = snap["trend_regime_1d"]
+            self.latest_meta["vol_regime_1d"] = snap["vol_regime_1d"]
+            self.latest_meta["vol_prob_low_1d"] = float(snap["vol_prob_low_1d"])
+            self.latest_meta["daily_regime_str_1d"] = snap["daily_regime_str_1d"]
+            self.latest_meta["regime_code_1d"] = int(snap["regime_code_1d"])
+
+            return self._cached_regime
+
+        except Exception:
+            LOG.exception("Regime detector error (daily)")
+            if self._cached_regime is None:
+                self._cached_regime = "UNKNOWN"
+            return self._cached_regime
+
+
+@dataclasses.dataclass
+class Signal:
+
+    symbol: str
+    decision_ts: pd.Timestamp
+    entry: float
+    atr: float
+    rsi: float
+    adx: float
+    atr_pct: float
+    market_regime: str
+    price_boom_pct: float
+    price_slowdown_pct: float
+    vwap_dev_pct: float
+    ret_30d: float
+    ema_fast: float
+    ema_slow: float
+    listing_age_days: int
+    vwap_z_score: float
+    is_ema_crossed_down: bool
+    vwap_consolidated: bool
+    session_tag: str
+    day_of_week: int
+    hour_of_day: int
+    side: str = "short"
+
+    win_probability: float = 0.0
+
+
+    risk_on: int = 0
+    risk_on_1: int = 0
+    risk_scale: Optional[float] = None
+
+    def __post_init__(self):
+        self.side = str(self.side).upper()
+        if self.side not in ("LONG", "SHORT"):
+            self.side = "SHORT"
+        LOG.info(f"Successfully created Signal object for {self.symbol} using correct class definition.")
+
+
+class LiveTrader:
+    def __init__(self, settings: Settings, cfg_dict: Dict[str, Any]):
+        self.settings = settings
+        self.meta_schema = None
+        self._cycle_data_ts: Optional[pd.Timestamp] = None
+        self._init_ohlcv_cache()
+
+
+        self.cfg: Dict[str, Any] = {}
+        for key in dir(cfg):
+            if key.isupper():
+                self.cfg[key] = getattr(cfg, key)
+        self.cfg.update(cfg_dict)
+        for k, v in self.cfg.items():
+            setattr(cfg, k, v)
+
+
+        self._init_ohlcv_disk_cache()
+
+        self.feature_builder = FeatureBuilder(self.cfg)
+
+        self.db = DB(settings.pg_dsn)
+        self.tg = TelegramBot(settings.tg_bot_token, settings.tg_chat_id)
+        self.risk = RiskManager(self.cfg)
+
+
+        self.exchange = ExchangeProxy(self._init_ccxt())
+
+        bench_sym = self.cfg.get("REGIME_BENCHMARK_SYMBOL")
+        if not bench_sym:
+            bench_sym = self.cfg.get("REGIME_ASSET")
+        if not bench_sym:
+            bench_sym = "ETHUSDT"
+
+        self.regime_detector = RegimeDetector(
+            self.exchange,
+            bench_sym,
+            int(self.cfg.get("REGIME_CACHE_MINUTES", 60)),
+        )
+
+
+        self.symbols = self._load_symbols()
+
+        self._invalid_symbols: set[str] = self._load_invalid_symbols()
+        if self._invalid_symbols:
+            before = len(self.symbols)
+            self.symbols = [s for s in self.symbols if s not in self._invalid_symbols]
+            after = len(self.symbols)
+            LOG.warning("Filtered %d invalid symbols from universe (kept=%d). File=%s",
+                        before - after, after, str(INVALID_SYMBOLS_PATH))
+
+
+        self._universe_ctx: dict[str, dict] = {}
+        self._universe_ctx_ts: datetime = datetime.min.replace(tzinfo=timezone.utc)
+        self.open_positions: Dict[int, Dict[str, Any]] = {}
+        self.peak_equity: float = 0.0
+        self._listing_dates_cache: Dict[str, datetime.date] = {}
+        self.last_exit: Dict[str, datetime] = {}
+        self._zero_finalize_backoff: Dict[int, datetime] = {}
+
+        self._zero_finalize_backoff: Dict[int, datetime] = {}
+        self._cancel_cleanup_backoff: Dict[str, datetime] = {}
+
+        self.strategy_engine = StrategyEngine(
+            self.cfg.get("STRATEGY_SPEC_PATH", "strategy/donch_pullback_long.yaml"),
+            cfg=self.cfg
+        )
+        self._strategy_spec_path = Path(self.strategy_engine.spec_path).resolve()
+        _Watcher(self._strategy_spec_path, self._reload_strategy)
+        LOG.info("StrategyEngine loaded from %s; requires TFs: %s",
+                 self._strategy_spec_path, sorted(self.strategy_engine.required_timeframes()))
+
+
+        _Watcher(CONFIG_PATH, self._reload_cfg)
+        _Watcher(SYMBOLS_PATH, self._reload_symbols)
+
+        self.paused = False
+        self.tasks: List[asyncio.Task] = []
+        self.api_semaphore = asyncio.Semaphore(10)
+        self.symbol_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+        self._ohlcv_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+
+        self._wd_symbol: Optional[str] = None
+        self._wd_stage: str = "init"
+        self._wd_since: float = time.time()
+        self._wd_task: Optional[asyncio.Task] = None
+
+
+        meta_dir = (self.cfg.get("META_EXPORT_DIR")
+                    or self.cfg.get("WINPROB_ARTIFACT_DIR", "results/meta_export"))
+        self.meta_dir = str(meta_dir)
+        strict_bundle = bool(self.cfg.get("STRICT_META_BUNDLE", True))
+        required_extra = self.cfg.get("META_REQUIRED_EXTRA_FILES", []) or []
+
+        try:
+            self.meta_bundle = load_bundle(
+                meta_dir,
+                required_extra_files=required_extra,
+                strict=strict_bundle,
+            )
+            self.meta_dir = str(self.meta_bundle.meta_dir)
+            _set_bundle_id_for_logs(self.meta_bundle.bundle_id)
+            self.bundle_id = self.meta_bundle.bundle_id
+            self.winprob = WinProbScorer(bundle=self.meta_bundle, strict_schema=True)
+
+            self.meta_schema = getattr(self.winprob, "schema", None)
+
+        except Exception as e:
+            if strict_bundle:
+                raise
+            LOG.error("Meta bundle load failed (%s). Meta scoring disabled.", e)
+            self.meta_bundle = None
+            self.bundle_id = None
+            self.winprob = None
+        else:
+            LOG.info("Meta bundle loaded: dir=%s id=%s", self.meta_bundle.meta_dir, self.bundle_id)
+            pstar = getattr(self.winprob, "pstar", None)
+            pstar_s = f"{float(pstar):.4f}" if isinstance(pstar, (int, float)) else "None"
+
+
+            raw_feats = len(getattr(self.winprob, "required_keys", []))
+
+            model_cols = len(getattr(self.winprob, "model_features", []) or [])
+            pstar = getattr(self.winprob, "pstar", None)
+            pstar_s = "None" if pstar is None else f"{float(pstar):.6f}"
+
+            LOG.info(
+                "WinProb ready (bundle=%s, raw_feats=%d, model_cols=%d, p*=%s)",
+                self.bundle_id,
+                raw_feats,
+                model_cols,
+                pstar_s,
+            )
+
+
+            try:
+                curve_path = None
+
+                if getattr(self, "meta_bundle", None) is not None:
+                    curve_path = getattr(self.meta_bundle, "sizing_curve_path", None)
+
+
+                if not curve_path:
+                    curve_path = Path(self.meta_dir) / "sizing_curve.csv"
+                else:
+                    curve_path = Path(str(curve_path))
+
+                if curve_path.exists():
+                    self._load_meta_sizing_curve(curve_path)
+                else:
+                    LOG.warning(
+                        "bundle=%s META sizing curve not found at %s (meta sizing disabled)",
+                        self.bundle_id,
+                        str(curve_path),
+                    )
+                    self._meta_sizing_curve = None
+                    self._meta_sizing_mode = "none"
+
+            except Exception as e:
+                LOG.exception("bundle=%s Failed to load META sizing curve (meta sizing disabled): %s", self.bundle_id, e)
+                self._meta_sizing_curve = None
+                self._meta_sizing_mode = "error"
+
+
+            self.golden_store = None
+            try:
+                replay_flag = self.cfg.get("META_GOLDEN_ENABLED", None)
+                if replay_flag is None:
+
+                    replay_flag = self.cfg.get("BT_META_REPLAY_ENABLED", False)
+
+                replay_enabled = (
+                    bool(replay_flag)
+                    if not isinstance(replay_flag, str)
+                    else replay_flag.strip().lower() in ("1", "true", "yes", "on")
+                )
+
+                if replay_enabled:
+                    golden_path = Path(self.cfg.get("META_GOLDEN_PATH", "golden_features.parquet"))
+                    allow_syms_raw = self.cfg.get("META_GOLDEN_SYMBOLS", "") or ""
+                    allow_syms = [s.strip() for s in str(allow_syms_raw).split(",") if s.strip()] or None
+
+                    gs = GoldenFeatureStore(
+                        path=golden_path,
+                        feature_names=list(getattr(self.winprob, "raw_features", []) or []),
+                        symbols_allowlist=allow_syms,
+                    )
+                    gs.load()
+                    self.golden_store = gs
+
+                    mm = gs.minmax_ts()
+                    if mm:
+                        LOG.info(
+                            "bundle=%s Golden features loaded: rows=%d ts_range=[%s .. %s]",
+                            self.bundle_id,
+                            gs.available_keys(),
+                            mm[0].isoformat(),
+                            mm[1].isoformat(),
+                        )
+                    else:
+                        LOG.info("bundle=%s Golden features loaded: rows=%d", self.bundle_id, gs.available_keys())
+            except Exception as e:
+
+                LOG.warning("bundle=%s Golden features load failed (continuing without): %s", self.bundle_id, e)
+                self.golden_store = None
+
+
+            self.regime_thresholds = self._load_regime_thresholds()
+
+
+            try:
+                state_path = str(self.cfg.get("ONLINE_STATE_PATH", "results/online_state.jsonl"))
+                max_records = int(self.cfg.get("ONLINE_STATE_MAX_RECORDS", 2000))
+                cold_raw = self.cfg.get("ONLINE_STATE_COLDSTART_WINRATE", 0.25)
+                try:
+                    cold_f = float(cold_raw)
+                except Exception:
+                    cold_f = 0.25
+
+                self.online_state = OnlinePerformanceState(
+                    path=state_path,
+                    max_records=max_records,
+                    cold_start_winrate=cold_f,
+                )
+
+            except Exception as e:
+                LOG.warning("bundle=%s OnlinePerformanceState init failed (disabling): %s", getattr(self, "bundle_id", None) or "no_bundle", e)
+                self.online_state = None
+
+    def _meta_size_mult_from_p(self, p_cal: float) -> float:
+        if not bool(self.cfg.get("META_SIZING_ENABLED", False)):
+            return 1.0
+
+        if p_cal is None:
+            return 1.0
+        try:
+            p = float(p_cal)
+        except Exception:
+            return 1.0
+        if not np.isfinite(p):
+            return 1.0
+
+        curve = getattr(self, "_meta_sizing_curve", None)
+        mode = getattr(self, "_meta_sizing_mode", None)
+
+        if curve is None:
+
+            if bool(self.cfg.get("META_SIZING_FAIL_CLOSED", True)):
+                return float(self.cfg.get("RISK_OFF_PROBE_MULT", 0.01))
+            return 1.0
+
+        if mode == "bins":
+            df, plo, phi, mcol = curve
+            hit = df[(df[plo] <= p) & (p < df[phi])]
+            if hit.empty:
+
+                if p < float(df[plo].iloc[0]):
+                    return float(df[mcol].iloc[0])
+                return float(df[mcol].iloc[-1])
+            return float(hit[mcol].iloc[0])
+
+        if mode == "interp":
+            df, pcol, mcol = curve
+            xs = df[pcol].to_numpy(dtype=float)
+            ys = df[mcol].to_numpy(dtype=float)
+            if xs.size < 2:
+                return float(ys[0]) if ys.size == 1 else 1.0
+            return float(np.interp(p, xs, ys))
+
+        return 1.0
+
+    def _btc_vol_hi_threshold(self) -> float:
+
+
+        try:
+            thresholds = getattr(self, "regime_thresholds", None) or {}
+            if "btc_vol_hi" in thresholds:
+                v = float(thresholds.get("btc_vol_hi"))
+                if np.isfinite(v):
+                    return v
+        except Exception:
+            pass
+        try:
+            v = float(self.cfg.get("BTC_VOL_HI"))
+            if np.isfinite(v):
+                return v
+        except Exception:
+            pass
+        return float("nan")
+
+    @staticmethod
+    def _valid_prob_01(value: Any) -> tuple[bool, float]:
+        try:
+            p = float(value)
+        except Exception:
+            return False, float("nan")
+        if not np.isfinite(p):
+            return False, p
+        if p < 0.0 or p > 1.0:
+            return False, p
+        return True, p
+
+    def _offline_risk_on(self, meta_row: dict) -> int:
+
+        v = meta_row.get("risk_on", None)
+        try:
+            if v is not None and np.isfinite(float(v)):
+                return 1 if float(v) == 1.0 else 0
+        except Exception:
+            pass
+
+
+        try:
+            regime_up = float(meta_row.get("regime_up", np.nan))
+            btc_trend_slope = float(meta_row.get("btc_trend_slope", np.nan))
+            btc_vol_regime_level = float(meta_row.get("btc_vol_regime_level", np.nan))
+            btc_vol_hi = float(self._btc_vol_hi_threshold())
+        except Exception:
+            return 0
+
+        if not (np.isfinite(regime_up) and np.isfinite(btc_trend_slope) and np.isfinite(btc_vol_regime_level) and np.isfinite(btc_vol_hi)):
+            return 0
+
+        btc_trend_up = 1 if btc_trend_slope > 0 else 0
+        btc_vol_high = 1 if btc_vol_regime_level >= btc_vol_hi else 0
+
+        return 1 if (regime_up == 1.0 and btc_trend_up == 1 and btc_vol_high == 0) else 0
+
+    def _load_meta_sizing_curve(self, path=None) -> None:
+
+
+        from pathlib import Path
+
+
+        self._meta_bins = None
+        self._meta_curve_x = None
+        self._meta_curve_y = None
+
+        try:
+            curve_path = Path(path) if path is not None else (Path(self.meta_dir) / "sizing_curve.csv")
+            curve_path = curve_path.resolve()
+        except Exception:
+            LOG.warning("bundle=%s Failed to resolve sizing curve path=%r (meta sizing disabled)", self.bundle_id, path)
+            return
+
+        if not curve_path.exists():
+            LOG.info("bundle=%s No sizing_curve.csv found at %s (meta sizing disabled)", self.bundle_id, curve_path)
+            return
+
+        try:
+            df = pd.read_csv(curve_path)
+        except Exception as e:
+            LOG.warning("bundle=%s Failed to read sizing curve %s: %s (meta sizing disabled)", self.bundle_id, curve_path, e)
+            return
+
+        if df is None or df.empty:
+            LOG.warning("bundle=%s sizing_curve.csv is empty: %s (meta sizing disabled)", self.bundle_id, curve_path)
+            return
+
+        cols_l = [str(c).strip().lower() for c in df.columns]
+
+        def _col(name: str):
+            return df.columns[cols_l.index(name)]
+
+
+        mcol = None
+        for cand in ("risk_multiplier", "multiplier", "size_mult", "risk_mult"):
+            if cand in cols_l:
+                mcol = _col(cand)
+                break
+        if mcol is None:
+            LOG.warning(
+                "bundle=%s sizing_curve.csv missing multiplier column; got cols=%s (meta sizing disabled)",
+                self.bundle_id, list(df.columns)
+            )
+            return
+
+
+        lo_col = None
+        hi_col = None
+        for cand in ("bin_low", "p_lo", "p_low", "prob_lo"):
+            if cand in cols_l:
+                lo_col = _col(cand)
+                break
+        for cand in ("bin_high", "p_hi", "p_high", "prob_hi"):
+            if cand in cols_l:
+                hi_col = _col(cand)
+                break
+
+        if lo_col is not None and hi_col is not None:
+            bins = []
+            for _, r in df.iterrows():
+                try:
+                    lo = float(r[lo_col])
+                    hi = float(r[hi_col])
+                    mult = float(r[mcol])
+                except Exception:
+                    continue
+                if not (np.isfinite(lo) and np.isfinite(hi) and np.isfinite(mult)):
+                    continue
+                bins.append((lo, hi, mult))
+            bins.sort(key=lambda t: t[0])
+
+            if not bins:
+                LOG.warning("bundle=%s sizing_curve.csv bins parsed empty: %s (meta sizing disabled)", self.bundle_id, curve_path)
+                return
+
+            self._meta_bins = bins
+            LOG.info("bundle=%s Loaded META sizing curve (bins) from %s rows=%d", self.bundle_id, curve_path, len(bins))
+            return
+
+
+        pcol = None
+        for cand in ("p_cal", "p", "prob", "probability", "win_probability", "mean_score"):
+            if cand in cols_l:
+                pcol = _col(cand)
+                break
+
+        if pcol is None:
+            LOG.warning(
+                "bundle=%s sizing_curve.csv missing p/prob columns; got cols=%s (meta sizing disabled)",
+                self.bundle_id, list(df.columns)
+            )
+            return
+
+        try:
+            xs = df[pcol].astype(float).to_numpy()
+            ys = df[mcol].astype(float).to_numpy()
+        except Exception as e:
+            LOG.warning("bundle=%s Failed to parse sizing curve columns %s/%s: %s (meta sizing disabled)",
+                        self.bundle_id, pcol, mcol, e)
+            return
+
+        if len(xs) < 2:
+            LOG.warning("bundle=%s sizing_curve.csv too short for interpolation: %s (meta sizing disabled)",
+                        self.bundle_id, curve_path)
+            return
+
+        order = np.argsort(xs)
+        xs = xs[order]
+        ys = ys[order]
+        self._meta_curve_x = xs
+        self._meta_curve_y = ys
+        LOG.info("bundle=%s Loaded META sizing curve (interp) from %s pcol=%s mcol=%s n=%d",
+                self.bundle_id, curve_path, pcol, mcol, int(len(xs)))
+
+    def _meta_size_mult(self, p_cal: float) -> float:
+        import numpy as np
+
+        try:
+            p = float(p_cal)
+        except Exception:
+            return 0.0
+        if not np.isfinite(p):
+            return 0.0
+
+
+        bins = getattr(self, "_meta_bins", None)
+        if bins:
+
+            if p <= bins[0][0]:
+                return float(bins[0][2])
+            if p >= bins[-1][1]:
+                return float(bins[-1][2])
+
+            for lo, hi, mu in bins:
+
+                if p >= lo and p < hi:
+                    return float(mu)
+
+
+            return float(bins[-1][2])
+
+
+        xs = getattr(self, "_meta_curve_x", None)
+        ys = getattr(self, "_meta_curve_y", None)
+        if xs is not None and ys is not None and len(xs) >= 2:
+            p = min(max(p, float(xs[0])), float(xs[-1]))
+            return float(np.interp(p, xs, ys))
+
+
+        return float(self._winprob_multiplier(p))
+
+    def _resolve_meta_multiplier(self, p_cal: float, risk_on_value: float) -> float:
+
+
+        meta_mult = 1.0
+        if bool(self.cfg.get("META_SIZING_ENABLED", True)) and np.isfinite(p_cal):
+            bins = getattr(self, "_meta_bins", None)
+            xs = getattr(self, "_meta_curve_x", None)
+            ys = getattr(self, "_meta_curve_y", None)
+            has_curve = bool(bins) or (
+                xs is not None and ys is not None and len(xs) >= 2 and len(ys) >= 2
+            )
+            if bool(self.cfg.get("META_SIZING_FAIL_CLOSED", True)) and (not has_curve):
+                try:
+                    meta_mult = float(self.cfg.get("RISK_OFF_PROBE_MULT", 0.01))
+                except Exception:
+                    meta_mult = 0.01
+            else:
+                meta_mult = float(self._meta_size_mult(p_cal))
+
+        risk_on_f = 0.0
+        try:
+            risk_on_f = float(risk_on_value or 0.0)
+        except Exception:
+            risk_on_f = 0.0
+
+        if bool(self.cfg.get("META_RISK_OFF_PROBE_ENABLED", True)) and risk_on_f != 1.0:
+            try:
+                probe = float(self.cfg.get("RISK_OFF_PROBE_MULT", 0.01))
+            except Exception:
+                probe = 0.01
+            if np.isfinite(probe) and probe > 0.0:
+                meta_mult = min(meta_mult, probe)
+
+        if (not np.isfinite(meta_mult)) or meta_mult <= 0.0:
+            return 1.0
+        return float(meta_mult)
+
+
+    async def _build_oi_funding_features(
+        self,
+        symbol: str,
+        df5: pd.DataFrame,
+        decision_ts: pd.Timestamp,
+    ) -> Dict[str, float]:
+
+
+        try:
+            if df5 is None or df5.empty:
+                raise ValueError("df5 is empty")
+
+            if decision_ts not in df5.index:
+
+                raise KeyError(f"decision_ts not in df5.index: {decision_ts}")
+
+
+            df5_cut = df5.loc[:decision_ts].copy()
+            if df5_cut.empty:
+                raise ValueError("df5_cut is empty after slicing to decision_ts")
+
+            oi5, fr5 = await fetch_series_5m(
+                self.exchange,
+                symbol,
+                lookback_oi_days=int(self.cfg.get("OI_LOOKBACK_DAYS", 8)),
+                lookback_fr_days=int(self.cfg.get("FUNDING_LOOKBACK_DAYS", 8)),
+                end_ts=decision_ts,
+            )
+
+            staleness_max_age = pd.Timedelta(minutes=int(self.cfg.get("DERIV_MAX_AGE_MIN", 30)))
+
+            strict = bool(self.cfg.get("STRICT_PARITY_FEATURES", False))
+            feats = compute_oi_funding_features(
+                df5=df5_cut,
+                oi5=oi5,
+                fr5=fr5,
+                thresholds=self.regime_thresholds,
+                allow_nans=not strict,
+                staleness_max_age=staleness_max_age,
+            )
+            return feats
+
+        except (StaleDerivativesDataError, KeyError, ValueError, NotImplementedError) as e:
+            LOG.warning(f"OI/Funding features unavailable for {symbol} at {decision_ts}: {e}")
+            return {}
+        except Exception as e:
+
+            LOG.warning("OI/Funding features error for %s at %s: %s", symbol, decision_ts, e)
+
+            return {}
+
+    async def _fetch_ohlcv_df_paged(self, symbol: str, tf: str, limit: int) -> Optional[pd.DataFrame]:
+
+
+        try:
+            page_limit = int(self.cfg.get("OHLCV_PAGE_LIMIT", 1000))
+            tf_ms = int(_tf_to_timedelta(tf).total_seconds() * 1000)
+
+
+            need = int(limit) + 2
+
+
+            page_timeout_s = float(self.cfg.get("OHLCV_PAGE_TIMEOUT_S", 20.0))
+            total_timeout_s = float(self.cfg.get("OHLCV_TOTAL_TIMEOUT_S", 180.0))
+            progress_log_s = float(self.cfg.get("OHLCV_PROGRESS_LOG_S", 30.0))
+
+
+            try:
+                end_ms = int(self.exchange.milliseconds())
+            except Exception:
+                end_ms = int(time.time() * 1000)
+
+            start_ms = end_ms - (need * tf_ms)
+            start_ms = start_ms - (start_ms % tf_ms)
+            since = int(start_ms)
+
+            rows: list[list] = []
+            t0 = time.perf_counter()
+            t_last_log = t0
+            last_ts_seen: Optional[int] = None
+            n_pages = 0
+
+            while len(rows) < need:
+
+                if (time.perf_counter() - t0) > total_timeout_s:
+                    LOG.error(
+                        "OHLCV_TOTAL_TIMEOUT symbol=%s tf=%s need=%d got=%d pages=%d elapsed=%.2fs",
+                        symbol, tf, need, len(rows), n_pages, (time.perf_counter() - t0)
+                    )
+                    break
+
+                req_limit = min(page_limit, need - len(rows))
+
+                try:
+                    batch = await asyncio.wait_for(
+                        self.exchange.fetch_ohlcv(symbol, tf, since=since, limit=req_limit),
+                        timeout=page_timeout_s,
+                    )
+                except asyncio.TimeoutError:
+                    LOG.error(
+                        "OHLCV_PAGE_TIMEOUT symbol=%s tf=%s since=%s limit=%d timeout_s=%.1f got=%d pages=%d",
+                        symbol, tf, since, req_limit, page_timeout_s, len(rows), n_pages
+                    )
+                    break
+
+                n_pages += 1
+
+                if not batch:
+                    break
+
+
+                this_last = int(batch[-1][0])
+                if last_ts_seen is not None and this_last <= last_ts_seen:
+                    LOG.error(
+                        "OHLCV_NONADVANCING symbol=%s tf=%s since=%s last_ts_seen=%s this_last=%s pages=%d got=%d",
+                        symbol, tf, since, last_ts_seen, this_last, n_pages, len(rows)
+                    )
+                    break
+                last_ts_seen = this_last
+
+                rows.extend(batch)
+                since = this_last + tf_ms
+
+                now = time.perf_counter()
+                if (now - t_last_log) >= progress_log_s:
+                    LOG.info(
+                        "OHLCV_PROGRESS symbol=%s tf=%s got=%d/%d pages=%d elapsed=%.2fs",
+                        symbol, tf, len(rows), need, n_pages, (now - t0)
+                    )
+                    t_last_log = now
+
+
+                await asyncio.sleep(0)
+
+            if len(rows) < 2:
+                return None
+
+
+            df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+            df = df.set_index("timestamp").sort_index()
+
+
+            df = df[~df.index.duplicated(keep="last")]
+
+
+            if len(df) >= 2:
+                df = df.iloc[:-1]
+
+
+            if len(df) > int(limit):
+                df = df.iloc[-int(limit):]
+
+            return df
+
+        except Exception as e:
+            LOG.exception("Error fetching OHLCV paged for %s %s: %s", symbol, tf, e)
+            return None
+
+
+    def _init_ohlcv_cache(self) -> None:
+        self._ohlcv_cache: dict[tuple[str, str], pd.DataFrame] = {}
+        self._ohlcv_cache_ts: dict[tuple[str, str], float] = {}
+
+
+    def _init_ohlcv_disk_cache(self) -> None:
+
+        self._ohlcv_store = None
+        self._ohlcv_disk_last_flush: dict[tuple[str, str], pd.Timestamp] = {}
+        self._ohlcv_disk_tfs: set[str] = set()
+
+        enabled = bool(self.cfg.get("OHLCV_DISK_CACHE_ENABLED", False))
+        if not enabled:
+            return
+
+        path = Path(self.cfg.get("OHLCV_DISK_CACHE_SQLITE", "results/runtime/ohlcv_cache.sqlite"))
+        self._ohlcv_store = OHLCVSqliteStore(path)
+
+        tfs = self.cfg.get("OHLCV_DISK_CACHE_TFS", ["5m"])
+        if isinstance(tfs, str):
+            tfs = [tfs]
+        self._ohlcv_disk_tfs = {str(x).strip() for x in (tfs or []) if str(x).strip()}
+
+        self._ohlcv_disk_flush_bars = int(self.cfg.get("OHLCV_DISK_FLUSH_BARS", 12))
+
+
+        gov_days = int(self.cfg.get("GOV_CTX_DAYS_5M", 60))
+        req_gov_5m = gov_days * 288 + 500
+
+
+        vol_days = int(self.cfg.get("VOL_LOOKBACK_DAYS", 30)) + 2
+        don_days = int(self.cfg.get("DON_N_DAYS", 20)) + 2
+        req_scan_5m = max(1500, 288 * vol_days, 288 * don_days, int(self.cfg.get("VOL_CAP_BARS", 9000)))
+
+        default_keep = max(20000, req_gov_5m, req_scan_5m)
+        keep_cfg = int(self.cfg.get("OHLCV_DISK_KEEP_BARS", default_keep))
+        self._ohlcv_disk_keep_bars = max(keep_cfg, default_keep)
+
+        if self._ohlcv_disk_keep_bars < req_gov_5m:
+            LOG.warning(
+                "OHLCV disk keep_bars too small for GOV_CTX: keep=%d req=%d (GOV_CTX_DAYS_5M=%d)",
+                int(self._ohlcv_disk_keep_bars), int(req_gov_5m), int(gov_days),
+            )
+
+
+        LOG.info(
+            "OHLCV disk cache enabled: sqlite=%s tfs=%s flush_bars=%d keep_bars=%d",
+            str(path), sorted(self._ohlcv_disk_tfs), int(self._ohlcv_disk_flush_bars), int(self._ohlcv_disk_keep_bars),
+        )
+
+    async def _maybe_flush_ohlcv_to_disk(self, symbol: str, tf: str, df: pd.DataFrame, *, force: bool) -> None:
+        store = getattr(self, "_ohlcv_store", None)
+        if store is None:
+            return
+        if tf not in getattr(self, "_ohlcv_disk_tfs", set()):
+            return
+        if df is None or df.empty:
+            return
+
+        key = (symbol, tf)
+        last_ts = df.index[-1]
+
+        prev = self._ohlcv_disk_last_flush.get(key)
+        if (not force) and (prev is not None):
+            try:
+                new_slice = df.loc[df.index > prev]
+            except Exception:
+                new_slice = df
+            if len(new_slice) < int(getattr(self, "_ohlcv_disk_flush_bars", 12)):
+                return
+            df_flush = new_slice
+        else:
+            df_flush = df
+
+        try:
+            flush_timeout_s = float(self.cfg.get("OHLCV_DISK_FLUSH_TIMEOUT_S", 15.0))
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(self._ohlcv_store.upsert_df, symbol, tf, df_flush),
+                    timeout=flush_timeout_s,
+                )
+            except asyncio.TimeoutError:
+                LOG.error("OHLCV_DISK_FLUSH_TIMEOUT symbol=%s tf=%s rows=%d timeout_s=%.1f", symbol, tf, len(df_flush), flush_timeout_s)
+                return
+
+            self._ohlcv_disk_last_flush[key] = last_ts
+        except Exception as e:
+            LOG.warning("OHLCV_DISK_FLUSH_FAIL symbol=%s tf=%s err=%s", symbol, tf, e)
+
+    async def _get_ohlcv(self, symbol: str, tf: str, min_bars: int) -> Optional[pd.DataFrame]:
+
+
+        key = (symbol, tf)
+
+        async with self._ohlcv_locks[symbol]:
+
+            df = self._ohlcv_cache.get(key)
+
+
+            if (df is None or len(df) < int(min_bars)) and getattr(self, "_ohlcv_store", None) is not None:
+                try:
+
+                    load_bars = int(self.cfg.get("OHLCV_DISK_LOAD_BARS", min_bars))
+                    load_bars = max(load_bars, int(min_bars))
+
+                    load_timeout_s = float(self.cfg.get("OHLCV_DISK_LOAD_TIMEOUT_S", 10.0))
+                    try:
+                        df_disk = await asyncio.wait_for(
+                            asyncio.to_thread(self._ohlcv_store.load, symbol, tf=tf, limit_bars=load_bars),
+                            timeout=load_timeout_s,
+                        )
+                    except asyncio.TimeoutError:
+                        LOG.error("OHLCV_DISK_LOAD_TIMEOUT symbol=%s tf=%s limit=%d timeout_s=%.1f", symbol, tf, load_bars, load_timeout_s)
+                        df_disk = None
+
+                    if df_disk is not None and not df_disk.empty:
+                        df = df_disk
+                        self._ohlcv_cache[key] = df
+                        self._ohlcv_cache_ts[key] = time.time()
+                        LOG.info("OHLCV_DISK_HIT symbol=%s tf=%s bars=%d", symbol, tf, int(len(df)))
+                except Exception as e:
+                    LOG.warning("OHLCV_DISK_LOAD_FAIL symbol=%s tf=%s err=%s", symbol, tf, e)
+
+
+            if df is None or len(df) < min_bars:
+                t0 = time.perf_counter()
+                df = await self._fetch_ohlcv_df_paged(symbol, tf, min_bars)
+                dt = time.perf_counter() - t0
+                if dt > 5.0:
+                    LOG.warning("SLOW_OHLCV symbol=%s tf=%s bars=%d took=%.2fs", symbol, tf, min_bars, dt)
+
+
+                if df is None or df.empty or len(df) < int(min_bars):
+                    LOG.warning(
+                        "OHLCV_INSUFFICIENT symbol=%s tf=%s have=%s need=%d",
+                        symbol, tf, 0 if df is None else int(len(df)), int(min_bars),
+                    )
+                    return None
+
+                self._ohlcv_cache[key] = df
+                self._ohlcv_cache_ts[key] = time.time()
+
+
+                await self._maybe_flush_ohlcv_to_disk(symbol, tf, df, force=True)
+                return df
+
+
+            tail = int(self.cfg.get("OHLCV_TAIL_FETCH", 400))
+            t0 = time.perf_counter()
+            df_new = await self._fetch_ohlcv_df_paged(symbol, tf, tail)
+            dt = time.perf_counter() - t0
+            if dt > 5.0:
+                LOG.warning("SLOW_OHLCV_TAIL symbol=%s tf=%s bars=%d took=%.2fs", symbol, tf, tail, dt)
+
+            if df_new is not None and not df_new.empty:
+                merged = pd.concat([df, df_new], axis=0).sort_index()
+                merged = merged[~merged.index.duplicated(keep="last")]
+
+                if len(merged) > min_bars:
+                    merged = merged.iloc[-min_bars:]
+
+                df = merged
+                self._ohlcv_cache[key] = df
+                self._ohlcv_cache_ts[key] = time.time()
+
+                await self._maybe_flush_ohlcv_to_disk(symbol, tf, df, force=False)
+
+            return df
+
+    async def _fetch_ohlcv_df_simple(self, symbol: str, tf: str, limit: int) -> Optional[pd.DataFrame]:
+        try:
+            page_timeout_s = float(self.cfg.get("OHLCV_PAGE_TIMEOUT_S", 20.0))
+            ohlcv = await asyncio.wait_for(
+                self.exchange.fetch_ohlcv(symbol, tf, limit=int(limit)),
+                timeout=page_timeout_s,
+            )
+            if not ohlcv or len(ohlcv) < 2:
+                return None
+
+            df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+            df = df.set_index("timestamp").sort_index()
+            df = df[~df.index.duplicated(keep="last")]
+
+
+            df = df.iloc[:-1]
+
+            return df
+        except asyncio.TimeoutError:
+            LOG.error("OHLCV_SIMPLE_TIMEOUT symbol=%s tf=%s limit=%s timeout_s=%.1f", symbol, tf, limit, page_timeout_s)
+            return None
+        except Exception as e:
+            LOG.exception("Error fetching OHLCV simple for %s %s: %s", symbol, tf, e)
+            return None
+
+    def _asof_series_value(self, s: pd.Series, ts: pd.Timestamp) -> float:
+
+
+        try:
+            ts = pd.to_datetime(ts, utc=True, errors="coerce")
+            if pd.isna(ts):
+                return float(np.nan)
+
+            if s is None or len(s) == 0:
+                return float(np.nan)
+
+            if not isinstance(s.index, pd.DatetimeIndex):
+                return float(np.nan)
+
+            idx = s.index
+            if idx.tz is None:
+                idx = idx.tz_localize("UTC")
+                s = s.copy()
+                s.index = idx
+            else:
+                s = s.copy()
+                s.index = idx.tz_convert("UTC")
+
+            s = s.sort_index()
+            s = s.replace([np.inf, -np.inf], np.nan).dropna()
+            if s.empty:
+                return float(np.nan)
+
+            pos = int(s.index.searchsorted(ts, side="right") - 1)
+            if pos < 0:
+                return float(np.nan)
+            return float(s.iloc[pos])
+        except Exception:
+            return float(np.nan)
+
+    async def _compute_cross_asset_daily_ctx(
+        self, asset: str, asof_ts: pd.Timestamp, df5: Optional[pd.DataFrame] = None
+    ) -> dict:
+
+
+        out: dict = {}
+        try:
+            from .macro_offline_parity import compute_cross_asset_daily_context
+
+            asof_ts = pd.to_datetime(asof_ts, utc=True)
+
+            if df5 is None:
+                days = int(self.cfg.get("GOV_CTX_DAYS_5M", 60))
+                min_bars = days * 288 + 500
+                df5 = await self._get_ohlcv(asset, "5m", min_bars=min_bars)
+
+            if df5 is None or df5.empty:
+                return out
+
+            prefix = asset.lower()
+            out.update(compute_cross_asset_daily_context(df5, asof_ts, prefix=prefix))
+
+
+            short = None
+            up = asset.upper()
+            if up.startswith("BTC"):
+                short = "btc"
+            elif up.startswith("ETH"):
+                short = "eth"
+
+            if short is not None:
+                if f"{prefix}_vol_regime_level" in out:
+                    out[f"{short}_vol_regime_level"] = out[f"{prefix}_vol_regime_level"]
+                if f"{prefix}_trend_slope" in out:
+                    out[f"{short}_trend_slope"] = out[f"{prefix}_trend_slope"]
+
+            return out
+
+        except Exception as e:
+            LOG.warning("Cross-asset daily ctx failed for %s: %s", asset, e)
+            return out
+
+
+    async def _get_gov_ctx(self) -> dict:
+
+
+        days = int(self.cfg.get("GOV_CTX_DAYS_5M", 60))
+        min_bars = days * 288 + 500
+
+        task_btc = asyncio.create_task(self._get_ohlcv("BTCUSDT", "5m", min_bars=min_bars))
+        task_eth = asyncio.create_task(self._get_ohlcv("ETHUSDT", "5m", min_bars=min_bars))
+        df_btc, df_eth = await asyncio.gather(task_btc, task_eth)
+
+
+        decision_ts_gov = None
+        try:
+            candidates = []
+            if df_btc is not None and not df_btc.empty:
+                candidates.append(df_btc.index[-1])
+            if df_eth is not None and not df_eth.empty:
+                candidates.append(df_eth.index[-1])
+            if candidates:
+                decision_ts_gov = min(candidates)
+        except Exception:
+            decision_ts_gov = None
+
+        if decision_ts_gov is None or pd.isna(pd.to_datetime(decision_ts_gov, utc=True, errors="coerce")):
+            raise RuntimeError("GOV_CTX: cannot determine decision_ts_gov (BTC/ETH 5m frames empty)")
+
+        decision_ts_gov = pd.to_datetime(decision_ts_gov, utc=True)
+
+
+        if df_btc is not None and not df_btc.empty:
+            df_btc = df_btc.loc[:decision_ts_gov].copy()
+        if df_eth is not None and not df_eth.empty:
+            df_eth = df_eth.loc[:decision_ts_gov].copy()
+
+
+        if hasattr(self, "_gov_ctx_cache_key") and hasattr(self, "_gov_ctx_cache"):
+            if getattr(self, "_gov_ctx_cache_key") == decision_ts_gov:
+                return dict(self._gov_ctx_cache)
+
+        ctx: dict = {}
+        ctx["decision_ts_gov"] = decision_ts_gov
+
+
+        try:
+            day_key = decision_ts_gov.floor("D")
+            if day_key.tz is None:
+                day_key = day_key.tz_localize("UTC")
+            else:
+                day_key = day_key.tz_convert("UTC")
+
+            if hasattr(self, "_cross_asset_daily_cache_key") and hasattr(self, "_cross_asset_daily_cache_val"):
+                if getattr(self, "_cross_asset_daily_cache_key") == day_key:
+                    ctx.update(dict(getattr(self, "_cross_asset_daily_cache_val") or {}))
+                else:
+                    raise KeyError("cross_asset_daily_cache_miss")
+            else:
+                raise KeyError("cross_asset_daily_cache_missing")
+
+        except KeyError:
+            try:
+                btc_ctx, eth_ctx = await asyncio.gather(
+                    self._compute_cross_asset_daily_ctx("BTCUSDT", decision_ts_gov, df5=df_btc),
+                    self._compute_cross_asset_daily_ctx("ETHUSDT", decision_ts_gov, df5=df_eth),
+                    return_exceptions=False,
+                )
+                merged = {}
+                merged.update(btc_ctx or {})
+                merged.update(eth_ctx or {})
+                ctx.update(merged)
+
+                self._cross_asset_daily_cache_key = day_key
+                self._cross_asset_daily_cache_val = dict(merged)
+
+            except Exception as e:
+                LOG.warning("GOV_CTX: cross-asset daily ctx computation failed: %s", e)
+
+
+        if df_btc is not None and not df_btc.empty:
+
+            btc_feats = await self._build_oi_funding_features("BTCUSDT", df_btc, decision_ts_gov)
+
+            if btc_feats:
+                if "funding_rate" in btc_feats:
+                    ctx["btc_funding_rate"] = float(btc_feats["funding_rate"])
+                if "oi_z_7d" in btc_feats:
+                    ctx["btc_oi_z_7d"] = float(btc_feats["oi_z_7d"])
+
+        if df_eth is not None and not df_eth.empty:
+
+            eth_feats = await self._build_oi_funding_features("ETHUSDT", df_eth, decision_ts_gov)
+
+            if eth_feats:
+                if "funding_rate" in eth_feats:
+                    ctx["eth_funding_rate"] = float(eth_feats["funding_rate"])
+                if "oi_z_7d" in eth_feats:
+                    ctx["eth_oi_z_7d"] = float(eth_feats["oi_z_7d"])
+
+
+        try:
+            markov_asset = str(self.cfg.get("MARKOV4H_ASSET", "ETHUSDT") or "ETHUSDT").upper()
+            markov_limit = int(self.cfg.get("MARKOV4H_LIMIT", 500) or 500)
+            alpha = float(self.cfg.get("MARKOV4H_PROB_EWMA_ALPHA", 0.2) or 0.2)
+
+
+            key4 = decision_ts_gov.floor("4h")
+            if hasattr(self, "_markov_cache_key") and hasattr(self, "_markov_cache_val"):
+                if getattr(self, "_markov_cache_key") == key4:
+                    ctx.update(dict(self._markov_cache_val))
+                else:
+                    raise KeyError("markov_cache_miss")
+            else:
+                raise KeyError("markov_cache_missing")
+
+        except KeyError:
+
+            try:
+                df4 = await self._fetch_ohlcv_df_simple(markov_asset, "4h", limit=markov_limit)
+                if df4 is None or df4.empty:
+                    raise RuntimeError("empty 4h frame")
+
+                df4 = drop_incomplete_last_bar(df4, "4h", decision_ts_gov)
+
+                markov_cfg = RegimeConfig(markov4h_prob_ewma_alpha=alpha)
+                snap = compute_markov4h_snapshot(df4, asof_ts=decision_ts_gov, cfg=markov_cfg)
+
+                ctx["markov_prob_up_4h"] = float(snap["markov_prob_up_4h"])
+                ctx["markov_state_4h"] = int(snap["markov_state_4h"])
+                ctx.setdefault("markov_state_up_4h", int(snap["markov_state_4h"]))
+
+
+                self._markov_cache_key = decision_ts_gov.floor("4h")
+                self._markov_cache_val = {
+                    "markov_prob_up_4h": ctx["markov_prob_up_4h"],
+                    "markov_state_4h": ctx["markov_state_4h"],
+                    "markov_state_up_4h": ctx["markov_state_up_4h"],
+                }
+
+            except Exception as e:
+                LOG.warning("GOV_CTX: Markov 4h computation failed: %s", e)
+
+
+        try:
+            if getattr(self, "online_state", None) is not None:
+                ctx.update(self.online_state.features_asof(decision_ts_gov))
+        except Exception as e:
+            LOG.warning("GOV_CTX: online performance features failed: %s", e)
+
+
+        self._gov_ctx_cache_key = decision_ts_gov
+        self._gov_ctx_cache = dict(ctx)
+        return dict(ctx)
+
+
+    async def _last_closed_5m_ts(self, symbol: str) -> Optional[pd.Timestamp]:
+
+
+        try:
+            df = await self._fetch_ohlcv_df_paged(str(symbol).upper(), "5m", limit=10)
+            if df is None or df.empty:
+                return None
+            ts = df.index[-1]
+            return pd.to_datetime(ts, utc=True)
+        except Exception:
+            return None
+
+
+    def _load_json_file(self, path: str) -> dict:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def _load_regime_thresholds(self) -> dict:
+
+
+        thresholds: dict = {}
+
+        report_path = os.getenv("DONCH_REGIMES_REPORT") or str(self.cfg.get("REGIMES_REPORT_PATH", "") or "").strip()
+        if report_path.lower() in ("none", "null"):
+            report_path = ""
+
+
+        if not report_path:
+            base = getattr(self, "meta_dir", None) or getattr(self, "bundle_dir", None) or str(self.cfg.get("META_DIR", "") or "").strip()
+            if base:
+                cand = os.path.join(str(base), "regimes_report.json")
+                if os.path.exists(cand):
+                    report_path = cand
+
+        if report_path and os.path.exists(report_path):
+            j = self._load_json_file(report_path)
+            thresholds = dict(j.get("thresholds", {}) or {})
+            LOG.info(
+                "bundle=%s Loaded regimes_report thresholds from %s (keys=%d)",
+                getattr(self, "bundle_id", None) or "no_bundle",
+                report_path,
+                len(thresholds),
+            )
+        else:
+            LOG.warning(
+                "bundle=%s regimes_report.json not found (set DONCH_REGIMES_REPORT or REGIMES_REPORT_PATH). "
+                "S3/S6/regime helpers may be unavailable.",
+                getattr(self, "bundle_id", None) or "no_bundle",
+            )
+
+
+        crowd_path = os.getenv("DONCH_CROWD_THRESHOLDS") or str(self.cfg.get("CROWD_THRESHOLDS_PATH", "") or "").strip()
+        if ("crowd_z_high" not in thresholds) or ("crowd_z_low" not in thresholds):
+            if crowd_path and os.path.exists(crowd_path):
+                cj = self._load_json_file(crowd_path)
+                if "crowd_z_high" in cj:
+                    thresholds["crowd_z_high"] = cj["crowd_z_high"]
+                if "crowd_z_low" in cj:
+                    thresholds["crowd_z_low"] = cj["crowd_z_low"]
+                LOG.info(
+                    "bundle=%s Loaded crowd thresholds from %s",
+                    getattr(self, "bundle_id", None) or "no_bundle",
+                    crowd_path,
+                )
+
+
+        thresholds.setdefault("crowd_z_high", float(self.cfg.get("CROWD_Z_HIGH", 1.0)))
+        thresholds.setdefault("crowd_z_low", float(self.cfg.get("CROWD_Z_LOW", -1.0)))
+        return thresholds
+
+    def _funding_regime_code(self, funding_rate: float) -> int:
+        eps = float(self.regime_thresholds.get("funding_neutral_eps", 1e-8))
+        fr = float(funding_rate)
+        if fr <= -eps:
+            return -1
+        if fr >= eps:
+            return 1
+        return 0
+
+    def _oi_regime_code(self, meta: dict) -> int:
+
+
+        q33 = float(self.regime_thresholds["oi_q33"])
+        q66 = float(self.regime_thresholds["oi_q66"])
+        src = str(self.regime_thresholds.get("oi_source", "oi_z_7d"))
+        x = meta.get(src)
+        if x is None:
+            x = meta.get("oi_z_7d")
+        if x is None:
+            x = meta.get("oi_pct_1d", 0.0)
+        x = float(x)
+
+        if x <= q33:
+            return -1
+        if x >= q66:
+            return 1
+        return 0
+
+    def _trend_regime_code_1d(self, trend_regime_1d: Optional[str], regime_code_1d: int) -> int:
+        if trend_regime_1d:
+            s = str(trend_regime_1d).upper()
+            return 1 if "BULL" in s else 0
+        return 1 if int(regime_code_1d) in (2, 3) else 0
+
+    def _vol_regime_code_1d(
+        self,
+        vol_regime_1d: Optional[str],
+        vol_prob_low_1d: Optional[float],
+        regime_code_1d: int,
+    ) -> int:
+        if vol_regime_1d:
+            s = str(vol_regime_1d).upper()
+            return 0 if "LOW" in s else 1
+        if vol_prob_low_1d is not None:
+            return 0 if float(vol_prob_low_1d) >= 0.5 else 1
+
+        return 0 if int(regime_code_1d) in (1, 3) else 1
+
+    def _tercile_code(self, x: float, q33: float, q66: float) -> int:
+        x = float(x)
+        if x <= float(q33):
+            return 0
+        if x < float(q66):
+            return 1
+        return 2
+
+    def _atr_pre_at_ts(self, df5: pd.DataFrame, ts: pd.Timestamp) -> float:
+
+
+        atr_len = int(self.cfg.get("ATR_LEN", 14))
+
+        tf = str(self.cfg.get("ATR_TIMEFRAME", "") or "").strip().lower()
+        if tf in ("", "none", "null"):
+            tf = "5m"
+
+        if tf != "5m":
+            df_atr = ta.resample_ohlcv(df5, tf)
+            atr_tf = ta.atr(df_atr, atr_len)
+            atr_pre = atr_tf.reindex(df5.index, method="ffill")
+        else:
+            atr_pre = ta.atr(df5, atr_len)
+
+        v = atr_pre.loc[ts] if ts in atr_pre.index else atr_pre.iloc[-1]
+        v = float(v)
+
+        if not np.isfinite(v):
+            raise ValueError(f"atr_pre not finite for ts={ts}: {v}")
+
+        return v
+
+    def _augment_meta_with_regime_sets(self, meta_full: dict) -> None:
+
+
+        if not getattr(self, "regime_thresholds", None):
+            return
+
+
+        if "funding_rate" in meta_full:
+            frc = self._funding_regime_code(float(meta_full["funding_rate"]))
+            meta_full["funding_regime_code"] = float(frc)
+
+
+        try:
+            oic = self._oi_regime_code(meta_full)
+            meta_full["oi_regime_code"] = float(oic)
+        except Exception:
+            pass
+
+
+        try:
+            cz_hi = float(self.regime_thresholds["crowd_z_high"])
+            cz_lo = float(self.regime_thresholds["crowd_z_low"])
+            oi_z = float(meta_full.get("oi_z_7d", 0.0) or 0.0)
+            fz = float(meta_full.get("funding_z_7d", 0.0) or 0.0)
+
+            crowd_side = 0
+            if (oi_z >= cz_hi) and (fz >= cz_hi):
+                crowd_side = 1
+            elif (oi_z >= cz_hi) and (fz <= cz_lo):
+                crowd_side = -1
+            meta_full["crowd_side"] = float(crowd_side)
+        except Exception:
+            pass
+
+
+        if "funding_regime_code" in meta_full and "oi_regime_code" in meta_full:
+            frc = int(float(meta_full["funding_regime_code"]))
+            oic = int(float(meta_full["oi_regime_code"]))
+            meta_full["S3_funding_x_oi"] = float((frc + 1) * 3 + (oic + 1))
+
+
+        def _first_present(*keys: str):
+            for k in keys:
+                if k in meta_full:
+                    return meta_full.get(k)
+            return None
+
+        try:
+            btc_vol_hi = float(self._btc_vol_hi_threshold())
+        except Exception:
+            btc_vol_hi = np.nan
+
+        try:
+            regime_up = int(float(meta_full.get("regime_up", 0.0) or 0.0))
+        except Exception:
+            regime_up = 0
+
+        tr_raw = _first_present("btcusdt_trend_slope", "btc_trend_slope")
+        vl_raw = _first_present("btcusdt_vol_regime_level", "btc_vol_regime_level")
+
+        try:
+            btc_trend_slope = float(tr_raw)
+        except Exception:
+            btc_trend_slope = np.nan
+
+        try:
+            btc_vol_level = float(vl_raw)
+        except Exception:
+            btc_vol_level = np.nan
+
+        risk_on = 0
+        if (
+            regime_up == 1
+            and np.isfinite(btc_trend_slope)
+            and (btc_trend_slope > 0.0)
+            and np.isfinite(btc_vol_level)
+            and np.isfinite(btc_vol_hi)
+            and (btc_vol_level < btc_vol_hi)
+        ):
+            risk_on = 1
+
+
+        meta_full["risk_on"] = float(risk_on)
+
+
+        try:
+            if np.isfinite(btc_trend_slope) and np.isfinite(btc_vol_level) and np.isfinite(btc_vol_hi):
+                btc_trend_up = 1 if btc_trend_slope > 0.0 else 0
+                btc_vol_high = 1 if btc_vol_level >= btc_vol_hi else 0
+                btc_risk = int(btc_trend_up * 2 + btc_vol_high)
+                meta_full["btc_risk_regime_code"] = float(btc_risk)
+
+                ru = 1 if int(regime_up) == 1 else 0
+                meta_full["S5_btcRisk_x_regimeUp"] = float(btc_risk * 2 + ru)
+            else:
+                meta_full["btc_risk_regime_code"] = np.nan
+                meta_full["S5_btcRisk_x_regimeUp"] = np.nan
+        except Exception:
+            meta_full["btc_risk_regime_code"] = np.nan
+            meta_full["S5_btcRisk_x_regimeUp"] = np.nan
+
+
+        meta_full["risk_on_1"] = float(risk_on)
+
+
+        if "regime_code_1d" in meta_full:
+            try:
+                rc = int(float(meta_full["regime_code_1d"]))
+            except Exception:
+                rc = None
+
+            if rc is not None:
+                meta_full["S1_regime_code_1d"] = float(rc)
+
+
+                tr_str = meta_full.get("trend_regime_1d", None)
+                vr_str = meta_full.get("vol_regime_1d", None)
+                vpl = meta_full.get("vol_prob_low_1d", None)
+
+                trc = self._trend_regime_code_1d(tr_str, rc)
+                vrc = self._vol_regime_code_1d(vr_str, (float(vpl) if vpl is not None else None), rc)
+
+                meta_full["trend_regime_code_1d"] = float(trc)
+                meta_full["vol_regime_code_1d"] = float(vrc)
+
+
+                if "markov_state_4h" in meta_full:
+                    ms = int(float(meta_full["markov_state_4h"]))
+                    meta_full["S2_markov_x_vol1d"] = float(ms * 2 + int(vrc))
+
+
+                if "crowd_side" in meta_full and "trend_regime_code_1d" in meta_full:
+                    cs = int(float(meta_full["crowd_side"]))
+                    meta_full["S4_crowd_x_trend1d"] = float((cs + 1) * 2 + int(trc))
+
+
+        if ("days_since_prev_break" in meta_full) and ("consolidation_range_atr" in meta_full):
+            try:
+
+                fresh_q33 = self.regime_thresholds.get("fresh_q33")
+                fresh_q66 = self.regime_thresholds.get("fresh_q66")
+                comp_q33 = self.regime_thresholds.get("compression_q33")
+                comp_q66 = self.regime_thresholds.get("compression_q66")
+
+                fresh = float(meta_full["days_since_prev_break"])
+                comp = float(meta_full["consolidation_range_atr"])
+
+
+                if (
+                    np.isfinite(fresh)
+                    and np.isfinite(comp)
+                    and fresh_q33 is not None
+                    and fresh_q66 is not None
+                    and comp_q33 is not None
+                    and comp_q66 is not None
+                ):
+                    fcode = self._tercile_code(fresh, float(fresh_q33), float(fresh_q66))
+                    ccode = self._tercile_code(comp, float(comp_q33), float(comp_q66))
+                    meta_full["S6_fresh_x_compress"] = float(fcode * 3 + ccode)
+                else:
+                    meta_full["S6_fresh_x_compress"] = np.nan
+            except Exception:
+                pass
+
+    def _is_bad_numeric(self, v) -> bool:
+
+
+        if v is None:
+            return True
+
+
+        if isinstance(v, (bool, np.bool_)):
+            return False
+
+
+        if isinstance(v, (np.integer, np.floating)):
+            return not np.isfinite(float(v))
+
+
+        if isinstance(v, (int, float)):
+            return not np.isfinite(float(v))
+
+
+        if isinstance(v, str):
+            s = v.strip()
+            if s == "":
+                return True
+            try:
+                return not np.isfinite(float(s))
+            except Exception:
+                return True
+
+
+        return True
+
+
+    def _missing_required_features(self, row: dict, required: list[str]) -> list[str]:
+        missing = []
+        for k in required:
+            v = row.get(k, None)
+            if self._is_bad_numeric(v):
+                missing.append(k)
+        return missing
+
+
+    def _score_winprob_safe_details(self, symbol: str, meta_row: dict) -> dict:
+
+
+        import math
+
+        out = {"schema_ok": False, "p_raw": None, "p_cal": None, "err": None}
+
+        if not getattr(self, "winprob", None):
+            out["err"] = "winprob_not_loaded"
+            return out
+
+        try:
+
+            p_raw, p_cal = self.winprob.score_with_details(meta_row)
+        except Exception as e:
+            out["err"] = f"{type(e).__name__}:{e}"
+            return out
+
+
+        try:
+            if p_cal is None:
+                out["err"] = "p_cal_none"
+                return out
+            p_cal_f = float(p_cal)
+            if not math.isfinite(p_cal_f):
+                out["err"] = "p_cal_nonfinite"
+                return out
+        except Exception:
+            out["err"] = "p_cal_cast_fail"
+            return out
+
+
+        p_raw_f = None
+        try:
+            if p_raw is not None:
+                pr = float(p_raw)
+                if math.isfinite(pr):
+                    p_raw_f = pr
+        except Exception:
+            p_raw_f = None
+
+        out["p_raw"] = p_raw_f
+        out["p_cal"] = p_cal_f
+        out["schema_ok"] = True
+        return out
+
+
+    def _score_winprob_safe(self, symbol: str, meta_row: dict):
+
+
+        d = self._score_winprob_safe_details(symbol, meta_row)
+        return d["p_cal"] if d.get("schema_ok") else None
+
+
+    def _load_universe_cache_if_fresh(self) -> Optional[dict]:
+
+        if not bool(self.cfg.get("UNIVERSE_CACHE_ENABLED", True)):
+            return None
+        p = Path(self.cfg.get("UNIVERSE_CACHE_PATH", UNIVERSE_CACHE_PATH))
+        if not p.exists():
+            return None
+        try:
+            raw = json.loads(p.read_text())
+            ttl_min = int(self.cfg.get("UNIVERSE_CACHE_TTL_MIN", 1440))
+            ts = raw.get("computed_at")
+            if not ts:
+                return None
+
+            try:
+                computed_at = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            except Exception:
+                computed_at = datetime.fromisoformat(ts)
+            if computed_at.tzinfo is None:
+                computed_at = computed_at.replace(tzinfo=timezone.utc)
+
+            if datetime.now(timezone.utc) - computed_at > timedelta(minutes=ttl_min):
+                return None
+
+            if bool(self.cfg.get("UNIVERSE_CACHE_REQUIRE_SYMBOLS_MATCH", True)):
+                cached_syms = list(map(str, raw.get("symbols", [])))
+                if sorted(cached_syms) != sorted(map(str, self.symbols)):
+                    return None
+
+            data = raw.get("data")
+            return data if isinstance(data, dict) and data else None
+        except Exception as e:
+            LOG.warning("Universe cache load failed: %s", e)
+            return None
+
+    def _save_universe_cache(self, data: dict) -> None:
+        if not bool(self.cfg.get("UNIVERSE_CACHE_ENABLED", True)):
+            return
+        p = Path(self.cfg.get("UNIVERSE_CACHE_PATH", UNIVERSE_CACHE_PATH))
+        try:
+            blob = {
+                "computed_at": datetime.now(timezone.utc).isoformat(),
+                "symbols": list(self.symbols),
+                "data": data,
+            }
+            p.write_text(json.dumps(blob))
+            LOG.info("Universe context cached to %s (%d symbols).", p, len(data))
+        except Exception as e:
+            LOG.warning("Failed to write universe cache: %s", e)
+
+
+    async def _build_universe_context(self) -> dict[str, dict]:
+
+
+        syms = list(self.symbols)
+        LOG.info("Building universe context for %d symbols…", len(syms))
+
+
+        tasks_1d = {s: self.exchange.fetch_ohlcv(s, '1d', limit=10) for s in syms}
+        tasks_1h = {s: self.exchange.fetch_ohlcv(s, '1h', limit=168) for s in syms}
+        res_1d = await asyncio.gather(*tasks_1d.values(), return_exceptions=True)
+        res_1h = await asyncio.gather(*tasks_1h.values(), return_exceptions=True)
+
+        one_d = {s: r for s, r in zip(tasks_1d.keys(), res_1d)}
+        one_h = {s: r for s, r in zip(tasks_1h.keys(), res_1h)}
+
+        weekly_ret = {}
+        med24 = {}
+        for s in syms:
+
+            d = one_d.get(s)
+            rs = 0.0
+            try:
+                if isinstance(d, list) and len(d) >= 8:
+                    close_series = pd.Series([row[4] for row in d], index=pd.to_datetime([row[0] for row in d], unit='ms', utc=True))
+                    last = float(close_series.iloc[-1])
+
+                    prev = float(close_series.iloc[-8])
+                    rs = (last / prev - 1.0) if prev > 0 else 0.0
+            except Exception:
+                rs = 0.0
+            weekly_ret[s] = rs
+
+
+            h = one_h.get(s)
+            med = 0.0
+            try:
+                if isinstance(h, list) and len(h) >= 48:
+                    dfh = pd.DataFrame(h, columns=['ts','o','h','l','c','v'])
+                    dfh['ts'] = pd.to_datetime(dfh['ts'], unit='ms', utc=True)
+                    dfh.set_index('ts', inplace=True)
+
+                    notional = dfh['c'] * dfh['v']
+
+                    roll_24h = notional.rolling(24).sum().dropna()
+
+                    med = float(roll_24h.tail(7).median()) if len(roll_24h) >= 1 else 0.0
+            except Exception:
+                med = 0.0
+            med24[s] = med
+
+
+        rets = np.array([weekly_ret[s] for s in syms], dtype=float)
+        ranks = np.argsort(np.argsort(rets))
+        pct = 100.0 * ranks / max(1, len(syms) - 1)
+
+        rs_arr = np.asarray(rets, dtype=float)
+        to_arr = np.asarray([med24[s] for s in syms], dtype=float)
+        mu_rs = float(np.nanmean(rs_arr)); sd_rs = float(np.nanstd(rs_arr));  sd_rs = sd_rs if sd_rs > 0 else 1.0
+        mu_to = float(np.nanmean(to_arr)); sd_to = float(np.nanstd(to_arr));  sd_to = sd_to if sd_to > 0 else 1.0
+        rs_z  = (rs_arr - mu_rs) / sd_rs
+        to_z  = (to_arr - mu_to) / sd_to
+
+        out = {}
+        for i, s in enumerate(syms):
+            out[s] = {
+                "rs_pct": float(pct[i]),
+                "median_24h_turnover_usd": float(med24[s]),
+            }
+
+        LOG.info("Universe context ready (%d symbols).", len(out))
+        return out
+
+
+    def _prior_breakout_stats(
+        self,
+        df1d: pd.DataFrame,
+        period: int = 20,
+        lookback_days: int = 60,
+        fallback_days: int = 3,
+    ) -> tuple[int, int, float]:
+
+
+        try:
+            if df1d is None or len(df1d) < period + fallback_days + 5:
+                return 0, 0, 0.0
+            dd = df1d.sort_index()
+            highs = dd["high"].rolling(period).max().shift(1)
+            close = dd["close"].astype(float)
+
+            sub = dd.iloc[-(lookback_days + fallback_days + 1):-1]
+            if sub.empty: return 0, 0, 0.0
+
+            highs_sub = highs.loc[sub.index]
+            cls_sub   = close.loc[sub.index]
+
+            brk_idx = cls_sub > highs_sub
+            breakout_days = list(np.where(brk_idx.to_numpy())[0])
+            n_b = 0; n_f = 0
+            for idx in breakout_days:
+                n_b += 1
+                upper = float(highs_sub.iloc[idx])
+
+                nxt = cls_sub.iloc[idx+1: idx+1+fallback_days]
+                if len(nxt) and np.nanmin(nxt.to_numpy()) < upper:
+                    n_f += 1
+            fail_rate = float(n_f / n_b) if n_b > 0 else 0.0
+            return int(n_b), int(n_f), float(fail_rate)
+        except Exception:
+            return 0, 0, 0.0
+
+    async def _cancel_reducing_orders(self, symbol: str, pos: dict):
+
+
+        try:
+            open_orders = await self._all_open_orders(symbol) or []
+        except Exception as e:
+            LOG.warning("Cancel sweep: failed to fetch open orders for %s: %s", symbol, e)
+            return
+
+
+        known_cids = {
+            pos.get("tp_final_cid"), pos.get("tp2_cid"), pos.get("tp1_cid"),
+            pos.get("sl_trail_cid"), pos.get("sl_cid")
+        }
+
+        for o in open_orders:
+            try:
+                oid  = o.get("id") or o.get("orderId")
+                coid = o.get("clientOrderId") or o.get("client_order_id")
+
+                ro   = bool(o.get("reduceOnly") or o.get("reduce_only") or
+                            (o.get("info", {}).get("reduceOnly") if isinstance(o.get("info"), dict) else False))
+
+                is_child = (coid in known_cids)
+                if ro or is_child:
+                    try:
+                        if oid:
+                            await self.exchange.cancel_order(oid, symbol, {"clientOrderId": coid, "acknowledged": True})
+                        elif coid:
+
+                            await self.exchange.cancel_order(None, symbol, {"clientOrderId": coid, "acknowledged": True})
+                        LOG.info("Canceled stale child order %s (cid=%s) on %s", oid, coid, symbol)
+                    except Exception as ce:
+                        LOG.warning("Cancel failed for %s (cid=%s) on %s: %s", oid, coid, symbol, ce)
+            except Exception as e:
+                LOG.warning("Cancel sweep loop error on %s: %s", symbol, e)
+
+    def _listing_age_days(self, symbol: str, dfs: dict[str, pd.DataFrame] | None = None, asof_ts: pd.Timestamp | None = None) -> int | None:
+
+
+        today = None
+        if asof_ts is not None:
+            ts = pd.to_datetime(asof_ts, utc=True, errors="coerce")
+            if ts is not pd.NaT and not pd.isna(ts):
+                today = ts.date()
+        if today is None:
+            today = datetime.now(timezone.utc).date()
+
+
+        d = self._listing_dates_cache.get(symbol)
+        if d:
+            try:
+                return (today - d).days
+            except Exception:
+                pass
+
+
+        if dfs:
+            try:
+
+                if '1d' in dfs and not dfs['1d'].empty:
+                    earliest = dfs['1d'].index[0].date()
+                else:
+                    earliest = None
+                    for df in dfs.values():
+                        if isinstance(df, pd.DataFrame) and not df.empty:
+                            ts = df.index[0].date()
+                            if earliest is None or ts < earliest:
+                                earliest = ts
+                if earliest:
+                    return (today - earliest).days
+            except Exception:
+                pass
+
+
+        return None
+
+    def _reload_strategy(self):
+        try:
+            self.strategy_engine.reload()
+            LOG.info("Strategy reloaded from %s", self.strategy_engine.spec_path)
+            try:
+                asyncio.create_task(self.tg.send(f"♻️ Strategy reloaded: {self.strategy_engine.spec_path}"))
+            except Exception:
+                pass
+        except Exception as e:
+            LOG.error("Strategy reload failed: %s", e)
+
+    def _init_ccxt(self):
+        ex = ccxt.bybit({
+            "apiKey": self.settings.bybit_api_key,
+            "secret": self.settings.bybit_api_secret,
+            "enableRateLimit": True,
+            "options": {"defaultType": "swap"},
+        })
+        if self.settings.bybit_testnet:
+            ex.set_sandbox_mode(True)
+        return ex
+
+    @staticmethod
+    def _load_symbols():
+        return SYMBOLS_PATH.read_text().split()
+
+    def _reload_cfg(self):
+        try:
+            new_cfg = load_yaml(CONFIG_PATH)
+            self.cfg.update(new_cfg)
+            for k, v in self.cfg.items():
+                setattr(cfg, k, v)
+            LOG.info("Config reloaded from %s", CONFIG_PATH)
+        except Exception as e:
+            LOG.error("Failed to reload config: %s", e)
+
+    def _reload_symbols(self):
+        try:
+            self.symbols = self._load_symbols()
+
+            self._invalid_symbols: set[str] = self._load_invalid_symbols()
+            if self._invalid_symbols:
+                before = len(self.symbols)
+                self.symbols = [s for s in self.symbols if s not in self._invalid_symbols]
+                after = len(self.symbols)
+                LOG.warning("Filtered %d invalid symbols from universe (kept=%d). File=%s",
+                            before - after, after, str(INVALID_SYMBOLS_PATH))
+
+            LOG.info("Symbols reloaded – %d symbols", len(self.symbols))
+        except Exception as e:
+            LOG.error("Failed to reload symbols: %s", e)
+
+    @staticmethod
+    def _load_invalid_symbols() -> set[str]:
+        try:
+            if INVALID_SYMBOLS_PATH.exists():
+                raw = INVALID_SYMBOLS_PATH.read_text(encoding="utf-8")
+                return {ln.strip() for ln in raw.splitlines() if ln.strip() and not ln.strip().startswith("#")}
+        except Exception:
+            pass
+        return set()
+
+    def _persist_invalid_symbols(self) -> None:
+        try:
+            INVALID_SYMBOLS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            txt = "\n".join(sorted(self._invalid_symbols)) + ("\n" if self._invalid_symbols else "")
+            INVALID_SYMBOLS_PATH.write_text(txt, encoding="utf-8")
+        except Exception:
+            LOG.exception("Failed to persist invalid symbols list to %s", str(INVALID_SYMBOLS_PATH))
+
+    def _maybe_quarantine_symbol(self, symbol: str, err: BaseException, *, where: str) -> bool:
+
+
+        try:
+            msg = str(err) or repr(err)
+        except Exception:
+            msg = repr(err)
+
+        msg_l = msg.lower()
+
+        reason = None
+
+        if "does not have market symbol" in msg_l:
+            reason = "unknown_market_symbol"
+
+
+        elif "category only support linear or option" in msg_l:
+            reason = "unsupported_category_181001"
+        elif ("retcode" in msg_l) and ("181001" in msg_l):
+            reason = "unsupported_category_181001"
+
+        if reason is None:
+            return False
+
+        if symbol not in self._invalid_symbols:
+            self._invalid_symbols.add(symbol)
+            self._persist_invalid_symbols()
+            LOG.warning(
+                "Quarantined invalid symbol=%s where=%s reason=%s -> %s | err=%s",
+                symbol, where, reason, str(INVALID_SYMBOLS_PATH), msg,
+            )
+        return True
+
+
+    def _normalize_cfg_key(self, key: str) -> str:
+
+        key_up = key.upper()
+        aliases = {
+            "FIXED_RISK_USDT": "RISK_USD",
+            "FIXED_RISK_CASH": "RISK_USD",
+            "RISK_USDT": "RISK_USD",
+            "RISK_PCT": "RISK_EQUITY_PCT",
+            "WINPROB_SIZE_FLOOR": "WINPROB_PROB_FLOOR",
+            "WINPROB_SIZE_CAP":   "WINPROB_PROB_CAP",
+            "BT_META_REPLAY_ENABLED": "META_GOLDEN_ENABLED",
+        }
+        return aliases.get(key_up, key_up)
+
+    async def _ensure_leverage(self, symbol: str):
+        try:
+            await self.exchange.set_margin_mode("cross", symbol)
+            await self.exchange.set_leverage(self.settings.default_leverage, symbol)
+        except ccxt.ExchangeError as e:
+            if "leverage not modified" in str(e):
+                LOG.debug("Leverage for %s already set to %dx.", symbol, self.settings.default_leverage)
+            else:
+                LOG.warning("Leverage setup failed for %s: %s", symbol, e)
+                raise e
+        except Exception as e:
+            LOG.warning("Unexpected leverage setup error for %s: %s", symbol, e)
+            raise e
+
+
+    async def _scan_symbol_for_signal(
+        self,
+        symbol: str,
+        market_regime: str,
+        eth_macd: Optional[dict],
+        gov_ctx: Optional[dict] = None
+    ) -> Optional[Signal]:
+        LOG.info("Checking %s...", symbol)
+
+        self._wd_symbol = symbol
+        self._wd_stage = "scan"
+        self._wd_since = time.time()
+        self._wd_task = asyncio.current_task()
+
+
+        reg_label = str(market_regime).upper().strip()
+        reg_code = REGIME_CODE_MAP.get(reg_label)
+
+        if reg_code is None:
+            LOG.warning("bundle=%s Unknown market regime label=%r; cannot compute regime_code_1d", self.bundle_id, reg_label)
+            return None
+
+        try:
+
+            base_tf = str(self.cfg.get('TIMEFRAME', '5m'))
+            ema_tf  = str(self.cfg.get('EMA_TIMEFRAME', '4h'))
+            rsi_tf  = str(self.cfg.get('RSI_TIMEFRAME', '1h'))
+            adx_tf  = str(self.cfg.get('ADX_TIMEFRAME', '1h'))
+
+            required_tfs = {base_tf, ema_tf, rsi_tf, adx_tf, '1d', '1h'}
+            required_tfs |= set(self.strategy_engine.required_timeframes() or [])
+
+
+            if base_tf == "5m":
+                bars_per_day = 288
+            else:
+
+                bars_per_day = int(pd.Timedelta("1D") / _tf_to_timedelta(base_tf))
+
+            vol_lookback_days = int(self.cfg.get("VOL_LOOKBACK_DAYS", 30))
+            don_n_days = int(self.cfg.get("DON_N_DAYS", 20))
+
+
+            need_days = max(vol_lookback_days, don_n_days + 2)
+
+            base_limit = max(1500, need_days * bars_per_day)
+
+
+            bars_per_day = int(pd.Timedelta("1D") / _tf_to_timedelta(base_tf))
+
+            vol_days = int(self.cfg.get("VOL_LOOKBACK_DAYS", 30))
+            don_days = int(self.cfg.get("DON_N_DAYS", 20))
+            cap_bars = int(self.cfg.get("VOL_CAP_BARS", 9000))
+
+            need_vol = bars_per_day * (vol_days + 2)
+            need_don = bars_per_day * (don_days + 2)
+
+
+            need_base = max(1500, need_vol, need_don)
+
+
+            base_limit = min(need_base, cap_bars)
+
+
+            LOG.info(
+                "OHLCV_LIMIT symbol=%s base_tf=%s bars_per_day=%d vol_days=%d don_days=%d cap_bars=%d need_vol=%d need_don=%d base_limit=%d",
+                symbol, base_tf, int(bars_per_day), int(vol_days), int(don_days), int(cap_bars),
+                int(need_vol), int(need_don), int(base_limit),
+            )
+
+            slow_s = float(self.cfg.get("SLOW_OHLCV_WARN_S", 8.0))
+
+            t0_fetch = time.perf_counter()
+            t0_sem = time.perf_counter()
+            await self.api_semaphore.acquire()
+            sem_wait = time.perf_counter() - t0_sem
+            if sem_wait >= 1.0:
+                LOG.warning("API_SEM_WAIT symbol=%s waited=%.2fs", symbol, float(sem_wait))
+            try:
+                df_base = await self._get_ohlcv(symbol, base_tf, min_bars=base_limit)
+            finally:
+                self.api_semaphore.release()
+
+            dt_fetch = time.perf_counter() - t0_fetch
+            if dt_fetch >= slow_s:
+                LOG.warning(
+                    "SLOW_OHLCV symbol=%s tf=%s bars=%d took=%.2fs",
+                    symbol, base_tf, int(base_limit), dt_fetch
+                )
+
+
+            if df_base is None or df_base.empty or len(df_base) < 3:
+                LOG.warning("SCAN_SKIP symbol=%s stage=too_few_bars tf=%s n=%s", symbol, base_tf, 0 if df_base is None else len(df_base))
+                return None
+
+
+            recent = df_base.tail(100)
+            if not recent.empty:
+                zero_vol_pct = (recent["volume"] == 0).sum() / len(recent)
+                if zero_vol_pct > 0.25:
+                    LOG.warning("DATA_ERROR %s %s: stale (%.0f%% zero vol).", symbol, base_tf, zero_vol_pct * 100)
+                    return None
+
+            dfs: dict[str, pd.DataFrame] = {base_tf: df_base}
+
+
+            for tf in sorted(required_tfs):
+                if tf == base_tf:
+                    continue
+                try:
+                    dfs[tf] = resample_ohlcv(df_base, tf)
+                except Exception as e:
+                    LOG.warning("SCAN_SKIP symbol=%s stage=resample_fail tf=%s err=%s", symbol, tf, e)
+                    return None
+
+
+            if base_tf not in dfs:
+                LOG.warning("Base TF %s not available for %s.", base_tf, symbol)
+                return None
+            df5 = dfs[base_tf]
+
+
+            if df5.index.tz is None:
+
+                df5.index = df5.index.tz_localize("UTC")
+            else:
+                df5.index = df5.index.tz_convert("UTC")
+
+            df5 = df5.sort_index()
+            df5 = df5[~df5.index.duplicated(keep="last")]
+
+
+            if df5.empty:
+                return None
+
+            decision_ts = df5.index[-1]
+
+
+            df5['ema_fast'] = ta.ema(dfs[ema_tf]['close'], cfg.EMA_FAST_PERIOD).reindex(df5.index, method='ffill')
+            df5['ema_slow'] = ta.ema(dfs[ema_tf]['close'], cfg.EMA_SLOW_PERIOD).reindex(df5.index, method='ffill')
+
+
+            atr_len = int(self.cfg.get("ATR_LEN", 14))
+            rsi_len = int(self.cfg.get("RSI_LEN", 14))
+            adx_len = int(self.cfg.get("ADX_LEN", 14))
+
+
+            df1h = dfs.get('1h')
+            if df1h is None or df1h.empty:
+                LOG.warning("No 1h data for %s; cannot compute ATR/RSI/ADX features.", symbol)
+                return None
+
+            atr_1h = ta.atr(df1h, atr_len)
+            rsi_1h = ta.rsi(df1h["close"], rsi_len)
+            adx_1h = ta.adx(df1h, adx_len)
+
+
+            df5['atr_1h'] = atr_1h.reindex(df5.index, method='ffill')
+            df5['rsi_1h'] = rsi_1h.reindex(df5.index, method='ffill')
+            df5['adx_1h'] = adx_1h.reindex(df5.index, method='ffill')
+
+
+            df5['atr'] = df5['atr_1h']
+            df5['adx'] = df5['adx_1h']
+            df5['rsi'] = df5['rsi_1h']
+
+
+            needed = ['close','volume','atr_1h','rsi_1h','adx_1h','ema_fast','ema_slow']
+            df5_req = df5[needed].dropna()
+            if df5_req.empty:
+                LOG.warning("SCAN_SKIP symbol=%s stage=df5_req_empty decision_ts=%s", symbol, decision_ts.isoformat())
+                return None
+
+            last = df5_req.iloc[-1]
+
+
+            age_opt = self._listing_age_days(symbol, dfs, asof_ts=decision_ts)
+            listing_age_days = int(age_opt) if age_opt is not None else 9999
+
+
+            univ = (getattr(self, "_universe_ctx", {}) or {}).get(symbol, {})
+            eth_ctx = {"eth_macd": dict(eth_macd or {})}
+            ctx = {
+                "symbol": symbol,
+                "market_regime": market_regime,
+                "listing_age_days": listing_age_days,
+                "last_exit_dt": self.last_exit.get(symbol),
+                "is_symbol_blacklisted": is_blacklisted(symbol),
+                **univ, **eth_ctx,
+            }
+
+
+            don_days = int(self.cfg.get("DON_N_DAYS", 20))
+            don_upper_s = donchian_upper_days_no_lookahead(df5["high"], don_days)
+
+
+            if decision_ts in don_upper_s.index:
+                injected_level = float(don_upper_s.loc[decision_ts])
+            else:
+                injected_level = float(don_upper_s.iloc[-1])
+
+
+            ctx["don_break_len"] = don_days
+            ctx["donch_break_len"] = don_days
+
+            if np.isfinite(injected_level):
+                ctx["don_break_level"] = float(injected_level)
+                ctx["donch_break_level"] = float(injected_level)
+
+
+            verdict = self.strategy_engine.evaluate(dfs, ctx)
+            should_enter = bool(getattr(verdict, "should_enter", False))
+
+
+            side = self._resolve_side(verdict)
+
+
+            df1d = dfs.get('1d')
+            ret_30d = 0.0
+            if df1d is not None and len(df1d) > cfg.STRUCTURAL_TREND_DAYS:
+                ret_30d = (df1d['close'].iloc[-1] / df1d['close'].iloc[-cfg.STRUCTURAL_TREND_DAYS] - 1)
+
+            tf_minutes = 5
+
+
+            don_len_raw = getattr(verdict, "don_break_len", None)
+
+
+            if don_len_raw is None:
+                try:
+                    don_len_raw = ctx.get("don_break_len", ctx.get("donch_break_len", None))
+                except Exception:
+                    don_len_raw = None
+
+
+            if don_len_raw is None:
+                try:
+                    don_len_raw = (
+                        ((getattr(self.strategy_engine, "_spec", {}) or {}).get("params", {}) or {})
+                        .get("DONCH_PERIOD", None)
+                    )
+                except Exception:
+                    don_len_raw = None
+
+
+            if don_len_raw is None:
+                don_len_raw = self.cfg.get("DON_N_DAYS", 20)
+
+            try:
+                don_len = int(don_len_raw)
+            except Exception:
+                don_len = 20
+
+            don_len = max(2, don_len)
+
+            don_level = None
+
+
+            try:
+                if np.isfinite(injected_level):
+                    don_level = float(injected_level)
+            except Exception:
+                pass
+
+
+            if bool(self.cfg.get("DEBUG_SIGNAL_DIAG", False)):
+                try:
+                    v = getattr(verdict, "don_break_level", None)
+                    if v is not None:
+                        v_f = float(v)
+                        if np.isfinite(v_f) and don_level is not None and abs(v_f - don_level) > 1e-9:
+                            LOG.warning(
+                                "[STRICT-PAR] StrategyEngine don_break_level differs from injected level: "
+                                "engine=%.8f injected=%.8f symbol=%s ts=%s",
+                                v_f, don_level, symbol, str(decision_ts),
+                            )
+                except Exception:
+                    pass
+
+
+            if don_level is None:
+                try:
+                    if df1d is not None and len(df1d) >= (don_len + 2):
+                        don_upper = df1d['high'].rolling(don_len).max().shift(1)
+                        don_level = float(don_upper.iloc[-1])
+                except Exception:
+                    pass
+
+            if don_level is None:
+                don_level = float(last['close'])
+
+
+            try:
+                bars_needed = int(self.cfg.get("VOL_LOOKBACK_DAYS", 30) * 24 * (60 // tf_minutes))
+                bars_needed = max(96, min(bars_needed, len(df5)))
+                vol_med = df5['volume'].tail(bars_needed).median()
+                vol_mult = float(last['volume'] / vol_med) if vol_med > 0 else 0.0
+            except Exception:
+                vol_mult = 0.0
+
+            rs_pct = float(univ.get("rs_pct", 0.0) or 0.0)
+
+            eth_hist = float((eth_macd or {}).get("hist", 0.0) or 0.0)
+            eth_above = 1.0 if float((eth_macd or {}).get("macd", 0.0)) > float((eth_macd or {}).get("signal", 0.0)) else 0.0
+
+
+            regime_up = 1.0 if eth_hist > 0 else 0.0
+
+
+            ts_utc = decision_ts if decision_ts is not None else df5.index[-1].to_pydatetime()
+            if getattr(ts_utc, "tzinfo", None) is None:
+                ts_utc = ts_utc.replace(tzinfo=timezone.utc)
+            hour_of_day = ts_utc.hour
+            day_of_week = ts_utc.weekday()
+            hour_sin = math.sin(2 * math.pi * hour_of_day / 24.0)
+            hour_cos = math.cos(2 * math.pi * hour_of_day / 24.0)
+
+
+            atr_pct = (last['atr_1h'] / last['close']) if last['close'] > 0 else 0.0
+            don_dist_atr = (float(last['close']) - float(don_level)) / float(last['atr_1h'] if last['atr_1h'] > 0 else np.nan)
+            if not np.isfinite(don_dist_atr):
+                don_dist_atr = 0.0
+
+            atr_at_entry = self._atr_pre_at_ts(df5, decision_ts)
+
+
+            entry_rule = getattr(verdict, "entry_rule", None) or self.cfg.get("ENTRY_RULE", "close_above_break")
+            pullback_type = getattr(verdict, "pullback_type", None) or self.cfg.get("PULLBACK_TYPE", "retest")
+            regime_1d = getattr(verdict, "regime_1d", None) or "unknown"
+
+
+            try:
+                vwap_lb   = int(self.cfg.get("VWAP_LOOKBACK_BARS", 12))
+                vwap_band = float(self.cfg.get("VWAP_BAND_PCT", 0.004))
+                vwap_feats = vwap_stack_features(df5, lookback_bars=vwap_lb, band_pct=vwap_band)
+            except Exception:
+                vwap_feats = {"vwap_frac_in_band": 0.0, "vwap_expansion_pct": 0.0, "vwap_slope_pph": 0.0}
+
+
+            basis_pct = 0.0
+            funding_8h = 0.0
+            try:
+                tk = await self.exchange.fetch_ticker(symbol)
+                mark  = float((tk.get("markPrice") or tk.get("mark") or tk.get("last") or 0.0)) if tk else 0.0
+                index = float((tk.get("indexPrice") or tk.get("index") or 0.0)) if tk else 0.0
+                if isinstance(tk, dict) and "info" in tk:
+                    info = tk["info"] or {}
+                    mark  = float(info.get("markPrice", mark))
+                    index = float(info.get("indexPrice", index))
+                if index and np.isfinite(mark) and np.isfinite(index) and index > 0:
+                    basis_pct = (mark - index) / index
+            except Exception:
+                pass
+            try:
+                fr = await self.exchange.fetch_funding_rate(symbol)
+                funding_8h = float(fr.get("fundingRate", 0.0)) if isinstance(fr, dict) else 0.0
+                if not np.isfinite(funding_8h):
+                    funding_8h = 0.0
+            except Exception:
+                pass
+
+
+            try:
+                prior_b, prior_f, prior_fail_rate = self._prior_breakout_stats(
+                    df1d, period=don_len, lookback_days=int(self.cfg.get("PRIOR_BRK_LOOKBACK_DAYS", 60)),
+                    fallback_days=int(self.cfg.get("PRIOR_BRK_FALLBACK_DAYS", 3))
+                )
+            except Exception:
+                prior_b = prior_f = prior_fail_rate = 0.0
+
+
+            rs_z = float(univ.get("rs_z", 0.0) or 0.0)
+            turnover_z = float(univ.get("turnover_z", 0.0) or 0.0)
+
+
+            oi_feats = await self._build_oi_funding_features(symbol, df5, decision_ts)
+
+
+            meta_full = {
+
+                "atr_1h": float(last["atr_1h"]),
+                "rsi_1h": float(last["rsi_1h"]),
+                "adx_1h": float(last["adx_1h"]),
+                "atr_pct": float(atr_pct),
+                "don_break_len": float(don_len),
+                "don_break_level": float(don_level),
+                "don_dist_atr": float(don_dist_atr),
+                "rs_pct": float(rs_pct),
+                "hour_sin": float(hour_sin),
+                "hour_cos": float(hour_cos),
+                "dow": float(day_of_week),
+                "vol_mult": float(vol_mult),
+
+                "eth_macd_line_4h": float((eth_macd or {}).get("macd", 0.0) or 0.0),
+                "eth_macd_signal_4h": float((eth_macd or {}).get("signal", 0.0) or 0.0),
+                "eth_macd_hist_4h": float((eth_macd or {}).get("hist", 0.0) or 0.0),
+                "eth_macd_hist_slope_4h": (
+                    float((eth_macd or {}).get("hist_slope_4h"))
+                    if (eth_macd is not None and (eth_macd or {}).get("hist_slope_4h") is not None)
+                    else np.nan
+                ),                "eth_macd_hist_slope_1h": (
+                    float((eth_macd or {}).get("hist_slope_1h"))
+                    if (eth_macd is not None and (eth_macd or {}).get("hist_slope_1h") is not None)
+                    else np.nan
+                ),
+
+
+                "eth_vol_regime_level": (
+                    float((gov_ctx or {}).get("eth_vol_regime_level"))
+                    if isinstance(gov_ctx, dict) and (gov_ctx or {}).get("eth_vol_regime_level") is not None
+                    else np.nan
+                ),
+                "eth_trend_slope": (
+                    float((gov_ctx or {}).get("eth_trend_slope"))
+                    if isinstance(gov_ctx, dict) and (gov_ctx or {}).get("eth_trend_slope") is not None
+                    else np.nan
+                ),
+
+
+                "regime_code_1d": float(reg_code),
+                "regime_up": int(regime_up),
+
+
+                "rs_z": float(rs_z),
+                "turnover_z": float(turnover_z),
+
+
+                "vwap_frac_in_band": float(vwap_feats.get("vwap_frac_in_band", 0.0)),
+                "vwap_expansion_pct": float(vwap_feats.get("vwap_expansion_pct", 0.0)),
+                "vwap_slope_pph": float(vwap_feats.get("vwap_slope_pph", 0.0)),
+
+
+                "prior_breakout_count": float(prior_b),
+                "prior_breakout_fail_count": float(prior_f),
+                "prior_breakout_fail_rate": float(prior_fail_rate),
+
+                "atr_at_entry": atr_at_entry,
+            }
+
+
+            meta_full.update(oi_feats or {})
+
+            if isinstance(gov_ctx, dict) and gov_ctx:
+                meta_full.update(gov_ctx)
+
+
+            eq_feats = self.feature_builder.compute_entry_quality_features(df5, decision_ts)
+            meta_full.update(eq_feats)
+
+
+            ds = meta_full.get("days_since_prev_break", None)
+            if self._is_bad_numeric(ds):
+
+                backfill_bars = int(getattr(self, "_ohlcv_disk_keep_bars", 0) or 0)
+
+
+                if backfill_bars <= 0:
+                    backfill_bars = int(self.cfg.get("ENTRY_QUAL_BACKFILL_BARS", 0))
+
+                if backfill_bars > 0:
+                    LOG.info(
+                        "ENTRY_QUAL_BACKFILL symbol=%s tf=%s from=%d to=%d (days_since_prev_break was NaN)",
+                        symbol, base_tf, int(len(df_base) if df_base is not None else 0), int(backfill_bars),
+                    )
+
+                    df_bf = await self._get_ohlcv(symbol, base_tf, min_bars=int(backfill_bars))
+                    if df_bf is not None and not df_bf.empty and len(df_bf) >= 3:
+
+                        eq_bf = self.feature_builder.compute_entry_quality_features(df_bf, decision_ts)
+                        meta_full.update(eq_bf)
+
+
+                        self._augment_meta_with_regime_sets(meta_full)
+
+
+            try:
+                self._augment_meta_with_regime_sets(meta_full)
+            except Exception as e:
+                LOG.warning("bundle=%s augment_meta_with_regime_sets failed: %s", getattr(self, "bundle_id", "no_bundle"), e)
+
+
+            if bool(self.cfg.get("REGIME_TRUTH_OVERRIDE", False)):
+                try:
+
+                    cache_key = getattr(self, "bundle_id", None)
+                    if (
+                        getattr(self, "_regime_truth_max_ts_bundle_id", None) != cache_key
+                        or getattr(self, "_regime_truth_max_ts_cache", None) is None
+                    ):
+                        def _max_ts_from_parquet(path_obj) -> Optional[pd.Timestamp]:
+                            if not path_obj:
+                                return None
+                            p = Path(str(path_obj))
+                            if not p.exists():
+                                return None
+                            df = pd.read_parquet(p)
+
+                            if isinstance(df.index, pd.DatetimeIndex):
+                                mx = df.index.max()
+                                return pd.to_datetime(mx, utc=True, errors="coerce")
+
+                            for c in ("ts", "timestamp", "time", "date", "asof_ts", "asof"):
+                                if c in df.columns:
+                                    s = pd.to_datetime(df[c], utc=True, errors="coerce")
+                                    if s.notna().any():
+                                        return pd.to_datetime(s.max(), utc=True, errors="coerce")
+                            return None
+
+                        daily_p = getattr(self.meta_bundle, "regime_daily_truth_path", None) if getattr(self, "meta_bundle", None) is not None else None
+                        markov_p = getattr(self.meta_bundle, "regime_markov4h_truth_path", None) if getattr(self, "meta_bundle", None) is not None else None
+
+                        daily_max = _max_ts_from_parquet(daily_p)
+                        markov_max = _max_ts_from_parquet(markov_p)
+
+
+                        if daily_max is None or markov_max is None:
+                            truth_max = None
+                        else:
+                            truth_max = min(daily_max, markov_max)
+
+                        self._regime_truth_max_ts_bundle_id = cache_key
+                        self._regime_truth_max_ts_cache = truth_max
+
+                    truth_max = getattr(self, "_regime_truth_max_ts_cache", None)
+
+                    if truth_max is None:
+                        LOG.warning(
+                            "bundle=%s REGIME_TRUTH_OVERRIDE disabled (cannot determine truth max ts).",
+                            getattr(self, "bundle_id", "no_bundle"),
+                        )
+                    else:
+                        decision_ts_u = pd.to_datetime(decision_ts, utc=True, errors="coerce")
+                        if pd.isna(decision_ts_u):
+                            raise ValueError("invalid decision_ts for REGIME_TRUTH_OVERRIDE")
+
+
+                        allow_stale = bool(self.cfg.get("REGIME_TRUTH_ALLOW_STALE", False))
+                        if (decision_ts_u > truth_max) and (not allow_stale):
+                            LOG.warning(
+                                "bundle=%s REGIME_TRUTH_OVERRIDE skipped (decision_ts=%s beyond truth_max_ts=%s).",
+                                getattr(self, "bundle_id", "no_bundle"),
+                                str(decision_ts_u),
+                                str(truth_max),
+                            )
+                        else:
+                            macro = (
+                                macro_regimes_asof(self.meta_bundle, decision_ts_u)
+                                if getattr(self, "meta_bundle", None) is not None
+                                else {}
+                            )
+                            if isinstance(macro, dict) and macro:
+                                meta_full.update(macro)
+
+                except Exception as e:
+                    LOG.warning(
+                        "bundle=%s REGIME_TRUTH_OVERRIDE failed (disabled for this cycle): %s",
+                        getattr(self, "bundle_id", "no_bundle"),
+                        e,
+                    )
+
+
+            if ("regime_up" not in meta_full) or pd.isna(meta_full.get("regime_up")):
+                LOG.warning(
+                    "bundle=%s missing regime_up after ETH MACD computation; leaving missing for fail-closed schema.",
+                    getattr(self, "bundle_id", "no_bundle"),
+                )
+
+
+            required = list(getattr(self.winprob, "raw_features", []) or [])
+
+
+            if required:
+                meta_row = {k: meta_full.get(k, np.nan) for k in required}
+            else:
+                meta_row = {}
+
+
+            try:
+                if getattr(self, "golden_store", None) is not None:
+
+                    ts = df5.index[-1]
+                    golden = self.golden_store.get(symbol, ts)
+                    if golden is not None:
+                        meta_row = golden
+                        LOG.info("bundle=%s Meta golden hit %s ts=%s",
+                                 self.bundle_id, symbol, ts.isoformat())
+            except Exception:
+                pass
+
+
+            if required:
+                ok_req, miss_req = validate_required_features(meta_row, required)
+                if not ok_req:
+                    schema_ok = False
+                    meta_err = f"missing_required:{miss_req}"
+                    LOG.warning("FEATURE_MISSING bundle=%s symbol=%s decision_ts=%s missing=%s",
+                                getattr(self, "bundle_id", "no_bundle"), symbol, decision_ts.isoformat(), miss_req)
+
+                    p_cal, p_raw = None, None
+                else:
+
+                    score_d = self._score_winprob_safe_details(symbol, meta_row)
+                    p_cal = score_d.get("p_cal")
+                    p_raw = score_d.get("p_raw")
+                    schema_ok = score_d.get("schema_ok")
+                    meta_err = score_d.get("err")
+            else:
+
+                p_cal, p_raw = None, None
+                schema_ok = True
+                meta_err = "no_model_features"
+
+
+            wp = getattr(self, "winprob", None)
+
+            cfg_thr = self.cfg.get("META_PROB_THRESHOLD", None)
+            pstar = None
+            pstar_src = "disabled_cfg_none"
+
+            if cfg_thr is None:
+                pstar = None
+            else:
+
+                if isinstance(cfg_thr, str) and cfg_thr.strip().lower() in ("artifact", "bundle", "pstar", "thresholds"):
+                    pstar = getattr(wp, "pstar", None) if wp is not None else None
+                    pstar_src = "cfg:artifact"
+                else:
+                    try:
+                        pstar = float(cfg_thr)
+                        pstar_src = "cfg:number"
+                    except Exception:
+                        pstar = None
+                        pstar_src = "cfg:bad_value"
+
+            try:
+                pstar = float(pstar) if pstar is not None else None
+                if pstar is not None and ((not np.isfinite(pstar)) or pstar < 0.0 or pstar > 1.0):
+                    pstar = None
+                    pstar_src = "cfg:out_of_range"
+            except Exception:
+                pstar = None
+                pstar_src = "cfg:parse_error"
+
+
+            scope_gate_enabled = bool(self.cfg.get("META_SCOPE_GATE_ENABLED", False))
+            gate_scope_raw = str(self.cfg.get("META_GATE_SCOPE", "") or "").strip()
+            gate_scope_l = gate_scope_raw.lower()
+            if gate_scope_raw:
+                if gate_scope_l in ("all", "none", "off", "disabled"):
+                    scope_gate_enabled = False
+                elif gate_scope_l in ("artifact", "bundle", "auto", "default"):
+                    scope_gate_enabled = True
+                else:
+
+                    scope_gate_enabled = True
+
+            meta_gate_fail_closed = bool(self.cfg.get("META_GATE_FAIL_CLOSED", True))
+
+
+            strat_ok = bool(should_enter)
+
+
+            meta_required = bool(getattr(cfg, "META_MODEL_ENABLED", True))
+
+            pstar_scope = getattr(wp, "pstar_scope", None) if wp is not None else None
+            if gate_scope_raw:
+                if gate_scope_l in ("all", "none", "off", "disabled"):
+                    pstar_scope = None
+                elif gate_scope_l in ("artifact", "bundle", "auto", "default"):
+
+                    pass
+                else:
+                    pstar_scope = gate_scope_raw
+            scope_ok, scope_info = eval_meta_scope(pstar_scope, meta_row)
+
+            risk_on_1_raw = scope_info.get("risk_on_1_raw", None)
+            risk_on_raw   = scope_info.get("risk_on_raw", None)
+            scope_val     = scope_info.get("scope_val", None)
+            scope_src     = scope_info.get("scope_src", None)
+            missing_cols  = bool(scope_info.get("missing_cols", False))
+
+            def _fmt_raw(x) -> str:
+                if x is None:
+                    return "None"
+                try:
+                    if isinstance(x, (float, np.floating)) and (not np.isfinite(float(x))):
+                        return "nan"
+                except Exception:
+                    pass
+                try:
+                    return str(x)
+                except Exception:
+                    return repr(x)
+
+            meta_ok = False
+            reason = ""
+            err = meta_err
+
+
+            if not bool(schema_ok):
+                meta_ok = False
+                reason = "schema_fail"
+                if err is None:
+                    err = "schema_fail"
+            else:
+                if pstar is None:
+
+                    if not meta_required:
+                        meta_ok = True
+                        reason = "meta_disabled"
+                    else:
+                        meta_ok = True
+                        reason = "no_prob_gate"
+
+                else:
+
+                    scope_blocked = scope_gate_enabled and (not bool(scope_ok))
+                    if scope_blocked and meta_gate_fail_closed:
+                        meta_ok = False
+                        if missing_cols:
+                            reason = f"scope_error:{(pstar_scope or 'NONE')}"
+                            if err is None:
+                                err = "scope_missing_cols"
+                        else:
+                            reason = f"scope_fail:{(pstar_scope or 'NONE')}"
+
+                    else:
+                        if scope_blocked:
+
+                            reason = f"scope_bypass:{(pstar_scope or 'NONE')}"
+                        p_ok, p_cal_f = self._valid_prob_01(p_cal)
+                        try:
+                            pstar_f = float(pstar)
+                        except Exception:
+                            pstar_f = float("nan")
+
+                        if p_ok and np.isfinite(pstar_f):
+                            meta_ok = (p_cal_f >= pstar_f)
+                            reason = "ok" if meta_ok else "below_pstar"
+                        else:
+
+                            meta_ok = True
+                            reason = "prob_invalid_no_gate"
+
+
+            bundle = getattr(self, "bundle_id", None) or "no_bundle"
+
+            try:
+                p_cal_f_log = float(p_cal) if p_cal is not None else float("nan")
+            except Exception:
+                p_cal_f_log = float("nan")
+            try:
+                pstar_f_log = float(pstar) if pstar is not None else float("nan")
+            except Exception:
+                pstar_f_log = float("nan")
+
+            LOG.info(
+                "META_DECISION bundle=%s symbol=%s decision_ts=%s schema_ok=%s "
+                "p_cal=%s pstar=%s pstar_scope=%s "
+                "risk_on_1=%s risk_on=%s scope_val=%s scope_src=%s scope_ok=%s "
+                "meta_ok=%s strat_ok=%s reason=%s err=%s",
+                bundle,
+                symbol,
+                decision_ts.isoformat(),
+                bool(schema_ok),
+                f"{p_cal_f_log:.4f}" if np.isfinite(p_cal_f_log) else "nan",
+                f"{pstar_f_log:.4f}" if np.isfinite(pstar_f_log) else "nan",
+                _fmt_raw(pstar_scope),
+                _fmt_raw(risk_on_1_raw),
+                _fmt_raw(risk_on_raw),
+                _fmt_raw(scope_val),
+                _fmt_raw(scope_src),
+                bool(scope_ok),
+                bool(meta_ok),
+                bool(strat_ok),
+                reason,
+                _fmt_raw(err),
+            )
+
+
+            should_enter = bool(should_enter) and bool(meta_ok)
+
+
+            try:
+                LOG.debug("META: p*=%.3f p=%.3f → %s", pstar, (p_cal if p_cal is not None else float("nan")), ("OK" if meta_ok else "VETO"))
+            except Exception:
+                pass
+
+
+            if bool(self.cfg.get("DEBUG_SIGNAL_DIAG", True)):
+
+                liq_usd = float(univ.get("median_24h_turnover_usd", 0.0) or 0.0)
+                liq_thr = float(self.cfg.get("LIQ_MIN_24H_USD", 500_000.0))
+                liq_ok_univ = univ.get("liq_ok", None)
+                g_liq = (bool(liq_ok_univ) if liq_ok_univ is not None else (liq_usd >= liq_thr))
+
+
+                rs_min = float(self.cfg.get("RS_MIN_PERCENTILE", 70))
+                vol_needed = float(self.cfg.get("VOL_MULTIPLE", 2.0))
+                regime_block = bool(self.cfg.get("REGIME_BLOCK_WHEN_DOWN", True))
+                g_rs = rs_pct >= rs_min
+                g_vol = vol_mult >= vol_needed
+                g_regime = (regime_up == 1.0) or (not regime_block)
+                g_micro = (atr_pct >= float(self.cfg.get("ENTRY_MIN_ATR_PCT", 0.0)))
+
+                g_meta = bool(meta_ok)
+
+
+                why = None
+                for attr in ("reason_tags", "tags", "reasons", "why", "debug", "failures"):
+                    if hasattr(verdict, attr):
+                        why = getattr(verdict, attr)
+                        break
+
+                def _ok(b): return "✅" if b else "❌"
+
+                pstar_disp = "None" if pstar is None else f"{float(pstar):.2f}"
+                p_disp = "None" if p_cal is None else f"{float(p_cal):.3f}"
+
+                LOG.debug(
+                    (
+                        f"\n--- {symbol} | {df5.index[-1].strftime('%Y-%m-%d %H:%M')} UTC ---\n"
+                        f"[Strategy verdict] should_enter={should_enter}"
+                        f"{'  why=' + str(why) if why is not None else ''}\n"
+                        f"[Gates]\n"
+                        f"  META: p*={pstar_disp},  p={p_disp} → {_ok(g_meta)}\n"
+                        f"===================================================="
+                    )
+                )
+
+
+            if not should_enter:
+                return None
+
+
+            lookback = int(self.cfg.get("VWAP_STACK_LOOKBACK_BARS", 12))
+            band_pct = float(self.cfg.get("VWAP_STACK_BAND_PCT", 0.004))
+            try:
+                vw = vwap_stack_features(
+                    df5[['open','high','low','close','volume']].copy(),
+                    lookback_bars=lookback, band_pct=band_pct
+                )
+                vwap_frac  = float(vw.get("vwap_frac_in_band", 0.0))
+                vwap_exp   = float(vw.get("vwap_expansion_pct", 0.0))
+                vwap_slope = float(vw.get("vwap_slope_pph", 0.0))
+            except Exception as e:
+                LOG.error("VWAP-stack calc failed for %s: %s", symbol, e)
+                vwap_frac = vwap_exp = vwap_slope = 0.0
+
+
+            boom_bars = int((cfg.PRICE_BOOM_PERIOD_H * 60) / tf_minutes)
+            slowdown_bars = int((cfg.PRICE_SLOWDOWN_PERIOD_H * 60) / tf_minutes)
+            df5['price_boom_ago'] = df5['close'].shift(boom_bars)
+            df5['price_slowdown_ago'] = df5['close'].shift(slowdown_bars)
+
+
+            vwap_bars = int((cfg.GAP_VWAP_HOURS * 60) / tf_minutes)
+            vwap_num = (df5['close'] * df5['volume']).shift(1).rolling(vwap_bars).sum()
+            vwap_den = df5['volume'].shift(1).rolling(vwap_bars).sum()
+            df5['vwap'] = vwap_num / vwap_den
+            vwap_dev_raw = df5['close'] - df5['vwap']
+            df5['vwap_dev_pct'] = vwap_dev_raw / df5['vwap']
+            df5['price_std'] = df5['close'].rolling(vwap_bars).std()
+            df5['vwap_z_score'] = vwap_dev_raw / df5['price_std']
+            df5['vwap_ok'] = df5['vwap_dev_pct'].abs() <= cfg.GAP_MAX_DEV_PCT
+            df5['vwap_consolidated'] = df5['vwap_ok'].rolling(cfg.GAP_MIN_BARS).min().fillna(0).astype(bool)
+
+            df5.dropna(inplace=True)
+            if df5.empty:
+                return None
+
+            last = df5.iloc[-1]
+
+            boom_ret_pct = (last['close'] / last['price_boom_ago'] - 1)
+            slowdown_ret_pct = (last['close'] / last['price_slowdown_ago'] - 1)
+            is_ema_crossed_down = last['ema_fast'] < last['ema_slow']
+
+
+            enter_ok = True
+            if bool(self.cfg.get("ENTRY_REQUIRE_EMA_CROSS", False)):
+                enter_ok = enter_ok and ((last['ema_fast'] > last['ema_slow']) if side == "long" else (last['ema_fast'] < last['ema_slow']))
+            if bool(self.cfg.get("ENTRY_REQUIRE_VWAP_CONSOL", False)):
+                enter_ok = enter_ok and bool(last.get('vwap_consolidated', False))
+            min_atr_pct = float(self.cfg.get("ENTRY_MIN_ATR_PCT", 0.0))
+            if min_atr_pct > 0:
+                enter_ok = enter_ok and (atr_pct >= min_atr_pct)
+            if not enter_ok:
+                if bool(self.cfg.get("DEBUG_SIGNAL_DIAG", True)):
+                    LOG.debug("— %s vetoed by local entry heuristics.", symbol)
+                return None
+
+
+            signal_obj = Signal(
+                symbol=symbol,
+                decision_ts=decision_ts,
+                entry=float(last['close']),
+                atr=float(last['atr_1h']),
+                rsi=float(last['rsi_1h']),
+                adx=float(last['adx_1h']),
+                atr_pct=float(atr_pct) * 100.0,
+                market_regime=market_regime,
+                price_boom_pct=float(boom_ret_pct),
+                price_slowdown_pct=float(slowdown_ret_pct),
+                vwap_dev_pct=float(last.get('vwap_dev_pct', 0.0)),
+                vwap_z_score=float(last.get('vwap_z_score', 0.0)),
+                ret_30d=float(ret_30d),
+                ema_fast=float(last['ema_fast']),
+                ema_slow=float(last['ema_slow']),
+                listing_age_days=int(listing_age_days),
+                session_tag=("ASIA" if 0 <= hour_of_day < 8 else "EUROPE" if 8 <= hour_of_day < 16 else "US"),
+                day_of_week=day_of_week,
+                hour_of_day=hour_of_day,
+                vwap_consolidated=bool(last.get('vwap_consolidated', False)),
+                is_ema_crossed_down=bool(is_ema_crossed_down),
+                side=side,
+            )
+
+            signal_obj.vwap_stack_frac = vwap_frac
+            signal_obj.vwap_stack_expansion_pct = vwap_exp
+            signal_obj.vwap_stack_slope_pph = vwap_slope
+
+            signal_obj.rs_pct = rs_pct
+            signal_obj.liq_ok = bool(univ.get("liq_ok", True))
+            signal_obj.vol_mult = vol_mult
+
+            signal_obj.don_break_len = don_len
+            signal_obj.don_break_level = don_level
+            signal_obj.don_dist_atr = don_dist_atr
+
+            signal_obj.eth_macd_hist_4h = eth_hist
+            signal_obj.eth_macd_above_signal = bool(eth_above)
+            signal_obj.regime_up_flag = bool(regime_up)
+
+            signal_obj.entry_rule = entry_rule
+            signal_obj.pullback_type = pullback_type
+            signal_obj.regime_1d = regime_1d or ""
+
+
+            try:
+                if p_cal is not None and np.isfinite(p_cal):
+                    signal_obj.win_probability = float(min(max(float(p_cal), 0.0), 1.0))
+                else:
+                    signal_obj.win_probability = 0.0
+            except Exception:
+                signal_obj.win_probability = 0.0
+
+
+            try:
+                signal_obj.risk_on = int(1 if float(risk_on_raw or 0.0) == 1.0 else 0)
+            except Exception:
+                signal_obj.risk_on = 0
+            try:
+                signal_obj.risk_on_1 = int(1 if float(risk_on_1_raw or 0.0) == 1.0 else 0)
+            except Exception:
+                signal_obj.risk_on_1 = 0
+
+
+            risk_scale_raw = last.get("risk_scale", None)
+            if risk_scale_raw is None:
+                risk_scale_raw = meta_full.get("risk_scale", None)
+            try:
+                risk_scale_f = float(risk_scale_raw)
+                signal_obj.risk_scale = risk_scale_f if np.isfinite(risk_scale_f) else None
+            except Exception:
+                signal_obj.risk_scale = None
+
+
+            LOG.info(
+                "SIGNAL %s @ %.6f | regime=%s | wp=%.2f%%",
+                symbol, float(last['close']), market_regime, signal_obj.win_probability * 100.0
+            )
+
+
+            setattr(signal_obj, "don_break_level", meta_full.get("don_break_level"))
+            setattr(signal_obj, "don_dist_atr", meta_full.get("don_dist_atr"))
+            setattr(signal_obj, "don_break_len", meta_full.get("don_break_len"))
+
+            setattr(signal_obj, "meta_pstar", pstar)
+
+
+            return signal_obj
+
+        except ccxt.BadSymbol:
+            LOG.warning("Invalid symbol on exchange: %s", symbol)
+        except Exception as e:
+            LOG.error("Error scanning symbol %s: %s", symbol, e, exc_info=True)
+        return None
+
+
+    def _vwap_stack_multiplier(self, stack_frac: float | None, expansion_pct: float | None) -> float:
+
+
+        cfgd = self.cfg
+        if not bool(cfgd.get("VWAP_STACK_SIZING_ENABLED", True)):
+            return 1.0
+
+        m_lo = float(cfgd.get("VWAP_STACK_MIN_MULTIPLIER", 1.00))
+        m_hi = float(cfgd.get("VWAP_STACK_MAX_MULTIPLIER", 1.00))
+        if abs(m_hi - m_lo) < 1e-12:
+            return m_lo
+
+        frac_min = float(cfgd.get("VWAP_STACK_FRAC_MIN", 0.50))
+        frac_good = float(cfgd.get("VWAP_STACK_FRAC_GOOD", 0.70))
+        exp_abs_min = float(cfgd.get("VWAP_STACK_EXPANSION_ABS_MIN", 0.006))
+        exp_good = float(cfgd.get("VWAP_STACK_EXPANSION_GOOD", 0.015))
+        w_frac = float(cfgd.get("VWAP_STACK_FRAC_WEIGHT", 0.6))
+        w_exp  = float(cfgd.get("VWAP_STACK_EXP_WEIGHT", 0.4))
+        if (w_frac + w_exp) <= 0:
+            w_frac, w_exp = 1.0, 0.0
+
+        frac = float(stack_frac) if stack_frac is not None and np.isfinite(stack_frac) else 0.0
+        exp  = float(expansion_pct) if expansion_pct is not None and np.isfinite(expansion_pct) else 0.0
+
+        def lin01(x, lo, hi):
+            if hi <= lo:
+                hi = lo + 1e-6
+            return float(np.clip((x - lo) / (hi - lo), 0.0, 1.0))
+
+        s_frac = lin01(frac, frac_min, frac_good)
+        s_exp  = lin01(abs(exp), exp_abs_min, exp_good)
+
+        score = (w_frac * s_frac + w_exp * s_exp) / (w_frac + w_exp)
+        return float(m_lo + score * (m_hi - m_lo))
+
+    def _winprob_multiplier(self, wp: float) -> float:
+
+
+        cfgd = self.cfg
+        enabled = cfgd.get("META_SIZING_ENABLED", cfgd.get("WINPROB_SIZING_ENABLED", True))
+        if not bool(enabled):
+            return 1.0
+        try:
+            wp = float(wp)
+        except Exception:
+            return 1.0
+        if not np.isfinite(wp):
+            return 1.0
+        wp = float(np.clip(wp, 0.0, 1.0))
+
+        prob_lo = float(
+            cfgd.get(
+                "META_SIZING_P0",
+                cfgd.get("WINPROB_PROB_FLOOR", cfgd.get("WINPROB_SIZE_FLOOR", 0.50)),
+            )
+        )
+        prob_hi = float(
+            cfgd.get(
+                "META_SIZING_P1",
+                cfgd.get("WINPROB_PROB_CAP", cfgd.get("WINPROB_SIZE_CAP", 0.90)),
+            )
+        )
+        if prob_hi <= prob_lo:
+            prob_hi = prob_lo + 1e-6
+
+        mult_lo = float(cfgd.get("META_SIZING_MIN", cfgd.get("WINPROB_MIN_MULTIPLIER", 0.70)))
+        mult_hi = float(cfgd.get("META_SIZING_MAX", cfgd.get("WINPROB_MAX_MULTIPLIER", 1.30)))
+        if abs(mult_hi - mult_lo) < 1e-12:
+            return mult_lo
+
+        x = (np.clip(wp, prob_lo, prob_hi) - prob_lo) / (prob_hi - prob_lo)
+        return float(mult_lo + x * (mult_hi - mult_lo))
+
+    def _dyn_size_multiplier(self, prob_val: Any, eth_hist_val: Any) -> float:
+
+
+        size_mult = 1.0
+
+        prob_ok, p = self._valid_prob_01(prob_val)
+        if bool(self.cfg.get("META_SIZING_ENABLED", True)) and prob_ok:
+            size_mult = float(self._winprob_multiplier(p))
+
+        try:
+            eth_hist = float(eth_hist_val)
+        except Exception:
+            eth_hist = float("nan")
+        try:
+            hist_thresh = float(self.cfg.get("DYN_MACD_HIST_THRESH", 0.0))
+        except Exception:
+            hist_thresh = 0.0
+        try:
+            regime_down_mult = float(self.cfg.get("REGIME_DOWNSIZE_MULT", 1.0))
+        except Exception:
+            regime_down_mult = 1.0
+
+        if np.isfinite(eth_hist) and np.isfinite(hist_thresh) and np.isfinite(regime_down_mult):
+            if eth_hist < hist_thresh:
+                size_mult *= regime_down_mult
+
+        size_min_cap_raw = self.cfg.get("SIZE_MIN_CAP", self.cfg.get("SIZING_MULT_MIN", None))
+        size_max_cap_raw = self.cfg.get("SIZE_MAX_CAP", self.cfg.get("SIZING_MULT_MAX", None))
+        try:
+            size_min_cap = float(size_min_cap_raw) if size_min_cap_raw is not None else 0.0
+        except Exception:
+            size_min_cap = 0.0
+        try:
+            size_max_cap = float(size_max_cap_raw) if size_max_cap_raw is not None else float("inf")
+        except Exception:
+            size_max_cap = float("inf")
+
+        if np.isfinite(size_min_cap) and size_min_cap > 0.0:
+            size_mult = max(size_mult, size_min_cap)
+        if np.isfinite(size_max_cap) and size_max_cap > 0.0:
+            size_mult = min(size_mult, size_max_cap)
+
+        if (not np.isfinite(size_mult)) or size_mult < 0.0:
+            return 0.0
+        return float(size_mult)
+
+    def _yaml_sizing_multiplier(self, sig: Signal) -> float:
+
+
+        scalers = self.cfg.get("SIZING_SCALERS", []) or []
+        if not isinstance(scalers, list) or not scalers:
+            return 1.0
+
+        data = dict(vars(sig))
+        data.setdefault("win_probability", float(getattr(sig, "win_probability", 0.0) or 0.0))
+        data.setdefault("vwap_stack_frac", getattr(sig, "vwap_stack_frac", None))
+        data.setdefault("vwap_stack_expansion_pct", getattr(sig, "vwap_stack_expansion_pct", None))
+        data.setdefault("vwap_stack_slope_pph", getattr(sig, "vwap_stack_slope_pph", None))
+
+        def _one_scaler(s: dict) -> float:
+            try:
+                feat = s.get("feature") or s.get("field")
+                if not feat:
+                    return 1.0
+                x = data.get(feat, s.get("default", 0.0))
+                x = float(x) if x is not None and np.isfinite(x) else float(s.get("default", 0.0))
+
+                in_lo = float(s.get("in_min", s.get("min", 0.0)))
+                in_hi = float(s.get("in_max", s.get("max", 1.0)))
+                out_lo = float(s.get("mult_min", 1.0))
+                out_hi = float(s.get("mult_max", 1.0))
+                if in_hi <= in_lo:
+                    in_hi = in_lo + 1e-9
+
+                x_clamped = min(max(x, in_lo), in_hi)
+                t = (x_clamped - in_lo) / (in_hi - in_lo)
+                m = out_lo + t * (out_hi - out_lo)
+
+                if "cap_min" in s or "cap_max" in s:
+                    cap_min = float(s.get("cap_min", -1e18))
+                    cap_max = float(s.get("cap_max", +1e18))
+                    m = min(max(m, cap_min), cap_max)
+                return float(m)
+            except Exception:
+                return 1.0
+
+        mult = 1.0
+        for s in scalers:
+            if isinstance(s, dict):
+                mult *= _one_scaler(s)
+
+        gmin = float(self.cfg.get("SIZING_MULT_MIN", 0.0))
+        gmax = float(self.cfg.get("SIZING_MULT_MAX", 1e18))
+        return float(min(max(mult, gmin if gmin > 0 else 0.0), gmax))
+
+    async def _get_eth_macd_barometer(self) -> Optional[dict]:
+
+        try:
+            eth_ohlcv = await self.exchange.fetch_ohlcv('ETHUSDT', '4h', limit=200)
+            if not eth_ohlcv:
+                return None
+            df = pd.DataFrame(eth_ohlcv, columns=['ts','open','high','low','close','volume'])
+            macd_df = ta.macd(df['close'])
+            latest = macd_df.iloc[-1]
+            return {"macd": float(latest['macd']),
+                    "signal": float(latest['signal']),
+                    "hist": float(latest['hist'])}
+        except Exception as e:
+            LOG.warning("ETH barometer unavailable: %s", e)
+            return None
+
+    async def _get_eth_macd_barometer_asof(self, asof_ts: pd.Timestamp) -> Optional[dict]:
+
+
+        try:
+            asof_ts = pd.to_datetime(asof_ts, utc=True, errors="coerce")
+            if pd.isna(asof_ts):
+                raise ValueError("asof_ts is invalid")
+
+
+            eth_ohlcv_4h = await self.exchange.fetch_ohlcv("ETHUSDT", "4h", limit=260)
+            if not eth_ohlcv_4h:
+                return None
+
+            df4 = pd.DataFrame(eth_ohlcv_4h, columns=["ts", "open", "high", "low", "close", "volume"])
+            df4["ts"] = pd.to_datetime(df4["ts"], unit="ms", utc=True)
+            df4 = df4.set_index("ts").sort_index()
+            df4 = df4[~df4.index.duplicated(keep="last")]
+            df4 = drop_incomplete_last_bar(df4, "4h", asof_ts)
+            if df4 is None or df4.empty or len(df4) < 40:
+                return None
+
+            macd4 = ta.macd(df4["close"])
+            if macd4 is None or macd4.empty:
+                return None
+
+            last4 = macd4.iloc[-1]
+            hist_slope_4h = float("nan")
+            try:
+                if len(macd4) >= 2:
+                    hist_slope_4h = float(macd4["hist"].diff().iloc[-1])
+            except Exception:
+                hist_slope_4h = float("nan")
+
+            out = {
+                "macd": float(last4["macd"]),
+                "signal": float(last4["signal"]),
+                "hist": float(last4["hist"]),
+                "hist_slope_4h": float(hist_slope_4h),
+            }
+
+
+            try:
+                eth_ohlcv_1h = await self.exchange.fetch_ohlcv("ETHUSDT", "1h", limit=400)
+                if eth_ohlcv_1h:
+                    df1 = pd.DataFrame(eth_ohlcv_1h, columns=["ts", "open", "high", "low", "close", "volume"])
+                    df1["ts"] = pd.to_datetime(df1["ts"], unit="ms", utc=True)
+                    df1 = df1.set_index("ts").sort_index()
+                    df1 = df1[~df1.index.duplicated(keep="last")]
+                    df1 = drop_incomplete_last_bar(df1, "1h", asof_ts)
+                    if df1 is not None and (not df1.empty) and len(df1) >= 40:
+                        macd1 = ta.macd(df1["close"])
+                        if macd1 is not None and (not macd1.empty) and len(macd1) >= 2:
+                            out["hist_slope_1h"] = float(macd1["hist"].diff().iloc[-1])
+                        else:
+                            out["hist_slope_1h"] = float("nan")
+                    else:
+                        out["hist_slope_1h"] = float("nan")
+                else:
+                    out["hist_slope_1h"] = float("nan")
+            except Exception:
+                out["hist_slope_1h"] = float("nan")
+
+
+            for k in ("macd", "signal", "hist"):
+                v = out.get(k)
+                if v is None or not math.isfinite(float(v)):
+                    return None
+
+
+            return out
+
+        except Exception as e:
+            LOG.warning("ETH barometer unavailable (asof): %s", e)
+            return None
+
+
+    async def _open_position(self, sig: Signal) -> None:
+
+
+        if any(row["symbol"] == sig.symbol for row in self.open_positions.values()):
+            return
+        try:
+            positions = await self.exchange.fetch_positions(symbols=[sig.symbol])
+            if positions and positions[0] and float(positions[0].get("info", {}).get("size", 0)) > 0:
+                LOG.warning("Pre-flight: found existing exchange position for %s. Abort new entry.", sig.symbol)
+                return
+        except Exception as e:
+            LOG.error("Pre-flight check failed for %s: %s", sig.symbol, e)
+            return
+
+        try:
+            dd_hours = float(self.cfg.get("DEDUP_WINDOW_HOURS", 8.0))
+            recent_open = await self.db.pool.fetchval(
+                "SELECT MAX(opened_at) FROM positions WHERE symbol=$1", sig.symbol
+            )
+
+            if recent_open:
+                asof_dt = pd.to_datetime(sig.decision_ts, utc=True).to_pydatetime()
+                if (asof_dt - recent_open) < timedelta(hours=dd_hours):
+                    LOG.info("De-dup window: last %s open at %s < %sh → skip.", sig.symbol, recent_open, dd_hours)
+                    return
+        except Exception as _e:
+            LOG.warning("De-dup check failed for %s: %s (continuing)", sig.symbol, _e)
+
+
+        side = (getattr(sig, "side", "short") or "short").lower()
+        is_long = (side == "long")
+        entry_side = "buy" if is_long else "sell"
+        sl_close_side = "sell" if is_long else "buy"
+        tp_close_side = "sell" if is_long else "buy"
+        sl_trigger_dir = 2 if is_long else 1
+        tp_trigger_dir = 1 if is_long else 2
+        side_label = "LONG" if is_long else "SHORT"
+
+
+        regime_block = bool(self.cfg.get("REGIME_BLOCK_WHEN_DOWN", True))
+        try:
+            regime_up = float(getattr(sig, "regime_up_flag", 0.0) or 0.0) == 1.0
+        except Exception:
+            regime_up = bool(getattr(sig, "regime_up_flag", False))
+        if regime_block and (not regime_up):
+            LOG.info("ENTRY_SKIP_REGIME symbol=%s regime_up=%s regime_block=%s", sig.symbol, str(regime_up), str(regime_block))
+            return
+
+        try:
+            latest_eq_raw = await self.db.latest_equity()
+            latest_eq = float(latest_eq_raw) if latest_eq_raw is not None else float("nan")
+        except Exception:
+            latest_eq = float("nan")
+
+        equity_for_sizing = latest_eq if np.isfinite(latest_eq) and latest_eq > 0.0 else 0.0
+        if (not regime_up) and (not regime_block):
+            try:
+                regime_size_down = float(self.cfg.get("REGIME_SIZE_WHEN_DOWN", 1.0))
+            except Exception:
+                regime_size_down = 1.0
+            if np.isfinite(regime_size_down) and regime_size_down >= 0.0 and equity_for_sizing > 0.0:
+                equity_for_sizing = equity_for_sizing * regime_size_down
+
+
+        mode = str(self.cfg.get("RISK_MODE", "fixed")).lower()
+        fixed_risk = float(
+            self.cfg.get(
+                "FIXED_RISK_CASH",
+                self.cfg.get("FIXED_RISK_USDT", self.cfg.get("RISK_USD", 10.0)),
+            )
+        )
+        risk_pct = float(self.cfg.get("RISK_PCT", self.cfg.get("RISK_EQUITY_PCT", 0.01)))
+
+        p_cal = float(getattr(sig, "win_probability", float("nan")))
+        eth_hist = getattr(sig, "eth_macd_hist_4h", float("nan"))
+
+        risk_scale_used = False
+        risk_scale_raw = getattr(sig, "risk_scale", None)
+        try:
+            risk_scale_f = float(risk_scale_raw)
+            if np.isfinite(risk_scale_f):
+                size_mult_pre_probe = float(risk_scale_f)
+                risk_scale_used = True
+            else:
+                size_mult_pre_probe = float(self._dyn_size_multiplier(p_cal, eth_hist))
+        except Exception:
+            size_mult_pre_probe = float(self._dyn_size_multiplier(p_cal, eth_hist))
+
+        if not np.isfinite(size_mult_pre_probe):
+            size_mult_pre_probe = 0.0
+        size_mult_pre_probe = max(0.0, float(size_mult_pre_probe))
+
+        try:
+            risk_on_f = float(getattr(sig, "risk_on", 0.0) or 0.0)
+        except Exception:
+            risk_on_f = 0.0
+
+        size_mult_final = float(size_mult_pre_probe)
+        probe_cap_applied = False
+        if bool(self.cfg.get("META_RISK_OFF_PROBE_ENABLED", True)) and risk_on_f != 1.0:
+            try:
+                probe = float(self.cfg.get("RISK_OFF_PROBE_MULT", 0.01))
+            except Exception:
+                probe = 0.01
+            if np.isfinite(probe) and probe > 0.0:
+                size_mult_final = min(size_mult_final, probe)
+                probe_cap_applied = True
+
+        size_mult_final = max(0.0, float(size_mult_final))
+
+        if mode in ("percent", "pct"):
+            base_risk_usd = max(0.0, equity_for_sizing * risk_pct) if equity_for_sizing > 0.0 else fixed_risk
+            risk_pct_override = risk_pct * size_mult_final
+            if equity_for_sizing > 0.0:
+                risk_cash_target = max(0.0, equity_for_sizing * risk_pct_override)
+            else:
+                risk_cash_target = max(0.0, fixed_risk * size_mult_final)
+        else:
+            base_risk_usd = fixed_risk
+            fixed_cash_override = fixed_risk * size_mult_final
+            risk_cash_target = max(0.0, fixed_cash_override)
+
+        risk_usd = float(risk_cash_target)
+        sig.risk_usd = float(risk_usd)
+        sig.size_mult_pre_probe = float(size_mult_pre_probe)
+        sig.size_mult_final = float(size_mult_final)
+        sig.equity_for_sizing = float(equity_for_sizing)
+        sig.risk_cash_target = float(risk_cash_target)
+
+        LOG.info(
+            "SIZING_META symbol=%s p_cal=%s risk_scale=%s risk_scale_used=%s size_mult_pre_probe=%.4f size_mult_final=%.4f risk_on=%.0f probe_cap=%s equity_for_sizing=%.2f risk_cash_target=%.2f",
+            sig.symbol,
+            str(p_cal),
+            str(risk_scale_raw),
+            str(risk_scale_used),
+            float(size_mult_pre_probe),
+            float(size_mult_final),
+            float(risk_on_f),
+            str(probe_cap_applied),
+            float(equity_for_sizing),
+            float(risk_cash_target),
+        )
+
+        LOG.info(
+            "Sizing(%s) mode=%s base=%.2f · p_cal=%.4f · pre_probe×=%.4f · final×=%.4f (risk_on=%.0f, probe_cap=%s, risk_scale_used=%s) → risk=%.2f",
+            side_label,
+            mode,
+            base_risk_usd,
+            p_cal,
+            float(size_mult_pre_probe),
+            float(size_mult_final),
+            risk_on_f,
+            str(probe_cap_applied),
+            str(risk_scale_used),
+            risk_usd,
+        )
+
+
+        try:
+            ticker = await self.exchange.fetch_ticker(sig.symbol)
+            px = float(ticker["last"])
+        except Exception as e:
+            LOG.error("Failed to fetch live ticker for %s: %s", sig.symbol, e)
+            return
+
+        sl_mult = float(self.cfg.get("SL_ATR_MULT", 1.8))
+        stop_preview = px - sl_mult * float(sig.atr) if is_long else px + sl_mult * float(sig.atr)
+        stop_dist = abs(px - stop_preview)
+        if stop_dist <= 0:
+            LOG.warning("Stop distance is zero for %s. Skip.", sig.symbol)
+            return
+        intended_size = max(risk_usd / stop_dist, 0.0)
+
+
+        try:
+            notional_cap_pct = float(self.cfg.get("NOTIONAL_CAP_PCT_OF_EQUITY", 1.0))
+        except Exception:
+            notional_cap_pct = 1.0
+        try:
+            max_leverage_cap = float(self.cfg.get("MAX_LEVERAGE", 1.0))
+        except Exception:
+            max_leverage_cap = 1.0
+
+        if (not np.isfinite(equity_for_sizing)) or equity_for_sizing <= 0.0:
+            LOG.warning(
+                "Cannot enforce notional cap for %s (equity_for_sizing=%s). Skipping entry for parity safety.",
+                sig.symbol,
+                str(equity_for_sizing),
+            )
+            return
+
+        max_notional = float(equity_for_sizing) * max(0.0, float(notional_cap_pct)) * max(0.0, float(max_leverage_cap))
+        if (not np.isfinite(max_notional)) or max_notional <= 0.0:
+            LOG.warning(
+                "Invalid max_notional for %s (equity_for_sizing=%.6f cap_pct=%s max_lev=%s). Skipping entry.",
+                sig.symbol,
+                float(equity_for_sizing),
+                str(notional_cap_pct),
+                str(max_leverage_cap),
+            )
+            return
+
+        curr_notional = intended_size * px
+        if np.isfinite(curr_notional) and curr_notional > max_notional:
+            capped_size = max_notional / px
+            LOG.info(
+                "NOTIONAL_CAP symbol=%s pre_qty=%.10f capped_qty=%.10f pre_notional=%.4f max_notional=%.4f",
+                sig.symbol,
+                float(intended_size),
+                float(capped_size),
+                float(curr_notional),
+                float(max_notional),
+            )
+            intended_size = max(0.0, float(capped_size))
+
+        if intended_size <= 0.0:
+            LOG.warning("Capped size <= 0 for %s after notional cap. Skip.", sig.symbol)
+            return
+
+        try:
+            mkt = self.exchange._exchange.market(sig.symbol)
+        except Exception:
+            mkt = None
+
+        min_amt = None
+        min_cost = None
+        step_amt = None
+        if mkt:
+            lims = (mkt.get("limits") or {})
+            amt_lims = (lims.get("amount") or {})
+            cost_lims = (lims.get("cost") or {})
+            min_amt = amt_lims.get("min")
+            min_cost = cost_lims.get("min")
+            step_amt = (mkt.get("precision") or {}).get("amount", None)
+
+
+        size_prec = intended_size
+        try:
+            size_prec = float(self.exchange._exchange.amount_to_precision(sig.symbol, intended_size))
+        except Exception:
+            pass
+
+
+        def _ceil_to_step(x: float, step: Optional[float]) -> float:
+            import math as _m
+            if not step or step <= 0:
+                return x
+            return _m.ceil(x / step) * step
+
+        if (min_amt is not None) and (size_prec < float(min_amt)):
+            auto_pad = bool(self.cfg.get("MIN_TRADE_AUTOPAD_ENABLED", True))
+            cap_usd = float(self.cfg.get("MIN_TRADE_AUTOPAD_CAP_USD", 5.0))
+            bumped_size = max(float(min_amt), _ceil_to_step(size_prec, step_amt))
+            required_risk = bumped_size * stop_dist
+            if auto_pad and required_risk <= cap_usd:
+                LOG.info("Auto-padding risk to meet min amount: size %.10f -> %.10f (risk %.4f -> %.4f)",
+                         size_prec, bumped_size, risk_usd, required_risk)
+                risk_usd = float(required_risk)
+                size_prec = bumped_size
+            else:
+                LOG.warning("Size %.10f < min_amt %.10f for %s; risk needed ≈ %.4f USDT. "
+                            "Auto-pad=%s cap=%.2f. Skipping entry.",
+                            size_prec, float(min_amt), sig.symbol, required_risk, auto_pad, cap_usd)
+                return
+
+
+        if (min_cost is not None) and mkt:
+            try:
+                last_px = float((await self.exchange.fetch_ticker(sig.symbol))["last"])
+                notional = last_px * size_prec
+                if notional < float(min_cost):
+                    auto_pad = bool(self.cfg.get("MIN_TRADE_AUTOPAD_ENABLED", True))
+                    cap_usd = float(self.cfg.get("MIN_TRADE_AUTOPAD_CAP_USD", 5.0))
+                    need_size = float(min_cost) / last_px
+                    need_size = max(need_size, size_prec)
+                    need_size = _ceil_to_step(need_size, step_amt)
+                    required_risk = need_size * stop_dist
+                    if auto_pad and required_risk <= cap_usd:
+                        LOG.info("Auto-padding for min notional: size %.10f -> %.10f (risk %.4f -> %.4f)",
+                                 size_prec, need_size, risk_usd, required_risk)
+                        risk_usd = float(required_risk)
+                        size_prec = float(need_size)
+                    else:
+                        LOG.warning("Notional %.4f < min_cost %.4f on %s; needed risk ≈ %.4f. "
+                                    "Auto-pad=%s cap=%.2f. Skipping.",
+                                    notional, float(min_cost), sig.symbol, required_risk, auto_pad, cap_usd)
+                        return
+            except Exception as e:
+                LOG.warning("Min-cost check failed for %s: %s (continuing)", sig.symbol, e)
+
+
+        try:
+            size_prec = float(self.exchange._exchange.amount_to_precision(sig.symbol, size_prec))
+        except Exception:
+            pass
+
+        if size_prec <= 0:
+            LOG.warning("Final size <= 0 after min/precision checks; skipping entry.")
+            return
+
+        intended_size = size_prec
+        LOG.info(
+            "PARITY_ROW symbol=%s risk_on=%s size_mult_pre_probe=%.6f size_mult_final=%.6f equity_for_sizing=%.6f risk_cash_target=%.6f qty=%.10f",
+            sig.symbol,
+            str(getattr(sig, "risk_on", 0)),
+            float(getattr(sig, "size_mult_pre_probe", float("nan"))),
+            float(getattr(sig, "size_mult_final", float("nan"))),
+            float(getattr(sig, "equity_for_sizing", float("nan"))),
+            float(getattr(sig, "risk_cash_target", risk_usd)),
+            float(intended_size),
+        )
+
+
+        try:
+            await self._ensure_leverage(sig.symbol)
+        except Exception:
+            return
+
+
+        entry_cid = create_entry_cid(sig.symbol, sig.decision_ts, side_label)
+        try:
+            await self.exchange.create_market_order(
+                sig.symbol, entry_side, intended_size,
+                params={"clientOrderId": entry_cid, "category": "linear"}
+            )
+            LOG.info("Market %s sent for %s (CID=%s)", entry_side.upper(), sig.symbol, entry_cid)
+        except Exception as e:
+            LOG.error("Market %s failed for %s: %s", entry_side.upper(), sig.symbol, e)
+            return
+
+
+        actual_size = 0.0
+        actual_entry_price = 0.0
+        live_position = None
+        for _ in range(20):
+            await asyncio.sleep(0.5)
+            try:
+                positions = await self.exchange.fetch_positions(symbols=[sig.symbol])
+                pos = next((p for p in positions if p.get("info", {}).get("symbol") == sig.symbol), None)
+                if pos and float(pos.get("info", {}).get("size", 0)) > 0:
+                    live_position = pos
+                    actual_size = float(pos["info"]["size"])
+                    actual_entry_price = float(pos["info"]["avgPrice"])
+                    break
+            except Exception as e:
+                LOG.warning("Confirm loop failed for %s: %s", sig.symbol, e)
+
+        if not live_position:
+            LOG.error("Entry failed to confirm for %s; no exchange position appeared.", sig.symbol)
+            return
+
+        slippage_usd = (actual_entry_price - px) * actual_size if is_long else (px - actual_entry_price) * actual_size
+        LOG.info("Entry confirmed %s %s: size=%.6f @ %.6f (slip $%.4f)",
+                 side_label, sig.symbol, actual_size, actual_entry_price, slippage_usd)
+
+
+        stop_price = (actual_entry_price - sl_mult * float(sig.atr)) if is_long else (actual_entry_price + sl_mult * float(sig.atr))
+
+
+        opened_at = pd.to_datetime(sig.decision_ts, utc=True).to_pydatetime()
+        exit_deadline = None
+        if self.cfg.get("TIME_EXIT_HOURS_ENABLED", False):
+            exit_deadline = opened_at + timedelta(hours=int(self.cfg.get("TIME_EXIT_HOURS", 4)))
+        elif self.cfg.get("TIME_EXIT_ENABLED", False):
+            exit_deadline = opened_at + timedelta(days=int(self.cfg.get("TIME_EXIT_DAYS", 10)))
+
+        payload = {
+            "symbol": sig.symbol,
+            "side": side_label,
+            "size": float(actual_size),
+            "entry_price": float(actual_entry_price),
+            "trailing_active": False,
+            "atr": float(sig.atr),
+            "status": "OPEN",
+            "opened_at": opened_at,
+            "exit_deadline": exit_deadline,
+            "entry_cid": entry_cid,
+            "market_regime_at_entry": sig.market_regime,
+            "risk_usd": float(sig.risk_usd),
+            "slippage_usd": float(slippage_usd),
+
+            "rsi_at_entry": float(sig.rsi),
+            "adx_at_entry": float(sig.adx),
+            "atr_pct_at_entry": float(sig.atr_pct),
+            "price_boom_pct_at_entry": float(sig.price_boom_pct),
+            "price_slowdown_pct_at_entry": float(sig.price_slowdown_pct),
+            "vwap_dev_pct_at_entry": float(getattr(sig, "vwap_dev_pct", 0.0)),
+            "vwap_z_at_entry": float(getattr(sig, "vwap_z_score", 0.0)),
+            "ret_30d_at_entry": float(sig.ret_30d),
+            "ema_fast_at_entry": float(sig.ema_fast),
+            "ema_slow_at_entry": float(sig.ema_slow),
+            "listing_age_days_at_entry": int(sig.listing_age_days),
+            "session_tag_at_entry": sig.session_tag,
+            "day_of_week_at_entry": int(sig.day_of_week),
+            "hour_of_day_at_entry": int(sig.hour_of_day),
+            "vwap_consolidated_at_entry": bool(sig.vwap_consolidated),
+            "is_ema_crossed_down_at_entry": bool(sig.is_ema_crossed_down),
+            "win_probability_at_entry": float(getattr(sig, "win_probability", 0.0)),
+
+            "vwap_stack_frac_at_entry": float(getattr(sig, "vwap_stack_frac", 0.0)) if getattr(sig, "vwap_stack_frac", None) is not None else None,
+            "vwap_stack_expansion_pct_at_entry": float(getattr(sig, "vwap_stack_expansion_pct", 0.0)) if getattr(sig, "vwap_stack_expansion_pct", None) is not None else None,
+            "vwap_stack_slope_pph_at_entry": float(getattr(sig, "vwap_stack_slope_pph", 0.0)) if getattr(sig, "vwap_stack_slope_pph", None) is not None else None,
+        }
+
+        try:
+            pid = await self.db.insert_position(payload)
+            LOG.info("Inserted position %s (id=%s)", sig.symbol, pid)
+
+
+            sl_cid = create_stable_cid(pid, "SL")
+            await self.exchange.create_order(
+                sig.symbol, "market", sl_close_side, actual_size, None,
+                params={
+                    "triggerPrice": float(stop_price),
+                    "clientOrderId": sl_cid, "category": "linear",
+                    "reduceOnly": True, "closeOnTrigger": True, "triggerDirection": sl_trigger_dir
+                }
+            )
+
+            tp1_cid, tp_final_cid = None, None
+            if self.cfg.get("PARTIAL_TP_ENABLED", False):
+                tp1_cid = create_stable_cid(pid, "TP1")
+                tp1_mult = float(self.cfg.get("PARTIAL_TP_ATR_MULT", self.cfg.get("TP1_ATR_MULT", 4.0)))
+                tp1_price = actual_entry_price + (tp1_mult * float(sig.atr) * (+1 if is_long else -1))
+                qty_tp1 = actual_size * float(self.cfg.get("PARTIAL_TP_PCT", 0.5))
+                qty_tp1 = max(0.0, min(qty_tp1, actual_size))
+                await self.exchange.create_order(
+                    sig.symbol, "market", tp_close_side, qty_tp1, None,
+                    params={
+                        "triggerPrice": float(tp1_price),
+                        "clientOrderId": tp1_cid, "category": "linear",
+                        "reduceOnly": True, "closeOnTrigger": True, "triggerDirection": tp_trigger_dir
+                    }
+                )
+                if self.cfg.get("FINAL_TP_ENABLED", True):
+                    tp_final_cid = create_stable_cid(pid, "TP_FINAL")
+                    tp_mult = float(self.cfg.get("FINAL_TP_ATR_MULT", self.cfg.get("TP_ATR_MULT", 8.0)))
+                    tp_final_price = actual_entry_price + (tp_mult * float(sig.atr) * (+1 if is_long else -1))
+                    remainder = max(0.0, actual_size - qty_tp1)
+                    await self.exchange.create_order(
+                        sig.symbol, "market", tp_close_side, remainder, None,
+                        params={
+                            "triggerPrice": float(tp_final_price),
+                            "clientOrderId": tp_final_cid, "category": "linear",
+                            "reduceOnly": True, "closeOnTrigger": True, "triggerDirection": tp_trigger_dir
+                        }
+                    )
+            elif self.cfg.get("FINAL_TP_ENABLED", True):
+                tp_final_cid = create_stable_cid(pid, "TP_FINAL")
+                tp_mult = float(self.cfg.get("FINAL_TP_ATR_MULT", self.cfg.get("TP_ATR_MULT", 8.0)))
+                tp_price = actual_entry_price + (tp_mult * float(sig.atr) * (+1 if is_long else -1))
+                await self.exchange.create_order(
+                    sig.symbol, "market", tp_close_side, actual_size, None,
+                    params={
+                        "triggerPrice": float(tp_price),
+                        "clientOrderId": tp_final_cid, "category": "linear",
+                        "reduceOnly": True, "closeOnTrigger": True, "triggerDirection": tp_trigger_dir
+                    }
+                )
+
+
+            await self.db.update_position(
+                pid,
+                status="OPEN",
+                stop_price=float(stop_price),
+                sl_cid=sl_cid,
+                tp1_cid=tp1_cid,
+                tp_final_cid=tp_final_cid,
+            )
+
+
+            row = await self.db.pool.fetchrow("SELECT * FROM positions WHERE id=$1", pid)
+            self.open_positions[pid] = dict(row)
+
+
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+
+            rs_min       = float(self.cfg.get("RS_MIN_PERCENTILE", 70))
+            vol_needed   = float(self.cfg.get("VOL_MULTIPLE", 2.0))
+            regime_block = bool(self.cfg.get("REGIME_BLOCK_WHEN_DOWN", True))
+            min_atr_pct  = float(self.cfg.get("ENTRY_MIN_ATR_PCT", 0.0))
+            meta_thresh_raw = self.cfg.get("META_PROB_THRESHOLD", None)
+            try:
+                meta_thresh = float(meta_thresh_raw) if meta_thresh_raw is not None else None
+            except Exception:
+                meta_thresh = None
+
+
+            rs_pct      = float(getattr(sig, "rs_pct", 0.0) or 0.0)
+            liq_ok      = bool(getattr(sig, "liq_ok", True))
+            vol_mult    = float(getattr(sig, "vol_mult", 0.0) or 0.0)
+            wp          = float(getattr(sig, "win_probability", 0.0) or 0.0)
+            don_len     = getattr(sig, "don_break_len", None)
+            don_level   = getattr(sig, "don_break_level", None)
+            don_dist    = getattr(sig, "don_dist_atr", None)
+            eth_hist    = getattr(sig, "eth_macd_hist_4h", None)
+            eth_above   = getattr(sig, "eth_macd_above_signal", None)
+            reg_up      = bool(getattr(sig, "regime_up_flag", False))
+            pullback    = getattr(sig, "pullback_type", "?")
+            entry_rule  = getattr(sig, "entry_rule", "?")
+
+
+            don_len_s   = str(don_len) if isinstance(don_len, (int, float)) else "?"
+            don_level_s = f"{don_level:.6f}" if isinstance(don_level, (int, float)) else "N/A"
+            don_dist_s  = f"{don_dist:+.2f}" if isinstance(don_dist, (int, float)) else "N/A"
+            eth_hist_s  = f"{eth_hist:.3f}" if isinstance(eth_hist, (int, float)) else "N/A"
+            vwap_frac   = getattr(sig, "vwap_stack_frac", None)
+            vwap_exp    = getattr(sig, "vwap_stack_expansion_pct", None)
+            vwap_slope  = getattr(sig, "vwap_stack_slope_pph", None)
+            vwap_frac_s  = f"{vwap_frac:.2f}" if isinstance(vwap_frac, (int, float)) else "N/A"
+            vwap_exp_s   = f"{(vwap_exp*100):.2f}%" if isinstance(vwap_exp, (int, float)) else "N/A"
+            vwap_slope_s = f"{vwap_slope:.4f}" if isinstance(vwap_slope, (int, float)) else "N/A"
+
+
+            def _ok(b): return "✅" if b else "❌"
+            g_rs    = (rs_pct >= rs_min)
+            g_liq   = liq_ok
+            g_reg   = (reg_up or (not regime_block))
+            g_vol   = (vol_mult >= vol_needed)
+            g_micro = ((float(sig.atr_pct)/100.0) >= min_atr_pct)
+            g_meta  = True if meta_thresh is None else (wp >= meta_thresh)
+
+
+            final_tp_mult  = float(self.cfg.get("FINAL_TP_ATR_MULT", self.cfg.get("TP_ATR_MULT", 8.0)))
+            tp_final_price = actual_entry_price + (final_tp_mult * float(sig.atr) * (+1 if is_long else -1))
+
+
+            import math
+
+            risk_on = int(getattr(sig, "risk_on", 0) or 0)
+            risk_on_1 = int(getattr(sig, "risk_on_1", 0) or 0)
+
+
+            try:
+                sl_s = f"{float(stop_price):.6f}"
+            except Exception:
+                sl_s = "NA"
+
+            try:
+                tp_s = f"{float(tp_final_price):.6f}"
+            except Exception:
+                tp_s = "NA"
+
+
+            try:
+                base_r = float(base_risk_usd)
+            except Exception:
+                base_r = float("nan")
+
+            try:
+                total_r = float(risk_usd)
+            except Exception:
+                total_r = float("nan")
+
+            mult = (total_r / base_r) if (base_r and base_r > 0 and math.isfinite(base_r) and math.isfinite(total_r)) else float("nan")
+            mult_s = f"x{mult:.2f}" if math.isfinite(mult) else "xNA"
+
+            msg = (
+                f"🔔 OPENED {side_label} {sig.symbol} — {ts} UTC\n"
+                f"Px {actual_entry_price:.6f} | SL {sl_s} | TP {tp_s}\n"
+                f"Risk ${total_r:.2f} (base ${base_r:.2f} {mult_s}) | Regime {sig.market_regime} | risk_on={risk_on} risk_on_1={risk_on_1}"
+            )
+            await self.tg.send(msg)
+
+        except Exception as e:
+
+            msg = f"🚨 CRITICAL: Failed to persist/protect {sig.symbol}: {e}. Emergency closing now."
+            LOG.critical(msg)
+            await self.tg.send(msg)
+            try:
+                await self.exchange.create_market_order(
+                    sig.symbol, sl_close_side, actual_size, params={"reduceOnly": True, "category": "linear"}
+                )
+                await self.tg.send(f"✅ Emergency close filled for {sig.symbol}.")
+            except Exception as close_e:
+                await self.tg.send(f"🚨 FAILED EMERGENCY CLOSE for {sig.symbol}: {close_e}")
+
+    async def _manage_positions_loop(self):
+        while True:
+            if not self.open_positions:
+                await asyncio.sleep(2)
+                continue
+            for pid, pos in list(self.open_positions.items()):
+                try:
+                    await self._update_single_position(pid, pos)
+                except Exception as e:
+                    LOG.error("manage err %s %s", pos["symbol"], e)
+            await asyncio.sleep(5)
+
+    async def _update_single_position(self, pid: int, pos: Dict[str, Any]):
+        symbol = pos["symbol"]
+        bundle = getattr(self, "bundle_id", None) or "no_bundle"
+
+
+        try:
+            positions = await self.exchange.fetch_positions(symbols=[symbol])
+            position_size = 0.0
+            if positions and positions[0]:
+                position_size = float(positions[0].get("info", {}).get("size", 0))
+
+            if position_size == 0:
+
+                if not hasattr(self, "_cancel_cleanup_backoff"):
+                    self._cancel_cleanup_backoff = {}
+                _now = datetime.now(timezone.utc)
+                _last_cancel = self._cancel_cleanup_backoff.get(symbol)
+                if (not _last_cancel) or (_now - _last_cancel).total_seconds() >= float(self.cfg.get("CANCEL_CLEANUP_BACKOFF_SEC", 180)):
+                    try:
+                        await self._cancel_reducing_orders(symbol, pos)
+                    finally:
+                        self._cancel_cleanup_backoff[symbol] = _now
+
+
+                LOG.info("bundle=%s Position size for %s is 0. Finalizing via _finalize_zero_position_safe…", bundle, symbol)
+                try:
+                    await self._finalize_zero_position_safe(pid, pos, symbol)
+                except Exception as e:
+                    LOG.exception("bundle=%s Finalize-zero failed for %s pid=%s: %s", bundle, symbol, pid, e)
+                return
+
+        except Exception as e:
+            LOG.error("bundle=%s Could not fetch position size for %s during update: %s", bundle, symbol, e)
+            return
+
+        orders = await self._all_open_orders(symbol)
+        open_cids = {o.get("clientOrderId") for o in (orders or [])}
+
+        if self.cfg.get("TIME_EXIT_ENABLED", cfg.TIME_EXIT_ENABLED):
+            ddl = pos.get("exit_deadline")
+
+            asof_dt = pd.to_datetime(self._cycle_data_ts, utc=True).to_pydatetime() if self._cycle_data_ts else None
+            if ddl and asof_dt and asof_dt >= ddl:
+                LOG.info("bundle=%s Time-exit firing on %s (pid %d)", bundle, symbol, pid)
+                await self._force_close_position(pid, pos, tag="TIME_EXIT")
+                return
+
+        trailing_active = bool(pos.get("trailing_active", False))
+
+
+        if (
+            self.cfg.get("PARTIAL_TP_ENABLED", False)
+            and not trailing_active
+            and pos.get("tp1_cid")
+            and pos.get("tp1_cid") not in open_cids
+        ):
+            fill_price = None
+            filled_qty = 0.0
+            try:
+                o = await self._fetch_by_cid(pos["tp1_cid"], symbol)
+                if o and str(o.get("status", "")).lower() == "closed":
+                    fill_price = o.get("average") or o.get("price")
+                    filled_qty = float(o.get("filled") or o.get("amount") or 0.0)
+            except Exception as e:
+                LOG.warning("bundle=%s Failed to fetch TP1 order %s for %s: %s", bundle, pos["tp1_cid"], symbol, e)
+
+            if (filled_qty or 0.0) > 0.0 and (fill_price is not None):
+                await self.db.add_fill(pid, "TP1", float(fill_price), float(filled_qty), datetime.now(timezone.utc))
+                await self.db.update_position(pid, trailing_active=True)
+                pos["trailing_active"] = True
+                trailing_active = True
+                await self._activate_trailing(pid, pos)
+                await self.tg.send(f"📈 TP1 hit on {symbol}, trailing activated")
+                LOG.info("bundle=%s TP1 recorded %s qty=%.8f px=%.8f -> trailing on", bundle, symbol, filled_qty, float(fill_price))
+            else:
+                LOG.info("bundle=%s TP1 not filled for %s (status!=closed or filled=0). Skipping.", bundle, symbol)
+
+        if trailing_active:
+            await self._trail_stop(pid, pos)
+
+        active_stop_cid = pos.get("sl_trail_cid") if trailing_active else pos.get("sl_cid")
+
+
+        is_closed = False
+        if active_stop_cid:
+            is_closed = active_stop_cid not in open_cids
+
+
+        if (not is_closed) and trailing_active and self.cfg.get("FINAL_TP_ENABLED", False):
+            tp2_cid = pos.get("tp2_cid")
+            if tp2_cid and (tp2_cid not in open_cids):
+                is_closed = True
+
+        if is_closed:
+            await self._finalize_position(pid, pos)
+
+
+    async def _activate_trailing(self, pid: int, pos: Dict[str, Any]):
+        symbol = pos["symbol"]
+        try:
+            if pos.get("sl_cid"):
+                await self._cancel_by_cid(pos["sl_cid"], symbol)
+        except ccxt.OrderNotFound:
+            pass
+        except Exception as e:
+            LOG.warning("Could not cancel original SL for %d (%s): %s", pid, pos.get('sl_cid'), e)
+
+        await self._trail_stop(pid, pos, first=True)
+
+        if self.cfg.get("FINAL_TP_ENABLED", False):
+            try:
+                is_long = (pos.get("side","SHORT").upper() == "LONG")
+                tp_dir = (+1 if is_long else -1)
+                final_tp_price = float(pos["entry_price"]) + tp_dir * tp_mult * float(pos["atr"])
+
+                qty_left = float(pos["size"]) * (1 - self.cfg["PARTIAL_TP_PCT"])
+                tp2_cid = create_stable_cid(pid, "TP2")
+
+                tp2_side = "sell" if is_long else "buy"
+                tp2_trigger_dir = 1 if is_long else 2
+
+                await self.exchange.create_order(
+                    symbol, "market", tp2_side, qty_left, None,
+                    params={
+                        "triggerPrice": float(final_tp_price),
+                        "clientOrderId": tp2_cid,
+                        'reduceOnly': True, 'closeOnTrigger': True,
+                        'triggerDirection': tp2_trigger_dir, 'category': 'linear'
+                    }
+                )
+                await self.db.update_position(pid, tp2_cid=tp2_cid)
+                pos["tp2_cid"] = tp2_cid
+                LOG.info("Final TP2 placed for %s with CID %s", symbol, tp2_cid)
+            except Exception as e:
+                LOG.error("Failed to place TP2 for %d: %s", pid, e)
+
+    async def _trail_stop(self, pid: int, pos: Dict[str, Any], first: bool = False):
+
+
+        symbol = pos["symbol"]
+        is_long = (pos.get("side", "SHORT").upper() == "LONG")
+        price = float((await self.exchange.fetch_ticker(symbol))["last"])
+        atr = float(pos["atr"])
+        prev_stop = float(pos.get("stop_price", 0) or 0.0)
+
+        k = float(self.cfg.get("TRAIL_DISTANCE_ATR_MULT", 1.0))
+        min_move = price * float(self.cfg.get("TRAIL_MIN_MOVE_PCT", 0.001))
+
+        if is_long:
+            new_stop = price - k * atr
+            favorable = (prev_stop == 0.0) or (new_stop > prev_stop)
+            close_side = "sell"
+            trigger_dir = 2
+            qty_left = float(pos["size"]) * (1 - float(self.cfg.get("PARTIAL_TP_PCT", 0.7)))
+        else:
+            new_stop = price + k * atr
+            favorable = (prev_stop == 0.0) or (new_stop < prev_stop)
+            close_side = "buy"
+            trigger_dir = 1
+            qty_left = float(pos["size"]) * (1 - float(self.cfg.get("PARTIAL_TP_PCT", 0.7)))
+
+        significant = abs(prev_stop - new_stop) > min_move
+        if not first and not (favorable and significant):
+            return
+
+        sl_trail_cid = create_stable_cid(pid, "SL_TRAIL")
+
+
+        try:
+            if (not first) and pos.get("sl_trail_cid"):
+                await self._cancel_by_cid(pos["sl_trail_cid"], symbol)
+        except ccxt.OrderNotFound:
+            pass
+        except Exception as e:
+            LOG.warning("Trail cancel failed for %s: %s", symbol, e)
+            return
+
+
+        await self.exchange.create_order(
+            symbol, 'market', close_side, qty_left, None,
+            params={
+                "triggerPrice": float(new_stop),
+                "clientOrderId": sl_trail_cid, "category": "linear",
+                "reduceOnly": True, "closeOnTrigger": True, "triggerDirection": trigger_dir
+            }
+        )
+        await self.db.update_position(pid, stop_price=float(new_stop), sl_trail_cid=sl_trail_cid)
+        pos["stop_price"] = float(new_stop)
+        pos["sl_trail_cid"] = sl_trail_cid
+        LOG.info("Trail updated %s to %.6f", symbol, new_stop)
+
+
+    async def _finalize_position(self, pid: int, pos: Dict[str, Any], inferred_exit_reason: str = None):
+        symbol = pos["symbol"]
+        bundle = getattr(self, "bundle_id", None) or "no_bundle"
+
+        opened_at: datetime = pos["opened_at"]
+        entry_price = float(pos["entry_price"])
+        size = float(pos["size"])
+        side = (pos.get("side") or "LONG").lower()
+
+        closing_order_type = inferred_exit_reason or "UNKNOWN"
+        exit_price = None
+        exit_qty_needed = abs(size)
+        close_side = "sell" if side == "long" else "buy"
+
+
+        closing_order_cid = None
+        if inferred_exit_reason in ("TP", "TP1", "TP2"):
+            closing_order_cid = pos.get("tp_final_cid") or pos.get("tp2_cid") or pos.get("tp1_cid")
+        elif inferred_exit_reason in ("SL", "TRAIL"):
+            closing_order_cid = pos.get("sl_trail_cid") or pos.get("sl_cid")
+
+        order_last_ts = None
+        try:
+            if closing_order_cid:
+                o = await self._fetch_by_cid(closing_order_cid, symbol)
+                if o:
+                    ts = o.get("lastTradeTimestamp") or o.get("timestamp") or o.get("datetime")
+                    if ts:
+                        try:
+                            order_last_ts = int(o["lastTradeTimestamp"]) if o.get("lastTradeTimestamp") else self.exchange.parse8601(ts)
+                        except Exception:
+                            order_last_ts = None
+                    if (o.get("average") or o.get("price")) and (o.get("filled") or 0) > 0:
+                        exit_price = float(o.get("average") or o.get("price"))
+                        closing_order_type = inferred_exit_reason
+        except Exception as e:
+            LOG.warning("bundle=%s Fetch order by CID %s for %s failed: %s", bundle, closing_order_cid, symbol, e)
+
+
+        fills = []
+        fees_paid = 0.0
+        try:
+            since_ms = max(0, int(opened_at.timestamp() * 1000) - 60_000)
+            my_trades = await self.exchange.fetch_my_trades(symbol, since=since_ms, limit=1000)
+            my_trades = sorted([t for t in my_trades or [] if t.get("timestamp")], key=lambda t: int(t["timestamp"]))
+            closing_trades = [t for t in my_trades if str(t.get("side", "")).lower() == close_side]
+
+            qty_left = exit_qty_needed
+            for t in closing_trades:
+                if qty_left <= 1e-12:
+                    break
+                t_qty = float(t.get("amount") or 0.0)
+                t_px = float(t.get("price") or 0.0)
+                if t_qty <= 0 or t_px <= 0:
+                    continue
+                use_qty = min(qty_left, t_qty)
+                fills.append((int(t["timestamp"]), t_px, use_qty, t.get("fee")))
+                qty_left -= use_qty
+
+            for _, _, _, fee in fills:
+                if isinstance(fee, dict):
+                    try:
+                        fees_paid += float(fee.get("cost") or 0.0)
+                    except Exception:
+                        pass
+        except Exception as e:
+            LOG.error("bundle=%s fetch_my_trades failed for %s: %s", bundle, symbol, e)
+
+
+        if fills:
+            exit_notional = sum(px * q for _, px, q, _ in fills)
+            exit_qty_sum = sum(q for _, _, q, _ in fills)
+            avg_exit = (exit_notional / exit_qty_sum) if exit_qty_sum > 0 else entry_price
+            closed_at = datetime.fromtimestamp(max(ts for ts, *_ in fills) / 1000.0, tz=timezone.utc)
+        else:
+
+            try:
+                evt_ts = await self._last_closed_5m_ts(symbol)
+                closed_at = pd.to_datetime(evt_ts, utc=True).to_pydatetime()
+            except Exception:
+                closed_at = opened_at
+
+            if order_last_ts:
+                closed_at = datetime.fromtimestamp(order_last_ts / 1000.0, tz=timezone.utc)
+
+            if exit_price is None:
+                try:
+                    tk = await self.exchange.fetch_ticker(symbol)
+                    exit_price = float(tk.get("last") or tk.get("mark") or tk.get("index") or entry_price)
+                except Exception:
+                    exit_price = entry_price
+            avg_exit = float(exit_price)
+            exit_qty_sum = exit_qty_needed
+
+
+        has_exit_fill = False
+        try:
+            existing = await self.db.pool.fetch("SELECT fill_type, ts FROM fills WHERE position_id=$1 ORDER BY ts ASC", pid)
+            for r in existing:
+                k = (r["fill_type"] or "").upper()
+                if k.startswith("TP") or k.startswith("SL") or "FALLBACK" in k or "TIME_EXIT" in k or "MANUAL_CLOSE" in k:
+                    has_exit_fill = True
+                    break
+
+            if (not has_exit_fill) and fills:
+                for ts, px, q, _ in fills:
+                    await self.db.add_fill(pid, closing_order_type, float(px), float(q), datetime.fromtimestamp(ts / 1000.0, tz=timezone.utc))
+            elif (not has_exit_fill) and not fills:
+                await self.db.add_fill(pid, closing_order_type, float(avg_exit), float(exit_qty_needed), closed_at)
+        except Exception as e:
+            LOG.warning("bundle=%s Exit fill persistence skipped for %s: %s", bundle, symbol, e)
+
+
+        def _pnl_linear(e_px, x_px, q, sd):
+            return (e_px - x_px) * q if sd == "short" else (x_px - e_px) * q
+
+        if side == "short":
+            total_pnl = (entry_price - avg_exit) * abs(size)
+            pnl_pct = (entry_price / avg_exit - 1.0) * 100.0 if avg_exit > 0 else 0.0
+        else:
+            total_pnl = (avg_exit - entry_price) * abs(size)
+            pnl_pct = (avg_exit / entry_price - 1.0) * 100.0 if entry_price > 0 else 0.0
+
+        if fills and (exit_qty_sum < 0.8 * abs(size)):
+            LOG.warning(
+                "bundle=%s Incomplete exit fills on %s: used %.6f / %.6f. Falling back to direct formula.",
+                bundle, symbol, exit_qty_sum, abs(size)
+            )
+            total_pnl = _pnl_linear(entry_price, avg_exit, abs(size), side)
+
+        holding_minutes = (closed_at - opened_at).total_seconds() / 60 if opened_at else 0.0
+
+
+        await self.db.update_position(
+            pid,
+            status="CLOSED",
+            closed_at=closed_at,
+            exit_reason=closing_order_type,
+            pnl=total_pnl,
+            pnl_pct=pnl_pct,
+            holding_minutes=holding_minutes,
+            avg_exit_price=avg_exit if "avg_exit_price" in getattr(self.db, "columns_positions", set()) else None,
+            fees_paid=fees_paid,
+        )
+
+        LOG.info(
+            "bundle=%s Closed %s pid=%d reason=%s avg_exit=%.8f pnl=%.4f pnl_pct=%.4f hold_min=%.2f",
+            bundle, symbol, pid, closing_order_type, float(avg_exit), float(total_pnl), float(pnl_pct), float(holding_minutes)
+        )
+
+        await self.risk.on_trade_close(total_pnl, self.tg)
+
+
+        try:
+            if getattr(self, "online_state", None) is not None:
+                evt_ts = await self._last_closed_5m_ts(symbol)
+                if evt_ts is not None and not pd.isna(evt_ts):
+                    self.online_state.record_trade_close(ts=evt_ts, pnl=float(total_pnl))
+        except Exception as e:
+            LOG.warning("bundle=%s OnlinePerformanceState record failed for %s: %s", bundle, symbol, e)
+
+
+        self.open_positions.pop(pid, None)
+        self.last_exit[symbol] = closed_at
+        await self.tg.send(f"✅ {symbol} position closed @ {avg_exit:.6g} | PnL ≈ {total_pnl:.2f} USDT")
+
+
+    async def _force_close_position(self, pid: int, pos: Dict[str, Any], tag: str):
+        symbol = pos["symbol"]
+        size = float(pos["size"])
+        entry_price = float(pos["entry_price"])
+        side = (pos.get("side") or "SHORT").upper()
+
+        try:
+            await self.exchange.cancel_all_orders(symbol, params={"category": "linear"})
+            close_side = "sell" if side == "LONG" else "buy"
+            await self.exchange.create_market_order(
+                symbol, close_side, size, params={"reduceOnly": True, "category": "linear"}
+            )
+            LOG.info("Force-closed %s (pid %d) due to: %s", symbol, pid, tag)
+        except Exception as e:
+            LOG.warning("Force-close issue on %s: %s", symbol, e)
+
+        await asyncio.sleep(2)
+
+        exit_price = None
+        try:
+            my_trades = await self.exchange.fetch_my_trades(symbol, limit=10)
+            closing_trade = next(
+                (t for t in reversed(my_trades)
+                 if str(t.get("side","")).lower() == ("sell" if side == "LONG" else "buy")),
+                None
+            )
+            if closing_trade:
+                exit_price = float(closing_trade["price"])
+                LOG.info("Confirmed force-close fill for %s at %.8f", symbol, exit_price)
+        except Exception as e:
+            LOG.error("Error fetching force-close fill for %s: %s", symbol, e)
+
+        if not exit_price:
+            exit_price = float((await self.exchange.fetch_ticker(symbol))["last"])
+
+        pnl = (entry_price - exit_price) * size if side == "SHORT" else (exit_price - entry_price) * size
+
+
+        try:
+            evt_ts = await self._last_closed_5m_ts(symbol)
+            closed_at = pd.to_datetime(evt_ts, utc=True).to_pydatetime()
+        except Exception:
+            closed_at = pos.get("opened_at") or datetime.now(timezone.utc)
+
+        holding_minutes = (closed_at - pos.get("opened_at", closed_at)).total_seconds()/60.0
+
+        await self.db.update_position(
+            pid, status="CLOSED", closed_at=closed_at, pnl=pnl,
+            exit_reason=tag, holding_minutes=holding_minutes
+        )
+        await self.db.add_fill(pid, tag, exit_price, size, closed_at)
+        await self.risk.on_trade_close(pnl, self.tg)
+
+
+        try:
+            if getattr(self, "online_state", None) is not None:
+                evt_ts = await self._last_closed_5m_ts(symbol)
+                if evt_ts is not None and not pd.isna(evt_ts):
+                    self.online_state.record_trade_close(ts=evt_ts, pnl=float(pnl))
+        except Exception as e:
+            LOG.warning("bundle=%s OnlinePerformanceState record failed for %s: %s", getattr(self, "bundle_id", None) or "no_bundle", symbol, e)
+
+        self.last_exit[symbol] = closed_at
+        self.open_positions.pop(pid, None)
+        await self.tg.send(f"⏰ {symbol} closed by {tag}. PnL ≈ {pnl:.2f} USDT")
+
+
+    async def _main_signal_loop(self):
+        LOG.info("Starting main signal scan loop.")
+        while True:
+            try:
+                if self.paused or not self.risk.can_trade():
+                    await asyncio.sleep(5)
+                    continue
+
+
+                gov_ctx = await self._get_gov_ctx()
+                decision_ts_gov = gov_ctx.get("decision_ts_gov")
+                if decision_ts_gov is None or pd.isna(pd.to_datetime(decision_ts_gov, utc=True, errors="coerce")):
+                    raise RuntimeError("GOV_CTX: missing/invalid decision_ts_gov")
+
+                decision_ts_gov = pd.to_datetime(decision_ts_gov, utc=True)
+
+
+                self._cycle_data_ts = decision_ts_gov
+
+
+                current_market_regime = await self.regime_detector.get_current_regime(decision_ts_gov)
+                gov_ctx.update(self.regime_detector.get_latest_meta_features())
+
+
+                eth_macd_data = await self._get_eth_macd_barometer_asof(decision_ts_gov)
+                if eth_macd_data:
+                    try:
+                        LOG.info(
+                            "ETH MACD(4h asof %s): macd=%.2f, hist=%.2f",
+                            str(decision_ts_gov),
+                            float(eth_macd_data.get("macd", 0.0) or 0.0),
+                            float(eth_macd_data.get("hist", 0.0) or 0.0),
+                        )
+                    except Exception:
+                        pass
+
+
+                try:
+                    if not (getattr(self, "_universe_ctx", None) or {}):
+                        cached = self._load_universe_cache_if_fresh()
+                        if cached:
+                            self._universe_ctx = cached
+                            LOG.info("Universe context loaded from cache (%d symbols).", len(cached))
+                except Exception as e:
+                    LOG.warning("Universe cache load failed (non-fatal): %s", e)
+
+                equity = await self.db.latest_equity() or 0.0
+                open_positions_count = len(self.open_positions)
+                open_symbols = {p["symbol"] for p in self.open_positions.values()}
+
+                for sym in self.symbols:
+
+
+                    if sym in self._invalid_symbols:
+                        continue
+                    if self.paused or not self.risk.can_trade():
+                        break
+                    if sym in open_symbols:
+                        continue
+
+
+                    cd_h = self.cfg.get("SYMBOL_COOLDOWN_HOURS", cfg.SYMBOL_COOLDOWN_HOURS)
+                    last_x = self.last_exit.get(sym)
+                    if last_x:
+                        asof_dt = pd.to_datetime(self._cycle_data_ts, utc=True).to_pydatetime()
+                        if (asof_dt - last_x) < timedelta(hours=cd_h):
+                            continue
+
+                    async with self.symbol_locks[sym]:
+
+                        try:
+                            positions = await self.exchange.fetch_positions(symbols=[sym])
+                            if positions and positions[0] and float(positions[0].get("info", {}).get("size", 0)) > 0:
+                                LOG.info("Skipping scan for %s, pre-flight position exists.", sym)
+                                if sym not in open_symbols:
+                                    LOG.warning("ORPHAN POSITION DETECTED for %s! Reconcile later.", sym)
+                                continue
+                        except Exception as e:
+
+                            if self._maybe_quarantine_symbol(sym, e, where="preflight_positions"):
+                                continue
+                            LOG.error("Pre-flight position check failed for %s: %s", sym, e)
+                            continue
+                        try:
+                            self._wd_symbol = sym
+                            self._wd_stage = "scan"
+                            self._wd_since = time.time()
+
+                            scan_timeout_s = float(
+                                self.cfg.get(
+                                    "SCAN_SYMBOL_TIMEOUT_S",
+                                    float(self.cfg.get("OHLCV_TOTAL_TIMEOUT_S", 180.0)) + 60.0,
+                                )
+                            )
+
+
+                            try:
+                                signal = await asyncio.wait_for(
+                                    self._scan_symbol_for_signal(
+                                        symbol=sym,
+                                        market_regime=current_market_regime,
+                                        eth_macd=eth_macd_data,
+                                        gov_ctx=gov_ctx,
+                                    ),
+                                    timeout=scan_timeout_s,
+                                )
+
+
+                            except asyncio.TimeoutError:
+                                LOG.warning("SCAN_TIMEOUT symbol=%s timeout_s=%.1f (skipping)", sym, scan_timeout_s)
+                                continue
+
+                            finally:
+
+                                pass
+
+
+                        except Exception as e:
+                            if self._maybe_quarantine_symbol(sym, e, where="scan_exception"):
+                                continue
+
+
+                        if signal:
+
+                            ok, vetoes = filters.evaluate(
+                                signal,
+                                listing_age_days=signal.listing_age_days,
+                                open_positions=open_positions_count,
+                                equity=equity,
+                            )
+
+                            if ok:
+                                await self._open_position(signal)
+                                open_positions_count += 1
+                                open_symbols.add(sym)
+                            else:
+                                LOG.info("Signal for %s vetoed: %s", sym, " | ".join(vetoes))
+
+                    await asyncio.sleep(0.5)
+
+            except Exception as e:
+                LOG.error("Critical error in main signal loop: %s", e)
+                traceback.print_exc()
+
+            LOG.info("Scan cycle complete. Sleeping…")
+            await asyncio.sleep(self.cfg.get("SCAN_INTERVAL_SEC", 60))
+
+
+    async def _equity_loop(self):
+        while True:
+            try:
+                bal = await self._fetch_platform_balance()
+                current_equity = bal["total"].get("USDT", 0.0)
+                await self.db.snapshot_equity(current_equity, datetime.now(timezone.utc))
+
+                if current_equity > self.peak_equity:
+                    self.peak_equity = current_equity
+
+                if self.cfg.get("DD_PAUSE_ENABLED", True) and not self.risk.kill_switch:
+                    if self.peak_equity and current_equity < self.peak_equity:
+                        drawdown_pct = (self.peak_equity - current_equity) / self.peak_equity * 100
+                        max_dd_pct = self.cfg.get("DD_MAX_PCT", 10.0)
+                        if drawdown_pct >= max_dd_pct:
+                            self.risk.kill_switch = True
+                            msg = f"❌ KILL-SWITCH: Equity drawdown {drawdown_pct:.2f}% ≥ {max_dd_pct}%."
+                            LOG.warning(msg)
+                            await self.tg.send(msg)
+            except Exception as e:
+                LOG.error("Error in equity loop: %s", e)
+            await asyncio.sleep(3600)
+
+
+    async def _finalize_zero_position_safe(self, pid: int, pos: dict, symbol: str):
+
+
+        bundle = getattr(self, "bundle_id", None) or "no_bundle"
+        now = datetime.now(timezone.utc)
+
+
+        if not hasattr(self, "_zero_finalize_backoff"):
+            self._zero_finalize_backoff = {}
+        last_try = self._zero_finalize_backoff.get(pid)
+        if last_try and (now - last_try).total_seconds() < float(self.cfg.get("FINALIZE_BACKOFF_SEC", 120)):
+            LOG.info("bundle=%s Position size is 0 for %s; finalize debounced.", bundle, symbol)
+            return
+        self._zero_finalize_backoff[pid] = now
+
+
+        exit_kind = "MANUAL_CLOSE"
+        candidates = [
+            ("TP",    pos.get("tp_final_cid")),
+            ("TP2",   pos.get("tp2_cid")),
+            ("TP1",   pos.get("tp1_cid")),
+            ("TRAIL", pos.get("sl_trail_cid")),
+            ("SL",    pos.get("sl_cid")),
+        ]
+
+        for label, cid in candidates:
+            if not cid:
+                continue
+            try:
+                o = await self._fetch_by_cid(cid, symbol)
+                if not o:
+                    continue
+                st = str(o.get("status", "")).lower()
+                filled = float(o.get("filled") or o.get("amount") or 0.0)
+                if st == "closed" and filled > 0.0:
+                    exit_kind = label
+                    break
+            except Exception as e:
+                LOG.warning("bundle=%s fetch_by_cid failed while inferring exit for %s cid=%s: %s", bundle, symbol, cid, e)
+
+        LOG.info("bundle=%s Finalizing zero-size %s pid=%d inferred_reason=%s", bundle, symbol, pid, exit_kind)
+
+        await self._finalize_position(pid, pos, inferred_exit_reason=exit_kind)
+
+
+    async def _find_pid_by_symbol(self, symbol: str, status: str = "CLOSED") -> Optional[int]:
+
+        row = await self.db.pool.fetchrow(
+            "SELECT id FROM positions WHERE symbol=$1 AND status=$2 ORDER BY COALESCE(closed_at, opened_at) DESC LIMIT 1",
+            symbol.upper(), status.upper()
+        )
+        return int(row["id"]) if row else None
+
+    async def _recent_positions_text(self, symbol: Optional[str] = None, limit: int = 10) -> str:
+
+        if symbol:
+            q = """
+            SELECT id, symbol, status, side, size, entry_price, closed_at, pnl
+            FROM positions WHERE symbol=$1 ORDER BY id DESC LIMIT $2
+            """
+            rows = await self.db.pool.fetch(q, symbol.upper(), limit)
+        else:
+            q = """
+            SELECT id, symbol, status, side, size, entry_price, closed_at, pnl
+            FROM positions ORDER BY id DESC LIMIT $1
+            """
+            rows = await self.db.pool.fetch(q, limit)
+        if not rows:
+            return "No positions."
+        lines = []
+        for r in rows:
+            lines.append(f"pid={r['id']}  {r['symbol']}  {r['status']}  "
+                         f"{r['side']}  sz={float(r['size']):.4g}  "
+                         f"EP={float(r['entry_price']):.6f}  "
+                         f"closed={str(r['closed_at'])[:19]}  "
+                         f"PnL={float(r['pnl'] or 0):.4f}")
+        return "Recent positions:\n" + "\n".join(lines)
+
+    async def _repair_closed_position(self, pid: int):
+
+        pos = await self.db.pool.fetchrow("SELECT * FROM positions WHERE id=$1", pid)
+        if not pos or str(pos["status"]).upper() != "CLOSED":
+            await self.tg.send(f"Repair: position {pid} not found or not closed."); return
+
+        side = (pos["side"] or "SHORT").lower()
+        size = float(pos["size"]); entry_price = float(pos["entry_price"])
+        exit_px = None
+        try:
+            symbol = pos["symbol"]; closed_at = pos["closed_at"]
+            since_ts = int((closed_at - timedelta(minutes=10)).timestamp() * 1000)
+            my_trades = await self.exchange.fetch_my_trades(symbol, limit=50, since=since_ts)
+            close_side = "sell" if side == "long" else "buy"
+            t = next((t for t in reversed(my_trades) if str(t.get("side","")).lower()==close_side), None)
+            if t: exit_px = float(t["price"])
+        except Exception:
+            pass
+        if exit_px is None:
+            ticker = await self.exchange.fetch_ticker(pos["symbol"])
+            exit_px = float(ticker.get("last") or entry_price)
+
+        new_pnl = (entry_price - exit_px)*size if side=="short" else (exit_px-entry_price)*size
+        new_pct = (entry_price/exit_px-1.0)*100.0 if side=="short" else (exit_px/entry_price-1.0)*100.0
+        await self.db.update_position(pid, pnl=new_pnl, pnl_pct=new_pct)
+        await self.tg.send(f"🔧 Repaired PnL for {pos['symbol']} pid={pid}: {new_pnl:.6f} USDT")
+
+
+    async def _fetch_platform_balance(self) -> dict:
+        account_type = self.cfg.get("BYBIT_ACCOUNT_TYPE", "STANDARD").upper()
+        params = {}
+        if account_type == "UNIFIED":
+            params['accountType'] = 'UNIFIED'
+        try:
+            return await self.exchange.fetch_balance(params=params)
+        except Exception as e:
+            LOG.error("Failed to fetch %s account balance: %s", account_type, e)
+            return {"total": {"USDT": 0.0}, "free": {"USDT": 0.0}}
+
+    async def _telegram_loop(self):
+        while True:
+            async for cmd in self.tg.poll_cmds():
+                await self._handle_cmd(cmd)
+            await asyncio.sleep(1)
+
+    async def _handle_cmd(self, cmd: str):
+        parts = cmd.split()
+        root = parts[0].lower()
+        if root == "/pause":
+            self.paused = True
+            await self.tg.send("⏸ Paused")
+
+        elif root == "/report" and len(parts) == 2:
+            period = parts[1].lower()
+            if period in ['6h', 'daily', 'weekly', 'monthly']:
+                await self.tg.send(f"Generating on-demand '{period}' report…")
+                res = self._generate_summary_report(period)
+                summary_text = await res if inspect.isawaitable(res) else res
+
+
+                await self.tg.send(summary_text)
+            else:
+                await self.tg.send("Unknown period. Use: 6h, daily, weekly, monthly.")
+
+        elif root == "/resume":
+            if self.risk.can_trade():
+                self.paused = False
+                await self.tg.send("▶️ Resumed")
+            else:
+                await self.tg.send("⚠️ Kill switch active")
+
+        elif root == "/set" and len(parts) == 3:
+            raw_key, val = parts[1], parts[2]
+            key = self._normalize_cfg_key(raw_key)
+            try:
+                cast = json.loads(val)
+            except json.JSONDecodeError:
+                cast = val
+
+            self.cfg[key] = cast
+            setattr(cfg, key, cast)
+            await self.tg.send(f"✅ {raw_key} → {key} set to {cast}")
+            return
+
+        elif root == "/open" and len(parts) == 2:
+            symbol = parts[1].upper()
+            asyncio.create_task(self._force_open_position(symbol))
+            return
+
+
+        elif root == "/status":
+            await self.tg.send(json.dumps({
+                "paused": self.paused,
+                "open": len(self.open_positions),
+                "loss_streak": self.risk.loss_streak,
+            }, indent=2))
+
+        elif root == "/regime":
+            try:
+                rd = getattr(self, "regime_detector", None)
+                if rd is None:
+                    await self.tg.send("Regime detector unavailable.")
+                    return
+
+                asof_ts = pd.to_datetime(getattr(self, "_cycle_data_ts", None), utc=True, errors="coerce")
+                if pd.isna(asof_ts):
+                    asof_ts = pd.Timestamp(datetime.now(timezone.utc))
+
+                current = await rd.get_current_regime(asof_ts)
+                meta = rd.get_latest_meta_features() or {}
+
+                reg_code = meta.get("regime_code_1d")
+                vol_prob = meta.get("vol_prob_low_1d")
+                trend = meta.get("trend_regime_1d")
+                vol = meta.get("vol_regime_1d")
+
+                reg_code_s = "n/a" if reg_code is None else str(reg_code)
+                vol_prob_s = "n/a" if vol_prob is None else f"{float(vol_prob):.4f}"
+                trend_s = "n/a" if trend is None else str(trend)
+                vol_s = "n/a" if vol is None else str(vol)
+
+                msg = (
+                    f"🧭 Regime (as-of {asof_ts.isoformat()})\n"
+                    f"• current: {str(current)}\n"
+                    f"• regime_code_1d: {reg_code_s}\n"
+                    f"• vol_prob_low_1d: {vol_prob_s}\n"
+                    f"• trend_regime_1d: {trend_s}\n"
+                    f"• vol_regime_1d: {vol_s}"
+                )
+                await self.tg.send(msg)
+            except Exception as e:
+                LOG.exception("Failed /regime command")
+                await self.tg.send(f"❌ /regime failed: {e}")
+            return
+
+        elif root == "/analyze":
+
+            period = (parts[1].lower() if len(parts) >= 2 else "30d")
+            await self.tg.send(f"🔎 Running in-bot deep analysis for {period}…")
+            try:
+                text = await self._deep_analysis_text(period)
+                await self.tg.send(text)
+            except Exception as e:
+                await self.tg.send(f"❌ Analysis failed: {e}")
+            return
+
+
+        elif root == "/recent":
+
+
+            sym = parts[1].upper() if len(parts) >= 2 and parts[1][0].isalpha() else None
+            lim = int(parts[-1]) if parts and parts[-1].isdigit() else 10
+            txt = await self._recent_positions_text(sym, lim)
+            await self.tg.send(txt)
+
+        elif root == "/pid" and len(parts) >= 2:
+
+            sym = parts[1].upper()
+            row = await self.db.pool.fetchrow(
+                "SELECT id,status FROM positions WHERE symbol=$1 ORDER BY id DESC LIMIT 1", sym
+            )
+            if not row:
+                await self.tg.send(f"No positions for {sym}.")
+            else:
+                await self.tg.send(f"{sym}: last pid={int(row['id'])} status={row['status']}")
+
+        elif root == "/repair" and len(parts) >= 2:
+
+
+            arg = parts[1]
+            if arg.isdigit():
+                await self._repair_closed_position(int(arg))
+            else:
+                pid = await self._find_pid_by_symbol(arg, status="CLOSED")
+                if pid is None:
+                    await self.tg.send(f"No CLOSED position found for {arg.upper()}.")
+                else:
+                    await self._repair_closed_position(pid)
+
+
+    async def _resume(self):
+
+
+        LOG.info("--> Resuming state with intelligent reconciliation…")
+
+
+        LOG.info("Fetching open positions from EXCHANGE & DATABASE…")
+        try:
+            exchange_positions = await self.exchange.fetch_positions()
+            open_exchange_positions = {
+                p['info']['symbol']: p for p in exchange_positions if float(p['info'].get('size', 0)) > 0
+            }
+            LOG.info("…exchange has %d open positions.", len(open_exchange_positions))
+        except Exception as e:
+            LOG.error("CRITICAL: Could not fetch exchange positions: %s. Exiting.", e)
+            sys.exit(1)
+
+        db_positions_rows = await self.db.fetch_open_positions()
+        db_positions = {r["symbol"]: dict(r) for r in db_positions_rows}
+        LOG.info("…database has %d OPEN positions.", len(db_positions))
+
+
+        LOG.info("Reconciling and identifying valid protective orders…")
+        valid_cids = set()
+        now_utc = datetime.now(timezone.utc)
+
+        for symbol, pos_data in open_exchange_positions.items():
+            if symbol not in db_positions:
+                msg = f"🚨 ORPHAN DETECTED: Exchange position {symbol} not in DB. Closing."
+                LOG.warning(msg)
+                await self.tg.send(msg)
+                try:
+                    side = 'buy' if pos_data['side'] == 'short' else 'sell'
+                    size = float(pos_data['info']['size'])
+                    await self.exchange.create_market_order(symbol, side, size, params={'reduceOnly': True})
+                except Exception as e:
+                    LOG.error("Failed to force-close orphan position %s: %s", symbol, e)
+
+        for symbol, pos_row in list(db_positions.items()):
+            pid = pos_row["id"]
+            if symbol not in open_exchange_positions:
+                LOG.warning("DB/EX mismatch: %s OPEN in DB but not on exchange. Closing in DB.", symbol)
+                await self.db.update_position(pid, status="CLOSED", closed_at=now_utc, pnl=0, exit_reason="RECONCILE_CLOSE")
+                del db_positions[symbol]
+                continue
+
+
+            opened_at = pos_row.get("opened_at")
+            max_holding_duration = None
+            if self.cfg.get("TIME_EXIT_HOURS_ENABLED", False):
+                max_holding_duration = timedelta(hours=self.cfg.get("TIME_EXIT_HOURS", 4))
+            elif self.cfg.get("TIME_EXIT_ENABLED", False):
+                max_holding_duration = timedelta(days=self.cfg.get("TIME_EXIT_DAYS", 10))
+
+            if opened_at and max_holding_duration and (now_utc - opened_at) > max_holding_duration:
+                msg = f"⏰ STALE ON RESTART: {symbol} (pid {pid}) older than time limit. Forcing close."
+                LOG.warning(msg); await self.tg.send(msg)
+                asyncio.create_task(self._force_close_position(pid, pos_row, tag="STALE_ON_RESTART"))
+                del db_positions[symbol]
+                continue
+
+            ex_pos = open_exchange_positions[symbol]
+            db_size = float(pos_row['size'])
+            ex_size = float(ex_pos['info']['size'])
+            if abs(db_size - ex_size) > 1e-9:
+                msg = (f"🚨 SIZE MISMATCH for {symbol} (pid {pid}): DB={db_size}, EX={ex_size}. Marking for review.")
+                LOG.critical(msg); await self.tg.send(msg)
+                await self.db.update_position(pid, status="SIZE_MISMATCH")
+                del db_positions[symbol]
+                continue
+
+            if pos_row.get("sl_cid"): valid_cids.add(pos_row["sl_cid"])
+            if pos_row.get("tp1_cid"): valid_cids.add(pos_row["tp1_cid"])
+            if pos_row.get("tp_final_cid"): valid_cids.add(pos_row["tp_final_cid"])
+            if pos_row.get("sl_trail_cid"): valid_cids.add(pos_row["sl_trail_cid"])
+
+        LOG.info("…identified %d valid CIDs to preserve.", len(valid_cids))
+
+
+        LOG.info("Fetching all open orders to clean orphans…")
+        try:
+            all_open_orders = await self._all_open_orders_for_all_symbols()
+            cancel_tasks = []
+            for order in all_open_orders:
+                cid = order.get("clientOrderId")
+                if cid and cid.startswith("bot_") and cid not in valid_cids:
+                    LOG.warning("Orphaned order %s (%s). Cancelling.", cid, order['symbol'])
+                    cancel_tasks.append(self.exchange.cancel_order(order['id'], order['symbol'], params={'category': 'linear'}))
+            if cancel_tasks:
+                await asyncio.gather(*cancel_tasks, return_exceptions=True)
+                LOG.info("…orphaned order cleanup complete.")
+            else:
+                LOG.info("…no orphaned orders found.")
+        except Exception as e:
+            LOG.error("Failed clean slate protocol on startup: %s", e)
+            traceback.print_exc()
+
+
+        LOG.info("Loading reconciled positions into memory…")
+        for symbol, pos_row in db_positions.items():
+            self.open_positions[pos_row["id"]] = pos_row
+            LOG.info("Resumed open position for %s (ID %d)", symbol, pos_row["id"])
+
+        LOG.info("Fetching peak equity from DB…")
+        peak = await self.db.pool.fetchval("SELECT MAX(equity) FROM equity_snapshots")
+        self.peak_equity = float(peak) if peak is not None else 0.0
+        LOG.info("Peak equity loaded: $%.2f", self.peak_equity)
+
+        LOG.info("Loading recent exit timestamps for cooldowns…")
+        cd_h = int(self.cfg.get("SYMBOL_COOLDOWN_HOURS", cfg.SYMBOL_COOLDOWN_HOURS))
+        rows = await self.db.pool.fetch(
+            "SELECT symbol, closed_at FROM positions "
+            "WHERE status='CLOSED' AND closed_at > (NOW() AT TIME ZONE 'utc') - $1::interval",
+            timedelta(hours=cd_h),
+        )
+        for r in rows:
+            self.last_exit[r["symbol"]] = r["closed_at"]
+
+        LOG.info("<-- Resume complete.")
+
+    async def _generate_summary_report(self, period: str) -> str:
+        now = datetime.now(timezone.utc)
+
+
+        start = None
+        try:
+            if isinstance(period, str) and period.endswith("h"):
+                start = now - timedelta(hours=int(period[:-1]))
+            elif isinstance(period, str) and period.endswith("d"):
+                start = now - timedelta(days=int(period[:-1]))
+        except Exception:
+            start = None
+        if start is None:
+            start = now - timedelta(hours=6)
+
+        period_pnls: list[float] = []
+        recent_pnls: list[float] = []
+        last_closed_regime = "n/a"
+        current_regime = "n/a"
+
+
+        try:
+            async with self.db.pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT pnl FROM positions WHERE closed_at IS NOT NULL AND closed_at >= $1 ORDER BY closed_at DESC",
+                    start,
+                )
+                period_pnls = [float(r["pnl"]) for r in rows if r["pnl"] is not None]
+
+                rows2 = await conn.fetch(
+                    "SELECT pnl FROM positions WHERE closed_at IS NOT NULL ORDER BY closed_at DESC LIMIT 50"
+                )
+                recent_pnls = [float(r["pnl"]) for r in rows2 if r["pnl"] is not None]
+
+                lr = await conn.fetchval(
+                    "SELECT market_regime FROM positions WHERE closed_at IS NOT NULL ORDER BY closed_at DESC LIMIT 1"
+                )
+                if lr is not None:
+                    last_closed_regime = str(lr)
+
+
+        except Exception:
+            LOG.exception("Failed to fetch PnL for report")
+
+
+        try:
+            rd = getattr(self, "regime_detector", None)
+            if rd is not None:
+                asof_ts = pd.to_datetime(getattr(self, "_cycle_data_ts", None), utc=True, errors="coerce")
+                if pd.isna(asof_ts):
+                    asof_ts = pd.Timestamp(now, tz="UTC")
+                current = await rd.get_current_regime(asof_ts)
+                current_regime = str(current) if current is not None else "n/a"
+        except Exception:
+            LOG.exception("Failed to fetch current regime for report")
+            try:
+                cached = getattr(getattr(self, "regime_detector", None), "_cached_regime", None)
+                if cached:
+                    current_regime = str(cached)
+            except Exception:
+                pass
+
+        total_pnl = float(sum(period_pnls))
+        n_trades = int(len(period_pnls))
+        n_wins = int(sum(1 for x in period_pnls if x > 0))
+        n_losses = int(sum(1 for x in period_pnls if x < 0))
+        win_rate = (100.0 * n_wins / n_trades) if n_trades > 0 else 0.0
+
+        sum_wins = float(sum(x for x in period_pnls if x > 0))
+        sum_losses_abs = float(-sum(x for x in period_pnls if x < 0))
+        pf = (sum_wins / sum_losses_abs) if sum_losses_abs > 0 else (float("inf") if sum_wins > 0 else 0.0)
+
+        report = (
+            f"📊 DONCH Report ({period})\n"
+            f"• Trades: {n_trades} | Wins: {n_wins} | Losses: {n_losses} | Win rate: {win_rate:.1f}%\n"
+            f"• Total PnL: {total_pnl:+.2f} | PF: {pf:.2f}\n"
+            f"• Regime (current): {current_regime}\n"
+            f"• Regime (last closed trade): {last_closed_regime}\n"
+        )
+
+
+        if recent_pnls:
+            rsum = float(sum(recent_pnls))
+            report += f"• Recent (last 50): {rsum:+.2f}\n"
+
+        return report
+
+
+    async def _deep_analysis_text(self, period: str = "30d") -> str:
+
+
+        now = datetime.now(timezone.utc)
+        window_map = {
+            '6h': timedelta(hours=6),
+            'daily': timedelta(days=1),
+            'weekly': timedelta(weeks=1),
+            'monthly': timedelta(days=30),
+            '7d': timedelta(days=7),
+            '30d': timedelta(days=30),
+            '90d': timedelta(days=90),
+            '180d': timedelta(days=180),
+            '365d': timedelta(days=365),
+        }
+        if period not in window_map and period != 'all':
+            period = '30d'
+        start_time = None if period == 'all' else now - window_map[period]
+
+
+        if start_time:
+            q = """SELECT id, symbol, side, opened_at, closed_at, size, entry_price, pnl, pnl_pct, fees_paid
+                FROM positions WHERE status='CLOSED' AND closed_at >= $1 ORDER BY closed_at ASC"""
+            rows = await self.db.pool.fetch(q, start_time)
+        else:
+            q = """SELECT id, symbol, side, opened_at, closed_at, size, entry_price, pnl, pnl_pct, fees_paid
+                FROM positions WHERE status='CLOSED' ORDER BY closed_at ASC"""
+            rows = await self.db.pool.fetch(q)
+
+        trades = [dict(r) for r in rows]
+        if not trades:
+            return "No closed trades in the selected window."
+
+
+        async def _load_equity_curve():
+            if start_time:
+                eq = await self.db.pool.fetch(
+                    "SELECT ts, equity FROM equity_snapshots WHERE ts >= $1 ORDER BY ts ASC", start_time)
+            else:
+                eq = await self.db.pool.fetch("SELECT ts, equity FROM equity_snapshots ORDER BY ts ASC")
+            eq = [(r['ts'], float(r['equity'])) for r in eq]
+            if len(eq) >= 2:
+                return eq
+
+
+            seed = None
+            if start_time:
+                seed = await self.db.pool.fetchval(
+                    "SELECT equity FROM equity_snapshots WHERE ts < $1 ORDER BY ts DESC LIMIT 1", start_time)
+            seed = float(seed) if seed is not None else float(self.cfg.get('MIN_EQUITY_USDT', 1000.0))
+            cur = seed
+            curve = []
+            for t in trades:
+                cur += float(t.get('pnl') or 0.0) - float(t.get('fees_paid') or 0.0)
+                curve.append((t['closed_at'], cur))
+            return curve
+
+        eq_curve = await _load_equity_curve()
+        if len(eq_curve) < 2:
+            return "Not enough equity points to compute CAGR/Sharpe/MAR."
+
+
+        def _max_drawdown(equities):
+            peak = equities[0][1]; max_dd = 0.0
+            for _, v in equities:
+                peak = max(peak, v)
+                dd = (v / peak) - 1.0
+                if dd < max_dd:
+                    max_dd = dd
+            return max_dd
+
+        def _cagr(equities):
+            start_ts, start_eq = equities[0]; end_ts, end_eq = equities[-1]
+            days = max(1.0, (end_ts - start_ts).total_seconds() / 86400.0)
+            years = days / 365.0
+            if start_eq <= 0 or end_eq <= 0:
+                return 0.0
+            return (end_eq / start_eq) ** (1.0 / years) - 1.0
+
+
+        from collections import OrderedDict
+        by_day = OrderedDict()
+        for ts, eq in eq_curve:
+            by_day[ts.date()] = eq
+        daily = list(by_day.items())
+        rets = []
+        for i in range(1, len(daily)):
+            prev, cur = daily[i-1][1], daily[i][1]
+            if prev > 0:
+                rets.append((cur / prev) - 1.0)
+        if len(rets) >= 2:
+            mean_r = sum(rets) / len(rets)
+            std_r  = (sum((r - mean_r) ** 2 for r in rets) / (len(rets) - 1)) ** 0.5
+            import math
+            sharpe = (mean_r / std_r) * math.sqrt(365) if std_r > 0 else 0.0
+        else:
+            sharpe = 0.0
+
+
+        wins = [float(t['pnl']) for t in trades if float(t['pnl'] or 0) > 0]
+        losses = [float(t['pnl']) for t in trades if float(t['pnl'] or 0) < 0]
+        gross_profit = sum(wins); gross_loss = -sum(losses)
+        profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else float('inf')
+        win_rate = (len(wins) / len(trades)) * 100.0
+
+        cagr  = _cagr(eq_curve)
+        maxdd = _max_drawdown(eq_curve)
+        mar   = (cagr / abs(maxdd)) if maxdd < 0 else float('inf')
+
+
+        hold_min = [ (t['closed_at'] - t['opened_at']).total_seconds()/60.0
+                    for t in trades if t.get('closed_at') and t.get('opened_at') ]
+        avg_hold = (sum(hold_min)/len(hold_min)) if hold_min else 0.0
+
+
+        avg_mae = avg_mfe = None
+        try:
+
+            if start_time:
+                recs = await self.db.pool.fetch(
+                    "SELECT mae_usd, mfe_usd FROM positions WHERE status='CLOSED' AND closed_at >= $1", start_time)
+            else:
+                recs = await self.db.pool.fetch("SELECT mae_usd, mfe_usd FROM positions WHERE status='CLOSED'")
+            mae_vals = [float(r['mae_usd']) for r in recs if r.get('mae_usd') is not None]
+            mfe_vals = [float(r['mfe_usd']) for r in recs if r.get('mfe_usd') is not None]
+            avg_mae = (sum(mae_vals)/len(mae_vals)) if mae_vals else None
+            avg_mfe = (sum(mfe_vals)/len(mfe_vals)) if mfe_vals else None
+        except Exception:
+            pass
+
+        lines = [
+            f"📈 *Deep Analysis ({period})*",
+            f"Trades: {len(trades)}  |  Win%: {win_rate:.2f}%  |  PF: {profit_factor:.3f}",
+            f"CAGR: {cagr*100:.2f}%  |  MaxDD: {maxdd*100:.2f}%  |  MAR: {mar:.3f}",
+            f"Sharpe (daily, rf=0): {sharpe:.3f}  |  Avg hold: {avg_hold:.1f} min",
+        ]
+        if (avg_mae is not None) or (avg_mfe is not None):
+            lines.append(f"Avg MAE: {avg_mae:+.2f} USDT  |  Avg MFE: {avg_mfe:+.2f} USDT")
+        else:
+            lines.append("MAE/MFE: not captured in DB (optional).")
+
+        return "\n".join(lines)
+
+
+    def _strategy_declared_side(self) -> str | None:
+
+
+        try:
+            path = getattr(self, "_strategy_spec_path", None)
+            if path:
+                from pathlib import Path as _P
+                import yaml as _yaml
+                data = _yaml.safe_load(_P(path).read_text()) or {}
+                st = data.get("strategy") or {}
+                s = st.get("side")
+                if s:
+                    s = str(s).strip().lower()
+                    if s in ("long", "short"):
+                        return s
+        except Exception:
+            pass
+
+
+        try:
+            spec = getattr(self.strategy_engine, "spec", None)
+            if isinstance(spec, dict):
+                st = spec.get("strategy") or {}
+                s = st.get("side")
+                if s:
+                    s = str(s).strip().lower()
+                    if s in ("long", "short"):
+                        return s
+        except Exception:
+            pass
+        return None
+
+    def _resolve_side(self, verdict) -> str:
+
+
+        try:
+            forced = str(self.cfg.get("STRATEGY_SIDE_OVERRIDE", "") or "").strip().lower()
+            if forced in ("long", "short"):
+                return forced
+        except Exception:
+            pass
+
+
+        y = self._strategy_declared_side()
+        if y:
+            return y
+
+
+        try:
+            v = getattr(verdict, "side", None)
+            if v:
+                vs = str(v).strip().lower()
+                if vs in ("long", "short"):
+                    return vs
+        except Exception:
+            pass
+
+
+        return "short"
+
+    async def _watchdog_loop(self):
+        every = float(self.cfg.get("WATCHDOG_LOG_SEC", 60.0))
+        while True:
+            await asyncio.sleep(every)
+            sym = getattr(self, "_wd_symbol", None)
+            stage = getattr(self, "_wd_stage", "unknown")
+            since = getattr(self, "_wd_since", None)
+            if sym:
+                age = (time.time() - float(since)) if since else 0.0
+                LOG.warning("WATCHDOG symbol=%s stage=%s age=%.1fs", sym, stage, age)
+                t = getattr(self, "_wd_task", None)
+                if t is not None:
+                    try:
+                        import traceback
+                        frames = t.get_stack(limit=50)
+                        if frames:
+
+                            txt = "".join(traceback.format_stack(frames[-1]))
+                            LOG.warning("WATCHDOG_TASK_STACK symbol=%s stage=%s\n%s", sym, stage, txt)
+                        else:
+                            LOG.warning("WATCHDOG_TASK_STACK symbol=%s stage=%s (no frames)", sym, stage)
+                    except Exception as e:
+                        LOG.warning("WATCHDOG_TASK_STACK_FAIL symbol=%s err=%s", sym, e)
+
+
+    async def _reporting_loop(self):
+        LOG.info("Reporting loop started.")
+        last_report_sent = {}
+        while True:
+            await asyncio.sleep(60 * 5)
+            now = datetime.now(timezone.utc)
+            periods_to_check = {
+                '6h': now.hour % 6 == 0,
+                'daily': now.hour == 0,
+                'weekly': now.weekday() == 0 and now.hour == 0,
+            }
+            for period, should_send in periods_to_check.items():
+                last_sent_date = last_report_sent.get(period)
+                is_already_sent = False
+                if period in ['daily', 'weekly'] and last_sent_date == now.date():
+                    is_already_sent = True
+                elif period == '6h' and last_sent_date == (now.date(), now.hour // 6):
+                    is_already_sent = True
+
+                if should_send and not is_already_sent:
+                    LOG.info("Sending scheduled '%s' report.", period)
+                    res = self._generate_summary_report(period)
+                    summary_text = await res if inspect.isawaitable(res) else res
+                    await self.tg.send(summary_text)
+                    if period in ['daily', 'weekly']:
+                        last_report_sent[period] = now.date()
+                    elif period == '6h':
+                        last_report_sent[period] = (now.date(), now.hour // 6)
+
+
+    async def run(self):
+
+
+        try:
+            faulthandler.register(signal.SIGUSR1, all_threads=True)
+            LOG.info("Faulthandler SIGUSR1 registered (kill -USR1 <pid> dumps stacks).")
+        except Exception as e:
+            LOG.warning("Faulthandler SIGUSR1 register failed: %s", e)
+
+
+        await self.db.init()
+        await self.db.migrate_schema()
+
+        if self.settings.bybit_testnet:
+            LOG.warning("="*60)
+            LOG.warning("RUNNING ON TESTNET")
+            LOG.warning("Testnet data is unreliable for most altcoins.")
+            LOG.warning("="*60)
+
+        LOG.info("Loading exchange markets…")
+        try:
+            await self.exchange._exchange.load_markets()
+            LOG.info("Markets loaded.")
+        except Exception as e:
+            LOG.error("Could not load markets: %s. Exiting.", e)
+            return
+
+        LOG.info("Loading symbol listing dates…")
+        self._listing_dates_cache = await self._load_listing_dates()
+
+        await self._resume()
+        await self.tg.send("DONCH 2 (2.2.1b) started successfully.")
+
+        try:
+            async with asyncio.TaskGroup() as tg:
+                tg.create_task(self._main_signal_loop())
+                tg.create_task(self._manage_positions_loop())
+                tg.create_task(self._telegram_loop())
+                tg.create_task(self._equity_loop())
+                tg.create_task(self._reporting_loop())
+                tg.create_task(self._watchdog_loop())
+
+        except* (asyncio.CancelledError, KeyboardInterrupt):
+            LOG.info("Shutdown signal received.")
+        finally:
+            await self.exchange.close()
+            if self.db.pool:
+                await self.db.pool.close()
+            await self.tg.close()
+            LOG.info("Bot shut down cleanly.")
+
+
+    async def _load_listing_dates(self) -> Dict[str, datetime.date]:
+        if LISTING_PATH.exists():
+            raw = json.loads(LISTING_PATH.read_text())
+            return {s: datetime.fromisoformat(ts).date() for s, ts in raw.items()}
+
+        LOG.info("listing_dates.json not found. Fetching from exchange.")
+        async def fetch_date(sym):
+            try:
+                candles = await self.exchange.fetch_ohlcv(sym, timeframe="1d", limit=1000)
+                if candles:
+                    ts = min(row[0] for row in candles)
+                    return sym, datetime.fromtimestamp(ts/1000, tz=timezone.utc).date()
+            except Exception as e:
+                LOG.warning("Could not fetch listing date for %s: %s", sym, e)
+            return sym, None
+
+        results = await asyncio.gather(*(fetch_date(s) for s in self.symbols))
+        out = {sym: d for sym, d in results if d}
+        if out:
+            LISTING_PATH.write_text(json.dumps({k: v.isoformat() for k, v in out.items()}, indent=2))
+            LOG.info("Saved %d listing dates to %s", len(out), LISTING_PATH)
+        else:
+            LOG.warning("No listing dates could be determined; leaving file absent.")
+        return out
+
+
+    async def _fetch_by_cid(self, cid: Optional[str], symbol: str, silent: bool = False):
+        if not cid:
+            return None
+        try:
+
+            base = {"clientOrderId": cid, "acknowledged": True, "category": "linear"}
+
+            for params in (
+                {**base, "trigger": True, "orderFilter": "StopOrder"},
+                {**base, "trigger": True, "orderFilter": "tpslOrder"},
+            ):
+                try:
+                    o = await self.exchange.fetch_order(None, symbol, params)
+                    if o:
+                        return o
+                except Exception:
+                    pass
+
+            return await self.exchange.fetch_order(None, symbol, base)
+
+        except Exception as e:
+            if not silent:
+                LOG.warning("Fetch by CID %s for %s failed (fallback to trades): %s", cid, symbol, e)
+            return None
+
+
+    async def _cancel_by_cid(self, cid: str, symbol: str):
+        try:
+            return await self.exchange.cancel_order(
+                None, symbol, params={"clientOrderId": cid, "category": "linear"}
+            )
+        except ccxt.OrderNotFound:
+            LOG.warning("Order %s for %s already filled/cancelled.", cid, symbol)
+        except Exception as e:
+            LOG.error("Failed to cancel order %s for %s: %s", cid, symbol, e)
+
+    async def _all_open_orders(self, symbol: str) -> list:
+        params_linear = {'category': 'linear'}
+        try:
+            active = await self.exchange.fetch_open_orders(symbol, params=params_linear)
+            stop = await self.exchange.fetch_open_orders(symbol, params={**params_linear, 'orderFilter': 'StopOrder'})
+            tpsl = await self.exchange.fetch_open_orders(symbol, params={**params_linear, 'orderFilter': 'tpslOrder'})
+            return active + stop + tpsl
+        except Exception as e:
+            LOG.warning("Could not fetch open orders for %s: %s", symbol, e)
+            return []
+
+    async def _all_open_orders_for_all_symbols(self) -> list:
+        params_linear = {'category': 'linear'}
+        try:
+            active = await self.exchange.fetch_open_orders(params=params_linear)
+            stop = await self.exchange.fetch_open_orders(params={**params_linear, 'orderFilter': 'StopOrder'})
+            tpsl = await self.exchange.fetch_open_orders(params={**params_linear, 'orderFilter': 'tpslOrder'})
+            return active + stop + tpsl
+        except Exception as e:
+            LOG.warning("Could not fetch all open orders: %s", e)
+            return []
+
+
+def create_entry_cid(symbol: str, decision_ts: pd.Timestamp, side: str, tag: str = "ENTRY") -> str:
+
+
+    ts = pd.to_datetime(decision_ts, utc=True).strftime("%Y%m%d%H%M")
+    sym8 = str(symbol).replace("/", "").upper()[:8]
+    side1 = "L" if str(side).upper().startswith("L") else "S"
+    base = f"{tag}|{symbol}|{side}|{ts}"
+    h = hashlib.sha1(base.encode("utf-8")).hexdigest()[:8]
+    return f"bot_{tag}{sym8}{side1}{ts}{h}"[:36]
+
+def validate_required_features(row: dict, required: list) -> tuple[bool, list]:
+
+
+    missing = []
+    for k in required:
+        val = row.get(k)
+        if val is None:
+            missing.append(k)
+            continue
+        try:
+            f = float(val)
+            if not math.isfinite(f):
+                missing.append(k)
+        except (ValueError, TypeError):
+            missing.append(k)
+    return (len(missing) == 0), missing
+
+def create_stable_cid(pid: int, tag: str) -> str:
+
+    return f"bot_{pid}_{tag}"[:36]
+
+
+async def async_main():
+    try:
+        settings = Settings()
+    except ValidationError as e:
+        LOG.error("Bad env: %s", e)
+        sys.exit(1)
+
+    cfg_dict = load_yaml(CONFIG_PATH)
+    trader = LiveTrader(settings, cfg_dict)
+    await trader.run()
+
+if __name__ == "__main__":
+    asyncio.run(async_main())

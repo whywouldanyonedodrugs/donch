@@ -1,0 +1,460 @@
+{
+  "decisions_count": 13334,
+  "expected_warmup_missing_fields": [
+    "S6_fresh_x_compress",
+    "days_since_prev_break"
+  ],
+  "incident_recommended": true,
+  "incident_rule": "recommended when non-warmup missing field repeats >= 3 rows/day",
+  "non_warmup_schema_fail_count": 277,
+  "schema_fail_class_counts": {
+    "integration_defect": 1057,
+    "unknown": 21,
+    "warmup_expected": 121
+  },
+  "schema_fail_count": 1199,
+  "schema_fail_rate": 0.08992050397480127,
+  "top_affected_symbols": [
+    {
+      "count": 32,
+      "symbol": "ALLOUSDT"
+    },
+    {
+      "count": 32,
+      "symbol": "APEXUSDT"
+    },
+    {
+      "count": 30,
+      "symbol": "ASTERUSDT"
+    },
+    {
+      "count": 30,
+      "symbol": "BEATUSDT"
+    },
+    {
+      "count": 30,
+      "symbol": "BOBBOBUSDT"
+    },
+    {
+      "count": 30,
+      "symbol": "BREVUSDT"
+    },
+    {
+      "count": 28,
+      "symbol": "CYBERUSDT"
+    },
+    {
+      "count": 28,
+      "symbol": "CYSUSDT"
+    },
+    {
+      "count": 28,
+      "symbol": "FFUSDT"
+    },
+    {
+      "count": 28,
+      "symbol": "FHEUSDT"
+    },
+    {
+      "count": 28,
+      "symbol": "FIDAUSDT"
+    },
+    {
+      "count": 27,
+      "symbol": "FLOWUSDT"
+    },
+    {
+      "count": 27,
+      "symbol": "FOLKSUSDT"
+    },
+    {
+      "count": 27,
+      "symbol": "HNTUSDT"
+    },
+    {
+      "count": 27,
+      "symbol": "IRYSUSDT"
+    },
+    {
+      "count": 27,
+      "symbol": "JCTUSDT"
+    },
+    {
+      "count": 26,
+      "symbol": "LITUSDT"
+    },
+    {
+      "count": 25,
+      "symbol": "MERLUSDT"
+    },
+    {
+      "count": 25,
+      "symbol": "METISUSDT"
+    },
+    {
+      "count": 25,
+      "symbol": "MONUSDT"
+    }
+  ],
+  "top_affected_symbols_by_class": {
+    "integration_defect": [
+      {
+        "count": 32,
+        "symbol": "ALLOUSDT"
+      },
+      {
+        "count": 32,
+        "symbol": "APEXUSDT"
+      },
+      {
+        "count": 30,
+        "symbol": "ASTERUSDT"
+      },
+      {
+        "count": 30,
+        "symbol": "BEATUSDT"
+      },
+      {
+        "count": 30,
+        "symbol": "BOBBOBUSDT"
+      },
+      {
+        "count": 28,
+        "symbol": "CYBERUSDT"
+      },
+      {
+        "count": 28,
+        "symbol": "CYSUSDT"
+      },
+      {
+        "count": 28,
+        "symbol": "FFUSDT"
+      },
+      {
+        "count": 28,
+        "symbol": "FIDAUSDT"
+      },
+      {
+        "count": 27,
+        "symbol": "FLOWUSDT"
+      },
+      {
+        "count": 27,
+        "symbol": "FOLKSUSDT"
+      },
+      {
+        "count": 27,
+        "symbol": "HNTUSDT"
+      },
+      {
+        "count": 27,
+        "symbol": "IRYSUSDT"
+      },
+      {
+        "count": 27,
+        "symbol": "JCTUSDT"
+      },
+      {
+        "count": 25,
+        "symbol": "MERLUSDT"
+      },
+      {
+        "count": 25,
+        "symbol": "METISUSDT"
+      },
+      {
+        "count": 25,
+        "symbol": "MONUSDT"
+      },
+      {
+        "count": 25,
+        "symbol": "NIGHTUSDT"
+      },
+      {
+        "count": 23,
+        "symbol": "PIEVERSEUSDT"
+      },
+      {
+        "count": 23,
+        "symbol": "PLUMEUSDT"
+      }
+    ],
+    "unknown": [
+      {
+        "count": 21,
+        "symbol": "SAROSUSDT"
+      }
+    ],
+    "warmup_expected": [
+      {
+        "count": 29,
+        "symbol": "BREVUSDT"
+      },
+      {
+        "count": 27,
+        "symbol": "FHEUSDT"
+      },
+      {
+        "count": 25,
+        "symbol": "LITUSDT"
+      },
+      {
+        "count": 23,
+        "symbol": "MAGMAUSDT"
+      },
+      {
+        "count": 17,
+        "symbol": "POWERUSDT"
+      }
+    ]
+  },
+  "top_missing_fields": [
+    {
+      "count": 939,
+      "field": "days_since_prev_break"
+    },
+    {
+      "count": 939,
+      "field": "S6_fresh_x_compress"
+    },
+    {
+      "count": 277,
+      "field": "meta_p"
+    },
+    {
+      "count": 277,
+      "field": "size_mult"
+    },
+    {
+      "count": 277,
+      "field": "risk_cash_target"
+    },
+    {
+      "count": 277,
+      "field": "risk_cash_realized"
+    },
+    {
+      "count": 277,
+      "field": "est_leverage_x"
+    },
+    {
+      "count": 277,
+      "field": "btc_vol_regime_level_x"
+    },
+    {
+      "count": 277,
+      "field": "btc_trend_slope_x"
+    },
+    {
+      "count": 277,
+      "field": "eth_vol_regime_level_x"
+    },
+    {
+      "count": 277,
+      "field": "eth_trend_slope_x"
+    },
+    {
+      "count": 277,
+      "field": "btc_vol_regime_level_y"
+    },
+    {
+      "count": 277,
+      "field": "btc_trend_slope_y"
+    },
+    {
+      "count": 277,
+      "field": "eth_vol_regime_level_y"
+    },
+    {
+      "count": 277,
+      "field": "eth_trend_slope_y"
+    },
+    {
+      "count": 277,
+      "field": "est_leverage_y"
+    },
+    {
+      "count": 277,
+      "field": "trend_regime_1d"
+    },
+    {
+      "count": 277,
+      "field": "vol_regime_1d"
+    },
+    {
+      "count": 277,
+      "field": "regime_1d"
+    }
+  ],
+  "top_missing_fields_by_class": {
+    "integration_defect": [
+      {
+        "count": 797,
+        "field": "days_since_prev_break"
+      },
+      {
+        "count": 797,
+        "field": "S6_fresh_x_compress"
+      },
+      {
+        "count": 277,
+        "field": "meta_p"
+      },
+      {
+        "count": 277,
+        "field": "size_mult"
+      },
+      {
+        "count": 277,
+        "field": "risk_cash_target"
+      },
+      {
+        "count": 277,
+        "field": "risk_cash_realized"
+      },
+      {
+        "count": 277,
+        "field": "est_leverage_x"
+      },
+      {
+        "count": 277,
+        "field": "btc_vol_regime_level_x"
+      },
+      {
+        "count": 277,
+        "field": "btc_trend_slope_x"
+      },
+      {
+        "count": 277,
+        "field": "eth_vol_regime_level_x"
+      },
+      {
+        "count": 277,
+        "field": "eth_trend_slope_x"
+      },
+      {
+        "count": 277,
+        "field": "btc_vol_regime_level_y"
+      },
+      {
+        "count": 277,
+        "field": "btc_trend_slope_y"
+      },
+      {
+        "count": 277,
+        "field": "eth_vol_regime_level_y"
+      },
+      {
+        "count": 277,
+        "field": "eth_trend_slope_y"
+      },
+      {
+        "count": 277,
+        "field": "est_leverage_y"
+      },
+      {
+        "count": 277,
+        "field": "trend_regime_1d"
+      },
+      {
+        "count": 277,
+        "field": "vol_regime_1d"
+      },
+      {
+        "count": 277,
+        "field": "regime_1d"
+      }
+    ],
+    "unknown": [
+      {
+        "count": 21,
+        "field": "days_since_prev_break"
+      },
+      {
+        "count": 21,
+        "field": "S6_fresh_x_compress"
+      }
+    ],
+    "warmup_expected": [
+      {
+        "count": 121,
+        "field": "days_since_prev_break"
+      },
+      {
+        "count": 121,
+        "field": "S6_fresh_x_compress"
+      }
+    ]
+  },
+  "top_non_warmup_missing_fields": [
+    {
+      "count": 277,
+      "field": "meta_p"
+    },
+    {
+      "count": 277,
+      "field": "size_mult"
+    },
+    {
+      "count": 277,
+      "field": "risk_cash_target"
+    },
+    {
+      "count": 277,
+      "field": "risk_cash_realized"
+    },
+    {
+      "count": 277,
+      "field": "est_leverage_x"
+    },
+    {
+      "count": 277,
+      "field": "btc_vol_regime_level_x"
+    },
+    {
+      "count": 277,
+      "field": "btc_trend_slope_x"
+    },
+    {
+      "count": 277,
+      "field": "eth_vol_regime_level_x"
+    },
+    {
+      "count": 277,
+      "field": "eth_trend_slope_x"
+    },
+    {
+      "count": 277,
+      "field": "btc_vol_regime_level_y"
+    },
+    {
+      "count": 277,
+      "field": "btc_trend_slope_y"
+    },
+    {
+      "count": 277,
+      "field": "eth_vol_regime_level_y"
+    },
+    {
+      "count": 277,
+      "field": "eth_trend_slope_y"
+    },
+    {
+      "count": 277,
+      "field": "est_leverage_y"
+    },
+    {
+      "count": 277,
+      "field": "trend_regime_1d"
+    },
+    {
+      "count": 277,
+      "field": "vol_regime_1d"
+    },
+    {
+      "count": 277,
+      "field": "regime_1d"
+    }
+  ],
+  "warmup_only_schema_fail_count": 922
+}

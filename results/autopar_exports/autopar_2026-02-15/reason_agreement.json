@@ -1,0 +1,7 @@
+{
+  "canonical_agreement_count": 13272,
+  "canonical_agreement_rate": 1.0,
+  "legacy_reason_equals_canonical_rate": 0.0553044002411091,
+  "note": "agreement computed on canonical reasons for stability across version-specific raw reason variants",
+  "rows": 13272
+}

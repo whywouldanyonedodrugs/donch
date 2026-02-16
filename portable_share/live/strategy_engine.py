@@ -1,0 +1,461 @@
+from __future__ import annotations
+import yaml
+from pathlib import Path
+from dataclasses import dataclass
+from typing import Dict, Any, List, Optional, Callable
+import pandas as pd
+import numpy as np
+from datetime import datetime, timezone, timedelta
+
+@dataclass
+class Verdict:
+    should_enter: bool
+    side: str
+    reason_tags: List[str]
+
+
+    don_break_level: Optional[float] = None
+    don_break_len: Optional[int] = None
+
+
+class StrategyEngine:
+
+
+    def __init__(self, spec_path: str, cfg: Optional[Dict[str, Any]] = None):
+        self.spec_path = Path(spec_path).resolve()
+        self.cfg = cfg or {}
+        if not self.spec_path.exists():
+            raise FileNotFoundError(self.spec_path)
+        self._spec = self._load()
+        self._ops = _build_ops_registry()
+
+
+    def reload(self):
+        self._spec = self._load()
+
+    def required_timeframes(self) -> List[str]:
+        tfs = self._spec.get("timeframes", {}) or {}
+        return list({v for v in tfs.values() if isinstance(v, str)})
+
+    def evaluate(self, dfs: Dict[str, pd.DataFrame], context: Dict[str, Any]) -> Verdict:
+        spec = self._spec
+        tfs = spec.get("timeframes", {}) or {}
+        params = spec.get("params", {}) or {}
+
+
+        ctx = context
+
+        def _mk_verdict(should_enter: bool, side: str, tags: List[str]) -> Verdict:
+
+            lvl = ctx.get("don_break_level", ctx.get("donch_break_level", None))
+            ln = ctx.get("don_break_len", ctx.get("donch_break_len", None))
+
+            lvl_f: Optional[float]
+            try:
+                if lvl is None:
+                    lvl_f = None
+                else:
+                    lvl_f = float(lvl)
+                    if not np.isfinite(lvl_f):
+                        lvl_f = None
+            except Exception:
+                lvl_f = None
+
+            ln_i: Optional[int]
+            try:
+                ln_i = int(ln) if ln is not None else None
+            except Exception:
+                ln_i = None
+
+
+            if ln_i is None:
+                try:
+                    fb = params.get("DONCH_PERIOD", None)
+                    if fb is None:
+                        fb = self.cfg.get("DON_N_DAYS", None)
+                    if fb is not None:
+                        ln_i = int(fb)
+                except Exception:
+                    ln_i = None
+
+
+            return Verdict(bool(should_enter), str(side), list(tags), don_break_level=lvl_f, don_break_len=ln_i)
+
+
+        def _resolve(x):
+            if isinstance(x, str) and x.startswith("@"):
+                if x.startswith("@cfg."):
+                    return _deep_get(self.cfg, x[5:])
+                if x.startswith("@params."):
+                    return _deep_get(params, x[8:])
+            return x
+
+
+        entry = spec.get("entry", {}) or {}
+        side = str(entry.get("side", "short")).lower()
+        all_ops = entry.get("all", []) or []
+        any_ops = entry.get("any", []) or []
+
+        tags: List[str] = []
+
+
+        veto = spec.get("veto", {}) or {}
+        veto_any = veto.get("any", []) or []
+        for op in veto_any:
+            ok, t = _eval_one(op, dfs, tfs, ctx, _resolve, self._ops)
+            if not ok:
+                tags.append(f"veto:{t or list(op.keys())[0]}")
+                return _mk_verdict(False, side, tags)
+
+
+        for op in all_ops:
+            ok, t = _eval_one(op, dfs, tfs, ctx, _resolve, self._ops)
+            if not ok:
+                return _mk_verdict(False, side, tags + [t or list(op.keys())[0]])
+            tags.append(t or list(op.keys())[0])
+
+
+        if any_ops:
+            passed_any = False
+            temp_tags = []
+            for op in any_ops:
+                ok, t = _eval_one(op, dfs, tfs, ctx, _resolve, self._ops)
+                if ok:
+                    passed_any = True
+                    temp_tags.append(t or list(op.keys())[0])
+            if not passed_any:
+                return _mk_verdict(False, side, tags + temp_tags)
+            tags.extend(temp_tags)
+
+        return _mk_verdict(True, side, tags)
+
+
+    def _load(self):
+        with open(self.spec_path, "r") as f:
+            raw = yaml.safe_load(f) or {}
+        return raw
+
+
+def _deep_get(d: Dict[str, Any], dotted: str):
+    cur = d
+    for k in dotted.split("."):
+        if isinstance(cur, dict) and k in cur:
+            cur = cur[k]
+        else:
+            return None
+    return cur
+
+
+def _build_ops_registry() -> Dict[str, Callable]:
+    return {
+        "donch_breakout": _op_donch_breakout,
+        "pullback_under_ma": _op_pullback_under_ma,
+        "volume_surge": _op_volume_surge,
+        "trend_filter_ema": _op_trend_filter_ema,
+        "blacklist_symbol": _op_blacklist_symbol,
+        "cooldown_hours": _op_cooldown_hours,
+        "min_listing_age_days": _op_min_listing_age_days,
+        "eth_macd_hist_above": _op_eth_macd_hist_above,
+        "universe_rs_pct_gte": _op_universe_rs_pct_gte,
+        "liquidity_median_24h_usd_gte": _op_liquidity_median_24h_usd_gte,
+        "eth_macd_bull": _op_eth_macd_bull,
+        "donch_breakout_daily_confirm": _op_donch_breakout_daily_confirm,
+        "volume_median_multiple": _op_volume_median_multiple,
+        "pullback_retest_close_above_break": _op_pullback_retest_close_above_break,
+        "micro_vol_filter": _op_micro_vol_filter,
+    }
+
+def _get_tf_df(dfs: Dict[str, pd.DataFrame], tfs: Dict[str, str], tf_key: str) -> Optional[pd.DataFrame]:
+    tf = tfs.get(tf_key, tf_key) if isinstance(tf_key, str) else tf_key
+    return dfs.get(tf)
+
+def _ema(s: pd.Series, period: int) -> pd.Series:
+    return s.ewm(span=int(period), adjust=False).mean()
+
+def _op_donch_breakout(args, dfs, tfs, ctx, resolve):
+
+    tf_df = _get_tf_df(dfs, tfs, resolve(args.get("tf", "base")))
+    period = int(resolve(args.get("period", 55)) or 55)
+    direction = str(resolve(args.get("direction", "up"))).lower()
+    if tf_df is None or len(tf_df) < period + 2:
+        return False, "donch:insufficient_data"
+    df = tf_df
+    hh = df["high"].rolling(period).max().shift(1)
+    ll = df["low"].rolling(period).min().shift(1)
+    close = df["close"]
+    if close.isna().any() or hh.isna().any() or ll.isna().any():
+        return False, "donch:nan"
+    c = float(close.iloc[-1])
+    up = bool(c > float(hh.iloc[-1]))
+    dn = bool(c < float(ll.iloc[-1]))
+    if direction == "up" and up:
+        return True, "donch_up"
+    if direction == "down" and dn:
+        return True, "donch_down"
+    return False, "donch:no_break"
+
+def _op_pullback_under_ma(args, dfs, tfs, ctx, resolve):
+
+    tf_df = _get_tf_df(dfs, tfs, resolve(args.get("tf", "base")))
+    ema_period = int(resolve(args.get("ema_period", 200)) or 200)
+    max_pb = float(resolve(args.get("max_pullback_pct", 0.02)) or 0.02)
+    if tf_df is None or len(tf_df) < ema_period + 5:
+        return False, "pb:insufficient"
+    df = tf_df
+    ema = _ema(df["close"], ema_period)
+    c = float(df["close"].iloc[-1])
+    e = float(ema.iloc[-1])
+    if e <= 0:
+        return False, "pb:ema0"
+
+    pb = (e - c) / e
+    ok = 0 <= pb <= max_pb
+    return (ok, f"pullback_{pb:.3f}")
+
+def _op_volume_surge(args, dfs, tfs, ctx, resolve):
+
+    tf_df = _get_tf_df(dfs, tfs, resolve(args.get("tf", "base")))
+    win = int(resolve(args.get("win", 50)) or 50)
+    mult = float(resolve(args.get("min_mult", 1.5)) or 1.5)
+    if tf_df is None or len(tf_df) < win + 5:
+        return False, "vol:insufficient"
+    df = tf_df
+    v = df["volume"]
+    vbar = v.rolling(win).mean().shift(1)
+    if float(vbar.iloc[-1] or 0) <= 0:
+        return False, "vol:avg0"
+    ok = float(v.iloc[-1]) >= mult * float(vbar.iloc[-1])
+    return (ok, f"vol_x{float(v.iloc[-1])/float(vbar.iloc[-1]):.2f}")
+
+def _op_trend_filter_ema(args, dfs, tfs, ctx, resolve):
+
+    tf_df = _get_tf_df(dfs, tfs, resolve(args.get("tf", "base")))
+    fast = int(resolve(args.get("fast", 50)) or 50)
+    slow = int(resolve(args.get("slow", 200)) or 200)
+    direction = str(resolve(args.get("direction", "up"))).lower()
+    if tf_df is None or len(tf_df) < slow + 5:
+        return False, "trend:insufficient"
+    df = tf_df
+    ema_f = _ema(df["close"], fast)
+    ema_s = _ema(df["close"], slow)
+    f = float(ema_f.iloc[-1]); s = float(ema_s.iloc[-1])
+    if direction == "up" and (f > s):
+        return True, "trend_up"
+    if direction == "down" and (f < s):
+        return True, "trend_down"
+    return False, "trend:no"
+
+def _op_blacklist_symbol(args, dfs, tfs, ctx, resolve):
+    return (not bool(ctx.get("is_symbol_blacklisted", False)), "not_blacklisted")
+
+def _op_cooldown_hours(args, dfs, tfs, ctx, resolve):
+    hours = float(resolve(args.get("hours", 0)) or 0.0)
+    if hours <= 0:
+        return True, "cooldown:off"
+    last_exit_dt = ctx.get("last_exit_dt")
+    if not last_exit_dt:
+        return True, "cooldown:none"
+    delta = datetime.now(timezone.utc) - last_exit_dt
+    ok = delta >= timedelta(hours=hours)
+    return ok, f"cooldown_ok_{ok}"
+
+def _op_min_listing_age_days(args, dfs, tfs, ctx, resolve):
+    days = int(resolve(args.get("days", 0)) or 0)
+    age = ctx.get("listing_age_days")
+    if age is None:
+        return False, "list_age:unknown"
+    return (age >= days, f"list_age_{age}d")
+
+def _op_eth_macd_hist_above(args, dfs, tfs, ctx, resolve):
+
+
+    thr = float(resolve(args.get("min", 0.0)) or 0.0)
+    val = float(ctx.get("eth_macdhist", 0.0) or 0.0)
+    ok = (val >= thr)
+    return ok, f"eth_hist_{val:.3f}_{'>=' if ok else '<'}_{thr:.3f}"
+
+def _op_universe_rs_pct_gte(args, dfs, tfs, ctx, resolve):
+
+
+    thr = float(resolve(args.get("min", 0)) or 0)
+    rs = float(ctx.get("rs_pct", 0.0) or 0.0)
+    return (rs >= thr), f"rs_pct={rs:.1f}>= {thr:.1f}"
+
+def _op_liquidity_median_24h_usd_gte(args, dfs, tfs, ctx, resolve):
+
+
+    thr = float(resolve(args.get("min_usd", 5e5)) or 0.0)
+    med = float(ctx.get("median_24h_turnover_usd", 0.0) or 0.0)
+    return (med >= thr), f"liq_med24h=${med:,.0f}>={thr:,.0f}"
+
+def _op_eth_macd_bull(args, dfs, tfs, ctx, resolve):
+
+
+    ed = ctx.get("eth_macd") or {}
+    macd = float(ed.get("macd", 0.0) or 0.0)
+    sig  = float(ed.get("signal", 0.0) or 0.0)
+    hist = float(ed.get("hist", 0.0) or 0.0)
+    ok = (macd > sig) and (hist > 0.0)
+    return ok, f"eth_bull(macd={macd:.3f},sig={sig:.3f},hist={hist:.3f})"
+
+def _op_donch_breakout_daily_confirm(args, dfs, tfs, ctx, resolve):
+
+
+    donch_tf = str(resolve(args.get("donch_tf", "1d")))
+    n = int(resolve(args.get("period", 20)))
+
+
+    injected = ctx.get("don_break_level", None)
+    if injected is None:
+        injected = ctx.get("donch_break_level", None)
+
+    upper_inj: Optional[float] = None
+    try:
+        if injected is not None:
+            upper_inj = float(injected)
+            if not np.isfinite(upper_inj):
+                upper_inj = None
+    except Exception:
+        upper_inj = None
+
+
+    df_base = _get_tf_df(dfs, tfs, "base")
+    base_close = None
+    try:
+        if df_base is not None and (not df_base.empty):
+            base_close = float(df_base["close"].iloc[-1])
+    except Exception:
+        base_close = None
+
+    if upper_inj is not None:
+        if base_close is None or (not np.isfinite(base_close)):
+
+            return False, "donch_inj:missing_base_close"
+
+
+        ctx["don_break_level"] = float(upper_inj)
+        ctx["donch_break_level"] = float(upper_inj)
+        if "don_break_len" not in ctx:
+            ctx["don_break_len"] = int(ctx.get("donch_break_len", n) or n)
+        if "donch_break_len" not in ctx:
+            ctx["donch_break_len"] = int(ctx.get("don_break_len", n) or n)
+
+        ok = bool(base_close > upper_inj)
+        ctx["donch_dist_pct"] = (base_close - upper_inj) / upper_inj if upper_inj > 0 else 0.0
+        return ok, f"donch{int(ctx.get('don_break_len', n))}_inj_close>{upper_inj:.6f}"
+
+
+    ddf = _get_tf_df(dfs, tfs, donch_tf)
+    if ddf is None or len(ddf) < n + 2:
+        return False, "donch_daily:insufficient"
+
+    dd = ddf.copy().sort_index()
+    highs = dd["high"].rolling(n).max().shift(1)
+    last_close = float(dd["close"].iloc[-1])
+    upper = float(highs.iloc[-1])
+    ok = last_close > upper and np.isfinite(upper)
+
+
+    ctx["donch_break_level"] = upper
+    ctx["don_break_level"] = upper
+    ctx["donch_break_len"] = n
+    ctx["don_break_len"] = n
+    ctx["donch_dist_pct"] = (last_close - upper) / upper if upper > 0 else 0.0
+    return ok, f"donch{n}_close>{upper:.6f}"
+
+
+def _op_micro_vol_filter(args, dfs, tfs, ctx, resolve):
+
+
+    atr_tf = str(resolve(args.get("atr_tf", "1h")))
+    atr_len = int(resolve(args.get("atr_len", 14)))
+    min_ratio = float(resolve(args.get("min_ratio", 0.0001)))
+    basetf = tfs.get("base", "5m")
+    df_base = _get_tf_df(dfs, tfs, basetf)
+    df_atr  = _get_tf_df(dfs, tfs, str(resolve(args.get("atr_tf","1h"))))
+    if df_base is None or df_atr is None or len(df_atr) < atr_len + 5:
+        return False, "microvol:short"
+
+
+    from . import indicators as ta
+    atr_s = ta.atr(df_atr, atr_len)
+    atr_last = float(atr_s.iloc[-1])
+    price_last = float(df_base["close"].iloc[-1])
+    ratio = (atr_last / price_last) if price_last > 0 else 0.0
+    ok = ratio >= min_ratio
+    return ok, f"atr1h/px={ratio:.5f}>={min_ratio:.5f}"
+
+def _op_pullback_retest_close_above_break(args, dfs, tfs, ctx, resolve):
+
+
+    level = ctx.get("don_break_level", ctx.get("donch_break_level", None))
+    try:
+        level = float(level) if level is not None else None
+    except Exception:
+        level = None
+    if level is None or (not np.isfinite(level)):
+        return False, "retest:no_break_ctx"
+
+
+    tf = str(resolve(args.get("tf", "5m")))
+    eps = float(resolve(args.get("eps_pct", 0.003)))
+    lb  = int(resolve(args.get("lookback_bars", 288)))
+
+
+    df = _get_tf_df(dfs, tfs, tf)
+    if df is None or len(df) < lb + 5:
+        return False, "retest:short"
+
+    sub = df.tail(lb)
+    band_hi = level * (1.0 + eps)
+    band_lo = level * (1.0 - eps)
+    touched = ((sub["low"] <= band_hi) & (sub["high"] >= band_lo)).any()
+    cur_close = float(sub["close"].iloc[-1])
+    trig_ok = cur_close > level
+    ok = bool(touched and trig_ok)
+    return ok, f"retest@{level:.6f}&close>{level:.6f}"
+
+
+def _op_volume_median_multiple(args, dfs, tfs, ctx, resolve):
+
+
+    tf = str(resolve(args.get("tf", "5m")))
+    days = int(resolve(args.get("days", 30)))
+    mult = float(resolve(args.get("min_mult", 2.0)))
+    cap = int(resolve(args.get("cap_bars", 9000)))
+    df = _get_tf_df(dfs, tfs, tf)
+
+    if df is None or df.empty:
+        return False, "vol:missing"
+
+
+    try:
+        bpd = int(round(24*60 / max(1, int((df.index[1]-df.index[0]).total_seconds()/60))))
+    except Exception:
+        bpd = 288
+
+    lookback = min(cap, days * bpd)
+    sub = df.tail(lookback)
+    if len(sub) < max(100, bpd):
+        return False, "vol:short"
+
+    cur_vol = float(sub["volume"].iloc[-1])
+    med_vol = float(sub["volume"].median())
+    ratio = (cur_vol / med_vol) if med_vol > 0 else 0.0
+    ok = ratio >= mult
+    ctx["vol_mult"] = float(ratio)
+    return ok, f"vol×={ratio:.2f}"
+
+
+def _eval_one(op_dict, dfs, tfs, ctx, resolve, registry):
+    if not isinstance(op_dict, dict) or len(op_dict) != 1:
+        return False, "bad_op"
+    name, args = next(iter(op_dict.items()))
+    args = args or {}
+    fn = registry.get(name)
+    if not fn:
+        return False, f"unknown:{name}"
+
+    args = {k: resolve(v) for k, v in args.items()}
+    ok, tag = fn(args, dfs, tfs, ctx, resolve)
+    return ok, tag

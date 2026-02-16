@@ -1,0 +1,69 @@
+{
+  "bundle_id": "796d068c78cb089b",
+  "bybit_testnet": false,
+  "config_hash": "5fed59c5c113447c62ccb15ab0c5208f29a47b72e54b9fb314a83872440a8c92",
+  "decisions_count": 13334,
+  "exported_at_utc": "2026-02-15T10:04:53+00:00",
+  "meta_scope": "all",
+  "meta_threshold": 0.42,
+  "reason_canonical_agreement_rate": 1.0,
+  "risk_mode": "fixed",
+  "risk_usd_base": 100.0,
+  "schema_fail_class_counts": {
+    "integration_defect": 1057,
+    "unknown": 21,
+    "warmup_expected": 121
+  },
+  "schema_fail_count": 1199,
+  "schema_fail_rate": 0.08992050397480127,
+  "schema_incident_recommended": true,
+  "schema_top_non_warmup_missing_fields": [
+    {
+      "count": 277,
+      "field": "meta_p"
+    },
+    {
+      "count": 277,
+      "field": "size_mult"
+    },
+    {
+      "count": 277,
+      "field": "risk_cash_target"
+    },
+    {
+      "count": 277,
+      "field": "risk_cash_realized"
+    },
+    {
+      "count": 277,
+      "field": "est_leverage_x"
+    },
+    {
+      "count": 277,
+      "field": "btc_vol_regime_level_x"
+    },
+    {
+      "count": 277,
+      "field": "btc_trend_slope_x"
+    },
+    {
+      "count": 277,
+      "field": "eth_vol_regime_level_x"
+    },
+    {
+      "count": 277,
+      "field": "eth_trend_slope_x"
+    },
+    {
+      "count": 277,
+      "field": "btc_vol_regime_level_y"
+    }
+  ],
+  "strategy_version": "strategies/donch_pullback_long.yaml@298c106897f1",
+  "symbol_metadata_source": "exchange_instrument_metadata",
+  "symbols_count": 553,
+  "timezone": "UTC",
+  "trades_count": 0,
+  "window_end_utc": "2026-02-10T00:00:00+00:00",
+  "window_start_utc": "2026-02-09T00:00:00+00:00"
+}

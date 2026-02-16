@@ -1,0 +1,5 @@
+reason_raw,reason_canonical,count
+no_prob_gate,strategy_fail,9790
+below_pstar,meta_prob,2329
+schema_fail,schema_fail,1199
+ok,strategy_fail,16
